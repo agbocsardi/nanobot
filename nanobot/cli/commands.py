@@ -403,7 +403,7 @@ def _onboard_plugins(config_path: Path) -> None:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 
-def _make_provider(config: Config):
+def _make_provider(config: Config, model: str | None = None):
     """Create the appropriate LLM provider from config.
 
     Routing is driven by ``ProviderSpec.backend`` in the registry.
@@ -411,7 +411,7 @@ def _make_provider(config: Config):
     from nanobot.providers.base import GenerationSettings
     from nanobot.providers.registry import find_by_name
 
-    model = config.agents.defaults.model
+    model = model or config.agents.defaults.model
     provider_name = config.get_provider_name(model)
     p = config.get_provider(model)
     spec = find_by_name(provider_name) if provider_name else None
@@ -654,7 +654,18 @@ def gateway(
     console.print(f"{__logo__} Starting nanobot gateway version {__version__} on port {port}...")
     sync_workspace_templates(config.workspace_path)
     bus = MessageBus()
-    provider = _make_provider(config)
+
+    # Restore persisted model selection from previous session
+    data_dir = config.workspace_path
+    model = config.agents.defaults.model
+    compact_model = config.agents.defaults.compact_model
+    persisted = AgentLoop.load_persisted_state(data_dir)
+    if persisted.get("model"):
+        model = persisted["model"]
+    if persisted.get("compact_model"):
+        compact_model = persisted["compact_model"]
+
+    provider = _make_provider(config, model)
     session_manager = SessionManager(config.workspace_path)
 
     # Preserve existing single-workspace installs, but keep custom workspaces clean.
@@ -670,7 +681,7 @@ def gateway(
         bus=bus,
         provider=provider,
         workspace=config.workspace_path,
-        model=config.agents.defaults.model,
+        model=model,
         max_iterations=config.agents.defaults.max_tool_iterations,
         context_window_tokens=config.agents.defaults.context_window_tokens,
         web_config=config.tools.web,
@@ -684,6 +695,10 @@ def gateway(
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
         timezone=config.agents.defaults.timezone,
+        compact_model=compact_model,
+        provider_factory=lambda m: _make_provider(config, m),
+        available_models=config.agents.defaults.models,
+        data_dir=data_dir,
         unified_session=config.agents.defaults.unified_session,
         disabled_skills=config.agents.defaults.disabled_skills,
         session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
@@ -886,7 +901,18 @@ def agent(
     sync_workspace_templates(config.workspace_path)
 
     bus = MessageBus()
-    provider = _make_provider(config)
+
+    # Restore persisted model selection from previous session
+    data_dir = config.workspace_path
+    model = config.agents.defaults.model
+    compact_model = config.agents.defaults.compact_model
+    persisted = AgentLoop.load_persisted_state(data_dir)
+    if persisted.get("model"):
+        model = persisted["model"]
+    if persisted.get("compact_model"):
+        compact_model = persisted["compact_model"]
+
+    provider = _make_provider(config, model)
 
     # Preserve existing single-workspace installs, but keep custom workspaces clean.
     if is_default_workspace(config.workspace_path):
@@ -905,7 +931,7 @@ def agent(
         bus=bus,
         provider=provider,
         workspace=config.workspace_path,
-        model=config.agents.defaults.model,
+        model=model,
         max_iterations=config.agents.defaults.max_tool_iterations,
         context_window_tokens=config.agents.defaults.context_window_tokens,
         web_config=config.tools.web,
@@ -918,6 +944,10 @@ def agent(
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
         timezone=config.agents.defaults.timezone,
+        compact_model=compact_model,
+        provider_factory=lambda m: _make_provider(config, m),
+        available_models=config.agents.defaults.models,
+        data_dir=data_dir,
         unified_session=config.agents.defaults.unified_session,
         disabled_skills=config.agents.defaults.disabled_skills,
         session_ttl_minutes=config.agents.defaults.session_ttl_minutes,

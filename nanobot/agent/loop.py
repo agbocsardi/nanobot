@@ -152,6 +152,10 @@ class AgentLoop:
         timezone: str | None = None,
         session_ttl_minutes: int = 0,
         hooks: list[AgentHook] | None = None,
+        compact_model: str = "",
+        provider_factory: Callable[[str], LLMProvider] | None = None,
+        available_models: list[str] | None = None,
+        data_dir: Path | None = None,
         unified_session: bool = False,
         disabled_skills: list[str] | None = None,
     ):
@@ -163,6 +167,7 @@ class AgentLoop:
         self.provider = provider
         self.workspace = workspace
         self.model = model or provider.get_default_model()
+        self.compact_model = compact_model
         self.max_iterations = (
             max_iterations if max_iterations is not None else defaults.max_tool_iterations
         )
@@ -185,6 +190,24 @@ class AgentLoop:
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
+
+        self._data_dir = data_dir
+
+        # /model switching support
+        self._provider_factory = provider_factory
+        self._available_models = available_models or []
+        self._providers: dict[str, LLMProvider] = {}
+        self._providers[self._provider_key(self.model)] = provider
+
+        # compact_model uses its own provider, not affected by /model switching
+        self._compact_provider: LLMProvider = provider
+        if compact_model and self._provider_key(compact_model) != self._provider_key(self.model):
+            if provider_factory:
+                try:
+                    self._compact_provider = provider_factory(compact_model)
+                    self._providers[self._provider_key(compact_model)] = self._compact_provider
+                except Exception:
+                    pass  # Fall back to main provider
 
         self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
         self.sessions = session_manager or SessionManager(workspace)
@@ -966,3 +989,154 @@ class AgentLoop:
             on_stream=on_stream,
             on_stream_end=on_stream_end,
         )
+
+    # -- /model switching ------------------------------------------------------
+
+    @staticmethod
+    def _provider_key(model: str) -> str:
+        """Extract provider key from model name."""
+        return model.split("/")[0] if "/" in model else "default"
+
+    def _format_model_list(self) -> str:
+        """Format current model and available models list."""
+        compact = self.compact_model or self.model
+        lines = [f"Main: {self.model}", f"Compact: {compact}"]
+        if not self._available_models:
+            lines.append("\nNo models configured. Add a 'models' list to config.json agents.defaults.")
+            return "\n".join(lines)
+        lines.append("\nAvailable:")
+        for i, m in enumerate(self._available_models, 1):
+            marker = "  <-- current" if m == self.model else ""
+            lines.append(f"  {i}. {m}{marker}")
+        lines.append("\nReply /model <number> to switch.")
+        return "\n".join(lines)
+
+    def _switch_model(self, arg: str) -> str:
+        """Switch the active model. arg can be a 1-based index or full model name."""
+        if not self._available_models:
+            return "No models configured. Add a 'models' list to config.json agents.defaults."
+
+        target: str | None = None
+        if arg.isdigit():
+            idx = int(arg) - 1
+            if 0 <= idx < len(self._available_models):
+                target = self._available_models[idx]
+            else:
+                return f"Invalid index. Choose 1-{len(self._available_models)}."
+        else:
+            for m in self._available_models:
+                if m == arg or m.lower() == arg.lower():
+                    target = m
+                    break
+            if target is None:
+                matches = [m for m in self._available_models if arg.lower() in m.lower()]
+                if len(matches) == 1:
+                    target = matches[0]
+                elif len(matches) > 1:
+                    return f"Ambiguous match: {', '.join(matches)}"
+                else:
+                    return f"Model '{arg}' not in available list. Use /model to see options."
+
+        if target == self.model:
+            return f"Already using {self.model}."
+
+        key = self._provider_key(target)
+        if key not in self._providers:
+            if not self._provider_factory:
+                return "Cannot switch: no provider factory configured."
+            try:
+                self._providers[key] = self._provider_factory(target)
+            except Exception as e:
+                return f"Failed to create provider for {target}: {e}"
+
+        old_model = self.model
+        self.provider = self._providers[key]
+        self.model = target
+        self.runner.provider = self.provider
+        self.subagents.provider = self.provider
+        self.subagents.model = target
+        self.consolidator.provider = self.provider
+        self.consolidator.model = target
+        self._persist_state()
+        return f"Switched: {old_model} -> {target}"
+
+    def _format_compact_model_list(self) -> str:
+        """Format current compact model and available options."""
+        current = self.compact_model or self.model
+        lines = [f"Compact model: {current}"]
+        if not self._available_models:
+            return lines[0]
+        lines.append("\nAvailable:")
+        for i, m in enumerate(self._available_models, 1):
+            marker = "  <-- current" if m == current else ""
+            lines.append(f"  {i}. {m}{marker}")
+        lines.append("\nReply /compact --switch <number> to change.")
+        return "\n".join(lines)
+
+    def _switch_compact_model(self, arg: str) -> str:
+        """Switch the compact model used for consolidation."""
+        if not self._available_models:
+            return "No models configured."
+
+        target: str | None = None
+        if arg.isdigit():
+            idx = int(arg) - 1
+            if 0 <= idx < len(self._available_models):
+                target = self._available_models[idx]
+            else:
+                return f"Invalid index. Choose 1-{len(self._available_models)}."
+        else:
+            for m in self._available_models:
+                if m == arg or m.lower() == arg.lower():
+                    target = m
+                    break
+            if target is None:
+                return f"Model '{arg}' not in available list."
+
+        key = self._provider_key(target)
+        if key not in self._providers:
+            if not self._provider_factory:
+                return "Cannot switch: no provider factory configured."
+            try:
+                self._providers[key] = self._provider_factory(target)
+            except Exception as e:
+                return f"Failed to create provider for {target}: {e}"
+
+        self.compact_model = target
+        self._compact_provider = self._providers[key]
+        self.consolidator.provider = self._compact_provider
+        self.consolidator.model = target
+        self._persist_state()
+        return f"Compact model switched to: {target}"
+
+    # -- state persistence -----------------------------------------------------
+
+    _STATE_FILE = ".state.json"
+
+    def _persist_state(self) -> None:
+        """Write model and compact_model to .state.json so they survive restarts."""
+        if not self._data_dir:
+            return
+        try:
+            import json
+            state_path = self._data_dir / self._STATE_FILE
+            state_path.write_text(
+                json.dumps({"model": self.model, "compact_model": self.compact_model}),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    @staticmethod
+    def load_persisted_state(data_dir: Path | None) -> dict:
+        """Load persisted model selection from .state.json."""
+        if not data_dir:
+            return {}
+        import json
+        state_path = data_dir / AgentLoop._STATE_FILE
+        if state_path.exists():
+            try:
+                return json.loads(state_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        return {}

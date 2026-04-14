@@ -499,13 +499,17 @@ def test_agent_config_sets_active_path(monkeypatch, tmp_path: Path) -> None:
     )
     monkeypatch.setattr("nanobot.config.loader.load_config", lambda _path=None: config)
     monkeypatch.setattr("nanobot.cli.commands.sync_workspace_templates", lambda _path: None)
-    monkeypatch.setattr("nanobot.cli.commands._make_provider", lambda _config: object())
+    monkeypatch.setattr("nanobot.cli.commands._make_provider", lambda _config, _model=None: object())
     monkeypatch.setattr("nanobot.bus.queue.MessageBus", lambda: object())
     monkeypatch.setattr("nanobot.cron.service.CronService", lambda _store: object())
 
     class _FakeAgentLoop:
         def __init__(self, *args, **kwargs) -> None:
             pass
+
+        @staticmethod
+        def load_persisted_state(_data_dir):
+            return {}
 
         async def process_direct(self, *_args, **_kwargs):
             return OutboundMessage(channel="cli", chat_id="direct", content="ok")
@@ -534,7 +538,7 @@ def test_agent_uses_workspace_directory_for_cron_store(monkeypatch, tmp_path: Pa
     monkeypatch.setattr("nanobot.config.loader.set_config_path", lambda _path: None)
     monkeypatch.setattr("nanobot.config.loader.load_config", lambda _path=None: config)
     monkeypatch.setattr("nanobot.cli.commands.sync_workspace_templates", lambda _path: None)
-    monkeypatch.setattr("nanobot.cli.commands._make_provider", lambda _config: object())
+    monkeypatch.setattr("nanobot.cli.commands._make_provider", lambda _config, _model=None: object())
     monkeypatch.setattr("nanobot.bus.queue.MessageBus", lambda: object())
 
     class _FakeCron:
@@ -544,6 +548,10 @@ def test_agent_uses_workspace_directory_for_cron_store(monkeypatch, tmp_path: Pa
     class _FakeAgentLoop:
         def __init__(self, *args, **kwargs) -> None:
             pass
+
+        @staticmethod
+        def load_persisted_state(_data_dir):
+            return {}
 
         async def process_direct(self, *_args, **_kwargs):
             return OutboundMessage(channel="cli", chat_id="direct", content="ok")
@@ -580,7 +588,7 @@ def test_agent_workspace_override_does_not_migrate_legacy_cron(
     monkeypatch.setattr("nanobot.config.loader.set_config_path", lambda _path: None)
     monkeypatch.setattr("nanobot.config.loader.load_config", lambda _path=None: config)
     monkeypatch.setattr("nanobot.cli.commands.sync_workspace_templates", lambda _path: None)
-    monkeypatch.setattr("nanobot.cli.commands._make_provider", lambda _config: object())
+    monkeypatch.setattr("nanobot.cli.commands._make_provider", lambda _config, _model=None: object())
     monkeypatch.setattr("nanobot.bus.queue.MessageBus", lambda: object())
     monkeypatch.setattr("nanobot.config.paths.get_cron_dir", lambda: legacy_dir)
 
@@ -591,6 +599,10 @@ def test_agent_workspace_override_does_not_migrate_legacy_cron(
     class _FakeAgentLoop:
         def __init__(self, *args, **kwargs) -> None:
             pass
+
+        @staticmethod
+        def load_persisted_state(_data_dir):
+            return {}
 
         async def process_direct(self, *_args, **_kwargs):
             return OutboundMessage(channel="cli", chat_id="direct", content="ok")
@@ -633,7 +645,7 @@ def test_agent_custom_config_workspace_does_not_migrate_legacy_cron(
     monkeypatch.setattr("nanobot.config.loader.set_config_path", lambda _path: None)
     monkeypatch.setattr("nanobot.config.loader.load_config", lambda _path=None: config)
     monkeypatch.setattr("nanobot.cli.commands.sync_workspace_templates", lambda _path: None)
-    monkeypatch.setattr("nanobot.cli.commands._make_provider", lambda _config: object())
+    monkeypatch.setattr("nanobot.cli.commands._make_provider", lambda _config, _model=None: object())
     monkeypatch.setattr("nanobot.bus.queue.MessageBus", lambda: object())
     monkeypatch.setattr("nanobot.config.paths.get_cron_dir", lambda: legacy_dir)
 
@@ -644,6 +656,10 @@ def test_agent_custom_config_workspace_does_not_migrate_legacy_cron(
     class _FakeAgentLoop:
         def __init__(self, *args, **kwargs) -> None:
             pass
+
+        @staticmethod
+        def load_persisted_state(_data_dir):
+            return {}
 
         async def process_direct(self, *_args, **_kwargs):
             return OutboundMessage(channel="cli", chat_id="direct", content="ok")
@@ -717,7 +733,7 @@ def _write_instance_config(tmp_path: Path) -> Path:
     return config_file
 
 
-def _stop_gateway_provider(_config) -> object:
+def _stop_gateway_provider(_config, _model=None) -> object:
     raise _StopGatewayError("stop")
 
 
@@ -745,7 +761,7 @@ def _patch_cli_command_runtime(
     )
     monkeypatch.setattr(
         "nanobot.cli.commands._make_provider",
-        make_provider or (lambda _config: object()),
+        make_provider or (lambda _config, _model=None: object()),
     )
 
     if message_bus is not None:
@@ -769,6 +785,10 @@ def _patch_serve_runtime(monkeypatch, config: Config, seen: dict[str, object]) -
     class _FakeAgentLoop:
         def __init__(self, **kwargs) -> None:
             seen["workspace"] = kwargs["workspace"]
+
+        @staticmethod
+        def load_persisted_state(_data_dir):
+            return {}
 
         async def _connect_mcp(self) -> None:
             return None
@@ -885,7 +905,7 @@ def test_gateway_cron_evaluator_receives_scheduled_reminder_context(
     monkeypatch.setattr("nanobot.config.loader.set_config_path", lambda _path: None)
     monkeypatch.setattr("nanobot.config.loader.load_config", lambda _path=None: config)
     monkeypatch.setattr("nanobot.cli.commands.sync_workspace_templates", lambda _path: None)
-    monkeypatch.setattr("nanobot.cli.commands._make_provider", lambda _config: provider)
+    monkeypatch.setattr("nanobot.cli.commands._make_provider", lambda _config, _model=None: provider)
     monkeypatch.setattr("nanobot.bus.queue.MessageBus", lambda: bus)
     monkeypatch.setattr("nanobot.session.manager.SessionManager", lambda _workspace: object())
 
@@ -898,6 +918,10 @@ def test_gateway_cron_evaluator_receives_scheduled_reminder_context(
         def __init__(self, *args, **kwargs) -> None:
             self.model = "test-model"
             self.tools = {}
+
+        @staticmethod
+        def load_persisted_state(_data_dir):
+            return {}
 
         async def process_direct(self, *_args, **_kwargs):
             return OutboundMessage(

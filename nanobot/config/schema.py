@@ -64,6 +64,8 @@ class AgentDefaults(Base):
 
     workspace: str = "~/.nanobot/workspace"
     model: str = "anthropic/claude-opus-4-5"
+    models: list[str] = Field(default_factory=list)  # Available models for /model switching
+    compact_model: str = ""  # Model for /compact summarization; empty = use default model
     provider: str = (
         "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
     )
