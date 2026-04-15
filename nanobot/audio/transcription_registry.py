@@ -80,6 +80,12 @@ TRANSCRIPTION_PROVIDERS: tuple[TranscriptionProviderSpec, ...] = (
         adapter="nanobot.providers.transcription:OpenAITranscriptionProvider",
         aliases=("silicon",),
     ),
+    TranscriptionProviderSpec(
+        name="faster_whisper",
+        default_model="small",
+        adapter="nanobot.providers.transcription:FasterWhisperTranscriptionProvider",
+        aliases=("faster-whisper", "local_whisper", "local-whisper"),
+    ),
 )
 
 _BY_NAME = {spec.name: spec for spec in TRANSCRIPTION_PROVIDERS}

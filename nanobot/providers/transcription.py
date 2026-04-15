@@ -825,3 +825,82 @@ class StepFunTranscriptionProvider:
             provider_label="StepFun",
             language=self.language,
         )
+
+
+class FasterWhisperTranscriptionProvider:
+    """Local voice transcription using faster-whisper via `uv run --script`.
+
+    Dependencies are declared inline in the bundled PEP 723 script; uv manages
+    (and caches) the isolated environment — no hand-managed venv required.
+    """
+
+    _TIMEOUT_S = 120.0
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        api_base: str | None = None,
+        language: str | None = None,
+        model: str | None = None,
+        uv_bin: str = "uv",
+        script_path: str = "",
+        device: str | None = None,
+        compute_type: str | None = None,
+    ):
+        self.uv_bin = uv_bin
+        if script_path:
+            self.script_path = str(Path(script_path).expanduser())
+        else:
+            self.script_path = str(Path(__file__).parent / "whisper" / "transcribe.py")
+        self.model = model or "small"
+        self.device = device or os.environ.get("NANOBOT_WHISPER_DEVICE", "cpu")
+        self.compute_type = compute_type or os.environ.get("NANOBOT_WHISPER_COMPUTE_TYPE", "int8")
+        self.language = language or None
+
+    async def transcribe(self, file_path: str | Path) -> str:
+        path = Path(file_path)
+        if not path.exists():
+            logger.error("Audio file not found: {}", file_path)
+            return ""
+
+        env = {
+            **os.environ,
+            "NANOBOT_WHISPER_MODEL": self.model,
+            "NANOBOT_WHISPER_DEVICE": self.device,
+            "NANOBOT_WHISPER_COMPUTE_TYPE": self.compute_type,
+        }
+        if self.language:
+            env["NANOBOT_WHISPER_LANGUAGE"] = self.language
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self.uv_bin,
+                "run",
+                "--quiet",
+                "--script",
+                self.script_path,
+                str(path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=self._TIMEOUT_S)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                logger.error("faster-whisper transcription timed out for: {}", file_path)
+                return ""
+
+            if proc.returncode != 0:
+                err_msg = stderr.decode(errors="replace").strip()
+                logger.error(
+                    "faster-whisper transcription failed (exit {}): {}", proc.returncode, err_msg
+                )
+                return ""
+
+            return stdout.decode().strip()
+
+        except Exception as e:
+            logger.error("faster-whisper transcription error: {}", e)
+            return ""
