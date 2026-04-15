@@ -5,7 +5,12 @@ from datetime import datetime
 from typing import Any
 
 from nanobot.agent.tools.base import Tool, tool_parameters
-from nanobot.agent.tools.schema import BooleanSchema, IntegerSchema, StringSchema, tool_parameters_schema
+from nanobot.agent.tools.schema import (
+    BooleanSchema,
+    IntegerSchema,
+    StringSchema,
+    tool_parameters_schema,
+)
 from nanobot.cron.service import CronService
 from nanobot.cron.types import CronJob, CronJobState, CronSchedule
 
@@ -33,6 +38,13 @@ from nanobot.cron.types import CronJob, CronJobState, CronSchedule
         ),
         deliver=BooleanSchema(
             description="Whether to deliver the execution result to the user channel (default true)",
+            default=True,
+        ),
+        use_user_session=BooleanSchema(
+            description=(
+                "Run in the user's existing session so the agent sees conversation history (default true). "
+                "When false the job runs in an isolated session with no prior context."
+            ),
             default=True,
         ),
         job_id=StringSchema("Job ID (for remove)"),
@@ -105,12 +117,15 @@ class CronTool(Tool):
         at: str | None = None,
         job_id: str | None = None,
         deliver: bool = True,
+        use_user_session: bool = True,
         **kwargs: Any,
     ) -> str:
         if action == "add":
             if self._in_cron_context.get():
                 return "Error: cannot schedule new jobs from within a cron job execution"
-            return self._add_job(name, message, every_seconds, cron_expr, tz, at, deliver)
+            return self._add_job(
+                name, message, every_seconds, cron_expr, tz, at, deliver, use_user_session
+            )
         elif action == "list":
             return self._list_jobs()
         elif action == "remove":
@@ -126,6 +141,7 @@ class CronTool(Tool):
         tz: str | None,
         at: str | None,
         deliver: bool = True,
+        use_user_session: bool = True,
     ) -> str:
         if not message:
             return "Error: message is required for add"
@@ -171,6 +187,7 @@ class CronTool(Tool):
             channel=self._channel,
             to=self._chat_id,
             delete_after_run=delete_after,
+            use_user_session=use_user_session,
         )
         return f"Created job '{job.name}' (id: {job.id})"
 
@@ -225,6 +242,11 @@ class CronTool(Tool):
             if j.payload.kind == "system_event":
                 parts.append(f"  Purpose: {self._system_job_purpose(j)}")
                 parts.append("  Protected: visible for inspection, but cannot be removed.")
+            else:
+                if j.payload.use_user_session:
+                    parts.append("  Session: user (shared context)")
+                else:
+                    parts.append("  Session: isolated (no prior context)")
             parts.extend(self._format_state(j.state, j.schedule))
             lines.append("\n".join(parts))
         return "Scheduled jobs:\n" + "\n".join(lines)
@@ -243,8 +265,5 @@ class CronTool(Tool):
                     "This is a system-managed Dream memory consolidation job for long-term memory.\n"
                     "It remains visible so you can inspect it, but it cannot be removed."
                 )
-            return (
-                f"Cannot remove job `{job_id}`.\n"
-                "This is a protected system-managed cron job."
-            )
+            return f"Cannot remove job `{job_id}`.\nThis is a protected system-managed cron job."
         return f"Job {job_id} not found"

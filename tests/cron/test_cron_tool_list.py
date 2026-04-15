@@ -237,6 +237,7 @@ async def test_list_shows_last_run_state(tmp_path) -> None:
     assert "ok" in result
     assert "(UTC)" in result
 
+
 @pytest.mark.asyncio
 async def test_list_shows_error_message(tmp_path) -> None:
     tool = _make_tool(tmp_path)
@@ -270,12 +271,14 @@ def test_list_shows_next_run(tmp_path) -> None:
 
 def test_list_includes_protected_dream_system_job_with_memory_purpose(tmp_path) -> None:
     tool = _make_tool(tmp_path)
-    tool._cron.register_system_job(CronJob(
-        id="dream",
-        name="dream",
-        schedule=CronSchedule(kind="cron", expr="0 */2 * * *", tz="UTC"),
-        payload=CronPayload(kind="system_event"),
-    ))
+    tool._cron.register_system_job(
+        CronJob(
+            id="dream",
+            name="dream",
+            schedule=CronSchedule(kind="cron", expr="0 */2 * * *", tz="UTC"),
+            payload=CronPayload(kind="system_event"),
+        )
+    )
 
     result = tool._list_jobs()
 
@@ -286,12 +289,14 @@ def test_list_includes_protected_dream_system_job_with_memory_purpose(tmp_path) 
 
 def test_remove_protected_dream_job_returns_clear_feedback(tmp_path) -> None:
     tool = _make_tool(tmp_path)
-    tool._cron.register_system_job(CronJob(
-        id="dream",
-        name="dream",
-        schedule=CronSchedule(kind="cron", expr="0 */2 * * *", tz="UTC"),
-        payload=CronPayload(kind="system_event"),
-    ))
+    tool._cron.register_system_job(
+        CronJob(
+            id="dream",
+            name="dream",
+            schedule=CronSchedule(kind="cron", expr="0 */2 * * *", tz="UTC"),
+            payload=CronPayload(kind="system_event"),
+        )
+    )
 
     result = tool._remove_job("dream")
 
@@ -358,3 +363,48 @@ def test_list_excludes_disabled_jobs(tmp_path) -> None:
     result = tool._list_jobs()
     assert "Paused job" not in result
     assert result == "No scheduled jobs."
+
+
+# -- use_user_session tests --
+
+
+def test_add_job_defaults_use_user_session_true(tmp_path) -> None:
+    tool = _make_tool(tmp_path)
+    tool.set_context("telegram", "chat-1")
+
+    tool._add_job(None, "standup", None, "0 9 * * *", None, None)
+    job = tool._cron.list_jobs()[0]
+    assert job.payload.use_user_session is True
+
+
+def test_add_job_can_disable_use_user_session(tmp_path) -> None:
+    tool = _make_tool(tmp_path)
+    tool.set_context("telegram", "chat-1")
+
+    tool._add_job(None, "standup", None, "0 9 * * *", None, None, use_user_session=False)
+    job = tool._cron.list_jobs()[0]
+    assert job.payload.use_user_session is False
+
+
+def test_list_shows_user_session_mode(tmp_path) -> None:
+    tool = _make_tool(tmp_path)
+    tool._cron.add_job(
+        name="User job",
+        schedule=CronSchedule(kind="cron", expr="0 9 * * *", tz="UTC"),
+        message="test",
+        use_user_session=True,
+    )
+    result = tool._list_jobs()
+    assert "Session: user (shared context)" in result
+
+
+def test_list_shows_isolated_session_mode(tmp_path) -> None:
+    tool = _make_tool(tmp_path)
+    tool._cron.add_job(
+        name="Isolated job",
+        schedule=CronSchedule(kind="cron", expr="0 9 * * *", tz="UTC"),
+        message="test",
+        use_user_session=False,
+    )
+    result = tool._list_jobs()
+    assert "Session: isolated (no prior context)" in result

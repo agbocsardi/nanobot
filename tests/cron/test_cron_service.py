@@ -181,12 +181,14 @@ async def test_running_service_honors_external_disable(tmp_path) -> None:
 
 def test_remove_job_refuses_system_jobs(tmp_path) -> None:
     service = CronService(tmp_path / "cron" / "jobs.json")
-    service.register_system_job(CronJob(
-        id="dream",
-        name="dream",
-        schedule=CronSchedule(kind="cron", expr="0 */2 * * *", tz="UTC"),
-        payload=CronPayload(kind="system_event"),
-    ))
+    service.register_system_job(
+        CronJob(
+            id="dream",
+            name="dream",
+            schedule=CronSchedule(kind="cron", expr="0 */2 * * *", tz="UTC"),
+            payload=CronPayload(kind="system_event"),
+        )
+    )
 
     result = service.remove_job("dream")
 
@@ -198,6 +200,7 @@ def test_remove_job_refuses_system_jobs(tmp_path) -> None:
 async def test_start_server_not_jobs(tmp_path):
     store_path = tmp_path / "cron" / "jobs.json"
     called = []
+
     async def on_job(job):
         called.append(job.name)
 
@@ -436,12 +439,14 @@ def test_update_job_not_found(tmp_path) -> None:
 
 def test_update_job_rejects_system_job(tmp_path) -> None:
     service = CronService(tmp_path / "cron" / "jobs.json")
-    service.register_system_job(CronJob(
-        id="dream",
-        name="dream",
-        schedule=CronSchedule(kind="cron", expr="0 */2 * * *", tz="UTC"),
-        payload=CronPayload(kind="system_event"),
-    ))
+    service.register_system_job(
+        CronJob(
+            id="dream",
+            name="dream",
+            schedule=CronSchedule(kind="cron", expr="0 */2 * * *", tz="UTC"),
+            payload=CronPayload(kind="system_event"),
+        )
+    )
     result = service.update_job("dream", name="hacked")
     assert result == "protected"
     assert service.get_job("dream").name == "dream"
@@ -464,6 +469,7 @@ def test_update_job_validates_schedule(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_update_job_preserves_run_history(tmp_path) -> None:
     import asyncio
+
     store_path = tmp_path / "cron" / "jobs.json"
     service = CronService(store_path, on_job=lambda _: asyncio.sleep(0))
     job = service.add_job(
@@ -564,3 +570,50 @@ async def test_list_jobs_during_on_job_does_not_cause_stale_reload(tmp_path) -> 
         next_run = j["state"]["nextRunAtMs"]
         assert next_run is not None
         assert next_run > now_ms, f"Job '{j['name']}' next_run should be in the future"
+
+
+def test_use_user_session_defaults_to_true(tmp_path) -> None:
+    service = CronService(tmp_path / "cron" / "jobs.json")
+    job = service.add_job(
+        name="default session",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="hello",
+    )
+    assert job.payload.use_user_session is True
+
+
+def test_use_user_session_false_persists(tmp_path) -> None:
+    store_path = tmp_path / "cron" / "jobs.json"
+    service = CronService(store_path)
+    service._load_store()
+    job = service.add_job(
+        name="isolated",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="hello",
+        use_user_session=False,
+    )
+
+    raw = json.loads((tmp_path / "cron" / "action.jsonl").read_text().strip().split("\n")[-1])
+    assert raw["params"]["payload"]["use_user_session"] is False
+
+    fresh = CronService(store_path)
+    loaded = fresh.get_job(job.id)
+    assert loaded is not None
+    assert loaded.payload.use_user_session is False
+
+
+def test_use_user_session_true_survives_reload(tmp_path) -> None:
+    store_path = tmp_path / "cron" / "jobs.json"
+    service = CronService(store_path)
+    service._load_store()
+    job = service.add_job(
+        name="user session",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="hello",
+        use_user_session=True,
+    )
+
+    fresh = CronService(store_path)
+    loaded = fresh.get_job(job.id)
+    assert loaded is not None
+    assert loaded.payload.use_user_session is True
