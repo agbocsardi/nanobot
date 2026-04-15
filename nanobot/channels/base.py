@@ -28,6 +28,7 @@ class BaseChannel(ABC):
     transcription_language: str | None = None
     send_progress: bool = True
     send_tool_hints: bool = False
+    transcription_faster_whisper: Any = None  # FasterWhisperConfig when provider is faster_whisper
 
     def __init__(self, config: Any, bus: MessageBus):
         """
@@ -42,12 +43,32 @@ class BaseChannel(ABC):
         self._running = False
 
     async def transcribe_audio(self, file_path: str | Path) -> str:
-        """Transcribe an audio file via Whisper (OpenAI or Groq). Returns empty string on failure."""
-        if not self.transcription_api_key:
-            return ""
+        """Transcribe an audio file via Whisper (OpenAI, Groq, or faster-whisper). Returns empty string on failure."""
         try:
+            if self.transcription_provider == "faster_whisper":
+                from nanobot.providers.transcription import FasterWhisperTranscriptionProvider
+
+                cfg = self.transcription_faster_whisper
+                if cfg is not None:
+                    provider = FasterWhisperTranscriptionProvider(
+                        venv_python=getattr(
+                            cfg, "venv_python", "~/.nanobot/whisper-env/bin/python"
+                        ),
+                        script_path=getattr(cfg, "script_path", ""),
+                        model=getattr(cfg, "model", "small"),
+                        device=getattr(cfg, "device", "cpu"),
+                        compute_type=getattr(cfg, "compute_type", "int8"),
+                    )
+                else:
+                    provider = FasterWhisperTranscriptionProvider()
+                return await provider.transcribe(file_path)
+
+            if not self.transcription_api_key:
+                return ""
+
             if self.transcription_provider == "openai":
                 from nanobot.providers.transcription import OpenAITranscriptionProvider
+
                 provider = OpenAITranscriptionProvider(
                     api_key=self.transcription_api_key,
                     api_base=self.transcription_api_base or None,
@@ -55,6 +76,7 @@ class BaseChannel(ABC):
                 )
             else:
                 from nanobot.providers.transcription import GroqTranscriptionProvider
+
                 provider = GroqTranscriptionProvider(
                     api_key=self.transcription_api_key,
                     api_base=self.transcription_api_base or None,
@@ -107,7 +129,9 @@ class BaseChannel(ABC):
         """
         pass
 
-    async def send_delta(self, chat_id: str, delta: str, metadata: dict[str, Any] | None = None) -> None:
+    async def send_delta(
+        self, chat_id: str, delta: str, metadata: dict[str, Any] | None = None
+    ) -> None:
         """Deliver a streaming text chunk.
 
         Override in subclasses to enable streaming. Implementations should
@@ -123,7 +147,11 @@ class BaseChannel(ABC):
     def supports_streaming(self) -> bool:
         """True when config enables streaming AND this subclass implements send_delta."""
         cfg = self.config
-        streaming = cfg.get("streaming", False) if isinstance(cfg, dict) else getattr(cfg, "streaming", False)
+        streaming = (
+            cfg.get("streaming", False)
+            if isinstance(cfg, dict)
+            else getattr(cfg, "streaming", False)
+        )
         return bool(streaming) and type(self).send_delta is not BaseChannel.send_delta
 
     def is_allowed(self, sender_id: str) -> bool:
@@ -168,7 +196,8 @@ class BaseChannel(ABC):
             logger.warning(
                 "Access denied for sender {} on channel {}. "
                 "Add them to allowFrom list in config to grant access.",
-                sender_id, self.name,
+                sender_id,
+                self.name,
             )
             return
 
