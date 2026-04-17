@@ -719,7 +719,7 @@ def gateway(
         if isinstance(cron_tool, CronTool):
             cron_token = cron_tool.set_cron_context(True)
 
-        use_user = job.payload.use_user_session and job.payload.channel and job.payload.to
+        use_user = not job.payload.isolated_session and job.payload.channel and job.payload.to
         if use_user:
             session_key = f"{job.payload.channel}:{job.payload.to}"
         else:

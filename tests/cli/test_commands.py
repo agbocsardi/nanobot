@@ -966,7 +966,7 @@ def test_gateway_cron_evaluator_receives_scheduled_reminder_context(
             deliver=True,
             channel="telegram",
             to="user-1",
-            use_user_session=False,
+            isolated_session=True,
         ),
     )
 
@@ -991,7 +991,7 @@ def test_gateway_cron_evaluator_receives_scheduled_reminder_context(
 
 
 def test_gateway_cron_user_session_skips_manual_delivery(monkeypatch, tmp_path: Path) -> None:
-    """When use_user_session=True the response is delivered through the
+    """When isolated_session=False the response is delivered through the
     normal message pipeline, so on_cron_job must NOT publish a second
     OutboundMessage."""
     config_file = tmp_path / "instance" / "config.json"
@@ -1061,7 +1061,7 @@ def test_gateway_cron_user_session_skips_manual_delivery(monkeypatch, tmp_path: 
             deliver=True,
             channel="telegram",
             to="user-1",
-            use_user_session=True,
+            isolated_session=False,
         ),
     )
 

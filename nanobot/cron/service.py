@@ -118,7 +118,7 @@ class CronService:
                                 deliver=j["payload"].get("deliver", False),
                                 channel=j["payload"].get("channel"),
                                 to=j["payload"].get("to"),
-                                use_user_session=j["payload"].get("useUserSession", True),
+                                isolated_session=j["payload"].get("isolatedSession", False),
                             ),
                             state=CronJobState(
                                 next_run_at_ms=j.get("state", {}).get("nextRunAtMs"),
@@ -222,7 +222,7 @@ class CronService:
                         "deliver": j.payload.deliver,
                         "channel": j.payload.channel,
                         "to": j.payload.to,
-                        "useUserSession": j.payload.use_user_session,
+                        "isolatedSession": j.payload.isolated_session,
                     },
                     "state": {
                         "nextRunAtMs": j.state.next_run_at_ms,
@@ -393,11 +393,11 @@ class CronService:
         name: str,
         schedule: CronSchedule,
         message: str,
-        deliver: bool = False,
+        deliver: bool = True,
         channel: str | None = None,
         to: str | None = None,
         delete_after_run: bool = False,
-        use_user_session: bool = True,
+        isolated_session: bool = False,
     ) -> CronJob:
         """Add a new job."""
         _validate_schedule_for_add(schedule)
@@ -414,7 +414,7 @@ class CronService:
                 deliver=deliver,
                 channel=channel,
                 to=to,
-                use_user_session=use_user_session,
+                isolated_session=isolated_session,
             ),
             state=CronJobState(next_run_at_ms=_compute_next_run(schedule, now)),
             created_at_ms=now,
@@ -501,7 +501,7 @@ class CronService:
         channel: str | None = ...,
         to: str | None = ...,
         delete_after_run: bool | None = None,
-        use_user_session: bool | None = None,
+        isolated_session: bool | None = None,
     ) -> CronJob | Literal["not_found", "protected"]:
         """Update mutable fields of an existing job. System jobs cannot be updated.
 
@@ -528,8 +528,8 @@ class CronService:
             job.payload.channel = channel
         if to is not ...:
             job.payload.to = to
-        if use_user_session is not None:
-            job.payload.use_user_session = use_user_session
+        if isolated_session is not None:
+            job.payload.isolated_session = isolated_session
         if delete_after_run is not None:
             job.delete_after_run = delete_after_run
 

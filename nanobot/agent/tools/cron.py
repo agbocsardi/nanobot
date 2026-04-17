@@ -40,12 +40,12 @@ from nanobot.cron.types import CronJob, CronJobState, CronSchedule
             description="Whether to deliver the execution result to the user channel (default true)",
             default=True,
         ),
-        use_user_session=BooleanSchema(
+        isolated_session=BooleanSchema(
             description=(
-                "Run in the user's existing session so the agent sees conversation history (default true). "
-                "When false the job runs in an isolated session with no prior context."
+                "Whether to run in an isolated session with no access to conversation history. "
+                "Set to true for standalone tasks that don't need context. Default false."
             ),
-            default=True,
+            default=False,
         ),
         job_id=StringSchema("Job ID (for remove)"),
         required=["action"],
@@ -117,14 +117,14 @@ class CronTool(Tool):
         at: str | None = None,
         job_id: str | None = None,
         deliver: bool = True,
-        use_user_session: bool = True,
+        isolated_session: bool = False,
         **kwargs: Any,
     ) -> str:
         if action == "add":
             if self._in_cron_context.get():
                 return "Error: cannot schedule new jobs from within a cron job execution"
             return self._add_job(
-                name, message, every_seconds, cron_expr, tz, at, deliver, use_user_session
+                name, message, every_seconds, cron_expr, tz, at, deliver, isolated_session
             )
         elif action == "list":
             return self._list_jobs()
@@ -141,7 +141,7 @@ class CronTool(Tool):
         tz: str | None,
         at: str | None,
         deliver: bool = True,
-        use_user_session: bool = True,
+        isolated_session: bool = False,
     ) -> str:
         if not message:
             return "Error: message is required for add"
@@ -187,7 +187,7 @@ class CronTool(Tool):
             channel=self._channel,
             to=self._chat_id,
             delete_after_run=delete_after,
-            use_user_session=use_user_session,
+            isolated_session=isolated_session,
         )
         return f"Created job '{job.name}' (id: {job.id})"
 
@@ -243,10 +243,10 @@ class CronTool(Tool):
                 parts.append(f"  Purpose: {self._system_job_purpose(j)}")
                 parts.append("  Protected: visible for inspection, but cannot be removed.")
             else:
-                if j.payload.use_user_session:
-                    parts.append("  Session: user (shared context)")
-                else:
+                if j.payload.isolated_session:
                     parts.append("  Session: isolated (no prior context)")
+                else:
+                    parts.append("  Session: user (shared context)")
             parts.extend(self._format_state(j.state, j.schedule))
             lines.append("\n".join(parts))
         return "Scheduled jobs:\n" + "\n".join(lines)

@@ -365,25 +365,25 @@ def test_list_excludes_disabled_jobs(tmp_path) -> None:
     assert result == "No scheduled jobs."
 
 
-# -- use_user_session tests --
+# -- isolated_session tests --
 
 
-def test_add_job_defaults_use_user_session_true(tmp_path) -> None:
+def test_add_job_defaults_isolated_session_false(tmp_path) -> None:
     tool = _make_tool(tmp_path)
     tool.set_context("telegram", "chat-1")
 
     tool._add_job(None, "standup", None, "0 9 * * *", None, None)
     job = tool._cron.list_jobs()[0]
-    assert job.payload.use_user_session is True
+    assert job.payload.isolated_session is False
 
 
-def test_add_job_can_disable_use_user_session(tmp_path) -> None:
+def test_add_job_can_enable_isolated_session(tmp_path) -> None:
     tool = _make_tool(tmp_path)
     tool.set_context("telegram", "chat-1")
 
-    tool._add_job(None, "standup", None, "0 9 * * *", None, None, use_user_session=False)
+    tool._add_job(None, "standup", None, "0 9 * * *", None, None, isolated_session=True)
     job = tool._cron.list_jobs()[0]
-    assert job.payload.use_user_session is False
+    assert job.payload.isolated_session is True
 
 
 def test_list_shows_user_session_mode(tmp_path) -> None:
@@ -392,7 +392,7 @@ def test_list_shows_user_session_mode(tmp_path) -> None:
         name="User job",
         schedule=CronSchedule(kind="cron", expr="0 9 * * *", tz="UTC"),
         message="test",
-        use_user_session=True,
+        isolated_session=False,
     )
     result = tool._list_jobs()
     assert "Session: user (shared context)" in result
@@ -404,7 +404,7 @@ def test_list_shows_isolated_session_mode(tmp_path) -> None:
         name="Isolated job",
         schedule=CronSchedule(kind="cron", expr="0 9 * * *", tz="UTC"),
         message="test",
-        use_user_session=False,
+        isolated_session=True,
     )
     result = tool._list_jobs()
     assert "Session: isolated (no prior context)" in result

@@ -572,17 +572,17 @@ async def test_list_jobs_during_on_job_does_not_cause_stale_reload(tmp_path) -> 
         assert next_run > now_ms, f"Job '{j['name']}' next_run should be in the future"
 
 
-def test_use_user_session_defaults_to_true(tmp_path) -> None:
+def test_isolated_session_defaults_to_false(tmp_path) -> None:
     service = CronService(tmp_path / "cron" / "jobs.json")
     job = service.add_job(
         name="default session",
         schedule=CronSchedule(kind="every", every_ms=60_000),
         message="hello",
     )
-    assert job.payload.use_user_session is True
+    assert job.payload.isolated_session is False
 
 
-def test_use_user_session_false_persists(tmp_path) -> None:
+def test_isolated_session_true_persists(tmp_path) -> None:
     store_path = tmp_path / "cron" / "jobs.json"
     service = CronService(store_path)
     service._load_store()
@@ -590,19 +590,19 @@ def test_use_user_session_false_persists(tmp_path) -> None:
         name="isolated",
         schedule=CronSchedule(kind="every", every_ms=60_000),
         message="hello",
-        use_user_session=False,
+        isolated_session=True,
     )
 
     raw = json.loads((tmp_path / "cron" / "action.jsonl").read_text().strip().split("\n")[-1])
-    assert raw["params"]["payload"]["use_user_session"] is False
+    assert raw["params"]["payload"]["isolated_session"] is True
 
     fresh = CronService(store_path)
     loaded = fresh.get_job(job.id)
     assert loaded is not None
-    assert loaded.payload.use_user_session is False
+    assert loaded.payload.isolated_session is True
 
 
-def test_use_user_session_true_survives_reload(tmp_path) -> None:
+def test_isolated_session_false_survives_reload(tmp_path) -> None:
     store_path = tmp_path / "cron" / "jobs.json"
     service = CronService(store_path)
     service._load_store()
@@ -610,10 +610,10 @@ def test_use_user_session_true_survives_reload(tmp_path) -> None:
         name="user session",
         schedule=CronSchedule(kind="every", every_ms=60_000),
         message="hello",
-        use_user_session=True,
+        isolated_session=False,
     )
 
     fresh = CronService(store_path)
     loaded = fresh.get_job(job.id)
     assert loaded is not None
-    assert loaded.payload.use_user_session is True
+    assert loaded.payload.isolated_session is False

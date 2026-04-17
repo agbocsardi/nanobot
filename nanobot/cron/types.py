@@ -29,9 +29,9 @@ class CronPayload:
     deliver: bool = False
     channel: str | None = None  # e.g. "whatsapp"
     to: str | None = None  # e.g. phone number
-    # Run in the user's session (channel:to) instead of an isolated cron:{job_id} session.
-    # When True the agent sees conversation history; when False it runs in a blank session.
-    use_user_session: bool = True
+    # When True, run in an isolated session with no access to conversation history.
+    # When False (default), the job shares the user's session context.
+    isolated_session: bool = False
 
 
 @dataclass
