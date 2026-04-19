@@ -79,7 +79,7 @@ async def test_transcribe_audio_faster_whisper_uses_config() -> None:
     channel.transcription_provider = "faster_whisper"
     channel.transcription_api_key = ""
     channel.transcription_faster_whisper = SimpleNamespace(
-        venv_python="/opt/whisper/bin/python",
+        uv_bin="/opt/bin/uv",
         script_path="/opt/whisper/run.py",
         model="large-v3",
         device="cuda",
@@ -97,7 +97,7 @@ async def test_transcribe_audio_faster_whisper_uses_config() -> None:
 
     assert result == "gpu text"
     mock_cls.assert_called_once_with(
-        venv_python="/opt/whisper/bin/python",
+        uv_bin="/opt/bin/uv",
         script_path="/opt/whisper/run.py",
         model="large-v3",
         device="cuda",

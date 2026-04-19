@@ -17,9 +17,13 @@ class Base(BaseModel):
 
 
 class FasterWhisperConfig(Base):
-    """Local faster-whisper transcription configuration."""
+    """Local faster-whisper transcription configuration.
 
-    venv_python: str = "~/.nanobot/whisper-env/bin/python"  # Path to isolated venv Python
+    The bundled PEP 723 script declares its own deps; `uv run --script` manages
+    the isolated cached environment (no hand-rolled venv).
+    """
+
+    uv_bin: str = "uv"  # uv executable (name on PATH or absolute path)
     script_path: str = ""  # Empty → resolve to bundled nanobot/providers/whisper/transcribe.py
     model: str = "small"  # Whisper model size
     device: str = "cpu"  # "cpu" or "cuda"

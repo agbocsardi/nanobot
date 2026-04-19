@@ -26,7 +26,7 @@ def _make_proc(
 @pytest.fixture()
 def provider(tmp_path: Path) -> FasterWhisperTranscriptionProvider:
     return FasterWhisperTranscriptionProvider(
-        venv_python="/usr/bin/python3",
+        uv_bin="uv",
         script_path=str(tmp_path / "transcribe.py"),
         model="small",
         device="cpu",
@@ -46,10 +46,9 @@ def test_explicit_script_path_is_used(tmp_path: Path) -> None:
     assert p.script_path == str(custom)
 
 
-def test_venv_python_expands_tilde() -> None:
-    p = FasterWhisperTranscriptionProvider(venv_python="~/my-env/bin/python")
-    assert "~" not in p.venv_python
-    assert p.venv_python.endswith("my-env/bin/python")
+def test_default_uv_bin() -> None:
+    p = FasterWhisperTranscriptionProvider()
+    assert p.uv_bin == "uv"
 
 
 async def test_transcribe_returns_stdout_on_success(
@@ -69,10 +68,12 @@ async def test_transcribe_returns_stdout_on_success(
 
     assert result == "Hello, world!"
     mock_exec.assert_called_once()
-    args = mock_exec.call_args
-    assert args[0][0] == provider.venv_python
-    assert args[0][1] == provider.script_path
-    assert args[0][2] == str(audio)
+    args = mock_exec.call_args[0]
+    assert args[0] == provider.uv_bin
+    assert args[1] == "run"
+    assert "--script" in args
+    assert provider.script_path in args
+    assert str(audio) in args
 
 
 async def test_transcribe_returns_empty_on_nonzero_exit(
@@ -153,7 +154,7 @@ async def test_transcribe_honors_custom_config(tmp_path: Path) -> None:
     audio.write_bytes(b"fake")
 
     provider = FasterWhisperTranscriptionProvider(
-        venv_python="/usr/bin/python3",
+        uv_bin="/opt/bin/uv",
         script_path=str(tmp_path / "custom.py"),
         model="large-v3",
         device="cuda",
@@ -170,6 +171,8 @@ async def test_transcribe_honors_custom_config(tmp_path: Path) -> None:
         result = await provider.transcribe(audio)
 
     assert result == "gpu result"
+    args = mock_exec.call_args[0]
+    assert args[0] == "/opt/bin/uv"
     env = mock_exec.call_args[1]["env"]
     assert env["NANOBOT_WHISPER_MODEL"] == "large-v3"
     assert env["NANOBOT_WHISPER_DEVICE"] == "cuda"
