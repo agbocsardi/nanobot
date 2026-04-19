@@ -990,10 +990,11 @@ def test_gateway_cron_evaluator_receives_scheduled_reminder_context(
     )
 
 
-def test_gateway_cron_user_session_skips_manual_delivery(monkeypatch, tmp_path: Path) -> None:
-    """When isolated_session=False the response is delivered through the
-    normal message pipeline, so on_cron_job must NOT publish a second
-    OutboundMessage."""
+def test_gateway_cron_user_session_publishes_final_response(monkeypatch, tmp_path: Path) -> None:
+    """When isolated_session=False the final response returned by
+    process_direct must still be published. process_direct bypasses the
+    inbound dispatch path that would normally publish it, so on_cron_job
+    must emit the OutboundMessage itself."""
     config_file = tmp_path / "instance" / "config.json"
     config_file.parent.mkdir(parents=True)
     config_file.write_text("{}")
@@ -1069,7 +1070,91 @@ def test_gateway_cron_user_session_skips_manual_delivery(monkeypatch, tmp_path: 
     assert response == "Daily standup summary."
     # Session key should be the user's session, not cron:{id}
     assert seen["session_key"] == "telegram:user-1"
-    # No manual delivery — response already went through the pipeline
+    # process_direct returns the OutboundMessage but doesn't publish it,
+    # so on_cron_job must publish it explicitly when deliver=True.
+    bus.publish_outbound.assert_awaited_once_with(
+        OutboundMessage(
+            channel="telegram",
+            chat_id="user-1",
+            content="Daily standup summary.",
+        )
+    )
+
+
+def test_gateway_cron_user_session_skips_publish_when_message_tool_delivered(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """If the agent used the message tool during the turn, _process_message
+    returns None and the response is already published — on_cron_job must
+    not double-publish."""
+    config_file = tmp_path / "instance" / "config.json"
+    config_file.parent.mkdir(parents=True)
+    config_file.write_text("{}")
+
+    config = Config()
+    config.agents.defaults.workspace = str(tmp_path / "config-workspace")
+    provider = object()
+    bus = MagicMock()
+    bus.publish_outbound = AsyncMock()
+    seen: dict[str, object] = {}
+
+    monkeypatch.setattr("nanobot.config.loader.set_config_path", lambda _path: None)
+    monkeypatch.setattr("nanobot.config.loader.load_config", lambda _path=None: config)
+    monkeypatch.setattr("nanobot.cli.commands.sync_workspace_templates", lambda _path: None)
+    monkeypatch.setattr("nanobot.cli.commands._make_provider", lambda _config: provider)
+    monkeypatch.setattr("nanobot.bus.queue.MessageBus", lambda: bus)
+    monkeypatch.setattr("nanobot.session.manager.SessionManager", lambda _workspace: object())
+
+    class _FakeCron:
+        def __init__(self, _store_path: Path) -> None:
+            self.on_job = None
+            seen["cron"] = self
+
+    class _FakeAgentLoop:
+        def __init__(self, *args, **kwargs) -> None:
+            self.model = "test-model"
+            self.tools = {}
+
+        async def process_direct(self, *args, **kwargs):
+            return None  # simulate message tool already delivered
+
+        async def close_mcp(self) -> None:
+            return None
+
+        async def run(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+    class _StopAfterCronSetup:
+        def __init__(self, *_args, **_kwargs) -> None:
+            raise _StopGatewayError("stop")
+
+    monkeypatch.setattr("nanobot.cron.service.CronService", _FakeCron)
+    monkeypatch.setattr("nanobot.agent.loop.AgentLoop", _FakeAgentLoop)
+    monkeypatch.setattr("nanobot.channels.manager.ChannelManager", _StopAfterCronSetup)
+
+    result = runner.invoke(app, ["gateway", "--config", str(config_file)])
+    assert isinstance(result.exception, _StopGatewayError)
+
+    cron = seen["cron"]
+    assert cron.on_job is not None
+
+    job = CronJob(
+        id="cron-3",
+        name="standup",
+        payload=CronPayload(
+            message="Summarise standup.",
+            deliver=True,
+            channel="telegram",
+            to="user-1",
+            isolated_session=False,
+        ),
+    )
+
+    response = asyncio.run(cron.on_job(job))
+    assert response == ""
     bus.publish_outbound.assert_not_awaited()
 
 

@@ -738,10 +738,14 @@ def gateway(
 
         response = resp.content if resp else ""
 
-        # When the cron job ran in the user's own session, the agent's
-        # response was already delivered through the normal message
-        # pipeline — no need to manually publish an OutboundMessage.
+        # Shared-session crons still need an explicit publish. process_direct
+        # bypasses the inbound dispatch path that would normally emit the
+        # final OutboundMessage, so the agent's reply is otherwise dropped.
+        # _process_message returns None when the message tool already
+        # delivered a user-visible reply during the turn — skip in that case.
         if use_user:
+            if resp is not None and job.payload.deliver:
+                await bus.publish_outbound(resp)
             return response
 
         message_tool = agent.tools.get("message")
