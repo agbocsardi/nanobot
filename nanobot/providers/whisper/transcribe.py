@@ -1,15 +1,21 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "faster-whisper>=1.0.3",
+# ]
+# ///
 """Transcribe audio files using faster-whisper (small, CPU, int8).
 
-Standalone script run by the isolated whisper-env Python.
-Prints clean transcript to stdout; stderr for diagnostics only.
+Standalone PEP 723 script. `uv run --script` manages the isolated environment;
+no hand-rolled venv required. Prints transcript to stdout; stderr for diagnostics.
 
 Environment variables:
     NANOBOT_WHISPER_MODEL        Model size (default: small)
     NANOBOT_WHISPER_DEVICE       Device (default: cpu)
     NANOBOT_WHISPER_COMPUTE_TYPE Compute type (default: int8)
 
-Usage: transcribe.py <audio_file> [language]
+Usage: uv run --script transcribe.py <audio_file> [language]
 Exit codes: 0 success, 1 bad args / file not found, 2 transcription error
 """
 

@@ -75,14 +75,6 @@ def get_bridge_install_dir() -> Path:
     return Path.home() / ".nanobot" / "bridge"
 
 
-def get_whisper_env_dir() -> Path:
-    """Return the isolated faster-whisper venv directory.
-
-    User-managed (not auto-created by nanobot).
-    """
-    return Path.home() / ".nanobot" / "whisper-env"
-
-
 def get_legacy_sessions_dir() -> Path:
     """Return the legacy global session directory used for migration fallback."""
     return Path.home() / ".nanobot" / "sessions"
