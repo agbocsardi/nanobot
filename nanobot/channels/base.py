@@ -47,9 +47,7 @@ class BaseChannel(ABC):
                 cfg = self.transcription_faster_whisper
                 if cfg is not None:
                     provider = FasterWhisperTranscriptionProvider(
-                        venv_python=getattr(
-                            cfg, "venv_python", "~/.nanobot/whisper-env/bin/python"
-                        ),
+                        uv_bin=getattr(cfg, "uv_bin", "uv"),
                         script_path=getattr(cfg, "script_path", ""),
                         model=getattr(cfg, "model", "small"),
                         device=getattr(cfg, "device", "cpu"),

@@ -96,19 +96,23 @@ class GroqTranscriptionProvider:
 
 
 class FasterWhisperTranscriptionProvider:
-    """Local voice transcription using faster-whisper via an isolated venv subprocess."""
+    """Local voice transcription using faster-whisper via `uv run --script`.
+
+    Dependencies are declared inline in the bundled PEP 723 script; uv manages
+    (and caches) the isolated environment — no hand-managed venv required.
+    """
 
     _TIMEOUT_S = 120.0
 
     def __init__(
         self,
-        venv_python: str = "~/.nanobot/whisper-env/bin/python",
+        uv_bin: str = "uv",
         script_path: str = "",
         model: str = "small",
         device: str = "cpu",
         compute_type: str = "int8",
     ):
-        self.venv_python = str(Path(venv_python).expanduser())
+        self.uv_bin = uv_bin
         if script_path:
             self.script_path = str(Path(script_path).expanduser())
         else:
@@ -132,7 +136,10 @@ class FasterWhisperTranscriptionProvider:
 
         try:
             proc = await asyncio.create_subprocess_exec(
-                self.venv_python,
+                self.uv_bin,
+                "run",
+                "--quiet",
+                "--script",
                 self.script_path,
                 str(path),
                 stdout=asyncio.subprocess.PIPE,
