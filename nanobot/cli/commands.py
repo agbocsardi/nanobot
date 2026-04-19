@@ -719,12 +719,24 @@ def gateway(
         cron_token = None
         if isinstance(cron_tool, CronTool):
             cron_token = cron_tool.set_cron_context(True)
+
+        # Cron jobs run in a private session, and whether the user sees
+        # anything is decided below via `deliver` and the evaluator. Without
+        # an explicit on_progress, the agent loop publishes every reasoning
+        # step and tool-hint to the user's channel via the default
+        # _bus_progress callback — which turns scheduled tasks into live
+        # narration and, when deliver=False, leaks output the job
+        # explicitly asked to suppress. Silence it.
+        async def _silent_progress(*_args, **_kwargs) -> None:
+            return None
+
         try:
             resp = await agent.process_direct(
                 reminder_note,
                 session_key=f"cron:{job.id}",
                 channel=job.payload.channel or "cli",
                 chat_id=job.payload.to or "direct",
+                on_progress=_silent_progress,
             )
         finally:
             if isinstance(cron_tool, CronTool) and cron_token is not None:
