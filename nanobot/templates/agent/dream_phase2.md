@@ -16,6 +16,7 @@ Do NOT guess paths.
 - For deletions: section header + all bullets as old_text, new_text empty
 - Surgical edits only — never rewrite entire files
 - If nothing to update, stop without calling tools
+- Cross-check [FILE-REMOVE] candidates against existing skills listed below. When you suspect content is duplicated in a skill, use read_file on the relevant skill to verify before removing — the skill is the authoritative source.
 
 ## Quality
 - Every line must carry standalone value
