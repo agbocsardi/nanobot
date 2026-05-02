@@ -27,7 +27,7 @@ export default defineConfig(({ mode }) => {
       sourcemap: false,
     },
     server: {
-      host: "127.0.0.1",
+      host: "0.0.0.0",
       port: 5173,
       strictPort: true,
       // Move Vite's HMR socket to a dedicated port so it doesn't collide with
@@ -35,7 +35,7 @@ export default defineConfig(({ mode }) => {
       // the root path, which triggers spurious write-after-end errors as each
       // side tries to close the other's socket).
       hmr: {
-        host: "127.0.0.1",
+        host: "0.0.0.0",
         port: 5174,
       },
       proxy: {
