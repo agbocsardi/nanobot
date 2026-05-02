@@ -41,10 +41,24 @@ class MemoryStore:
         r"^\[\d{4}-\d{2}-\d{2}[^\]]*\]\s+[A-Z][A-Z0-9_]*(?:\s+\[tools:\s*[^\]]+\])?:"
     )
 
+    _SYSTEM_FILES = [
+        "memory/system/procedures.md",
+        "memory/system/corrections.md",
+        "memory/system/now.md",
+    ]
+
+    _TOPIC_FILES = [
+        "memory/cooking.md",
+        "memory/health.md",
+        "memory/homelab.md",
+        "memory/api-notes.md",
+    ]
+
     def __init__(self, workspace: Path, max_history_entries: int = _DEFAULT_MAX_HISTORY):
         self.workspace = workspace
         self.max_history_entries = max_history_entries
         self.memory_dir = ensure_dir(workspace / "memory")
+        self.system_dir = ensure_dir(self.memory_dir / "system")
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.history_file = self.memory_dir / "history.jsonl"
         self.legacy_history_file = self.memory_dir / "HISTORY.md"
@@ -56,6 +70,8 @@ class MemoryStore:
         self._oversize_logged = False  # rate-limit oversized-entry warning
         self._git = GitStore(workspace, tracked_files=[
             "SOUL.md", "USER.md", "memory/MEMORY.md",
+            *self._SYSTEM_FILES,
+            *self._TOPIC_FILES,
         ])
         self._maybe_migrate_legacy_history()
 
@@ -220,6 +236,21 @@ class MemoryStore:
     # -- context injection (used by context.py) ------------------------------
 
     def get_memory_context(self) -> str:
+        """Return always-loaded memory context.
+
+        Reads all .md files from ``memory/system/`` and concatenates them.
+        Falls back to the legacy monolithic ``memory/MEMORY.md`` if the
+        system directory is empty (backward compat).
+        """
+        parts: list[str] = []
+        for md_file in sorted(self.system_dir.glob("*.md")):
+            content = md_file.read_text(encoding="utf-8").strip()
+            if content:
+                parts.append(f"## {md_file.stem}\n\n{content}")
+        if parts:
+            return "# System Memory\n\n" + "\n\n".join(parts)
+
+        # Legacy fallback — workspace hasn't migrated to system/ yet
         long_term = self.read_memory()
         return f"## Long-term Memory\n{long_term}" if long_term else ""
 

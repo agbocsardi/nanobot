@@ -3,11 +3,10 @@ Update memory files based on the analysis below.
 - [FILE-REMOVE] entries: delete the corresponding content from memory files
 
 ## File paths (relative to workspace root)
-- SOUL.md
-- USER.md
-- memory/MEMORY.md
 
-Do NOT guess paths.
+Read SOUL.md for the authoritative list of memory file paths and their purposes. Edit only the files listed there.
+
+Do NOT guess paths. Prefer editing system/ files over topic files for high-signal updates.
 
 ## Editing rules
 - Edit directly — file contents provided below, no read_file needed
