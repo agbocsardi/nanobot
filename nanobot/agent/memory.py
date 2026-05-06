@@ -744,6 +744,7 @@ class Dream:
     _MEMORY_FILE_MAX_CHARS = 32_000
     _SOUL_FILE_MAX_CHARS = 16_000
     _USER_FILE_MAX_CHARS = 16_000
+    _TOPIC_FILE_MAX_CHARS = 16_000
     _HISTORY_ENTRY_PREVIEW_MAX_CHARS = 4_000
 
     def __init__(
@@ -939,11 +940,31 @@ class Dream:
             self.store.read_user() or "(empty)", self._USER_FILE_MAX_CHARS,
         )
 
+        # Build topic file context from memory/*.md (excluding MEMORY.md and system/)
+        topic_parts: list[str] = []
+        for md_file in sorted(self.store.memory_dir.glob("*.md")):
+            if md_file.name == "MEMORY.md":
+                continue
+            content = md_file.read_text(encoding="utf-8").strip()
+            if content:
+                rel_path = str(md_file.relative_to(self.store.workspace))
+                annotated = (
+                    self._annotate_with_ages(content, file_path=rel_path)
+                    if self.annotate_line_ages
+                    else content
+                )
+                topic_parts.append(f"### {rel_path}\n{annotated}")
+        topic_context = ""
+        if topic_parts:
+            raw_topics = "\n\n".join(topic_parts)
+            topic_context = f"\n\n## Topic Files\n{truncate_text(raw_topics, self._TOPIC_FILE_MAX_CHARS)}"
+
         file_context = (
             f"## Current Date\n{current_date}\n\n"
             f"## Current Memory Files ({len(current_memory)} chars)\n{current_memory}\n\n"
             f"## Current SOUL.md ({len(current_soul)} chars)\n{current_soul}\n\n"
             f"## Current USER.md ({len(current_user)} chars)\n{current_user}"
+            f"{topic_context}"
         )
 
         # Phase 1: Analyze (no skills list — dedup is Phase 2's job)

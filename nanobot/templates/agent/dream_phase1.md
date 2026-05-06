@@ -30,10 +30,12 @@ Deduplication — scan ALL memory files for these redundancy patterns:
 - Information in topic files that is already captured in USER.md, SOUL.md, or a skill file
 - Verbose entries that can be condensed without losing information
 For each duplicate found, output [FILE-REMOVE] for the less authoritative copy (prefer keeping facts in their canonical location):
-  - Identity/preferences → USER.md
+  - Identity/personal traits (name, pronouns, diet, schedule, personality) → USER.md
+  - Product/equipment/domain preferences (gear, ingredients, tools, services) → the relevant topic file (e.g. homelab.md, cooking.md)
   - Behavioral rules/anti-patterns → corrections.md
   - Domain knowledge → the relevant topic file
   - Skill-covered content → the skill file is the authoritative source, remove from memory
+  - If no topic file fits, create a new one or use the closest match — do NOT put product/equipment info in USER.md
 
 Staleness — system/ and topic files may have ``← Nd`` suffixes showing days since last modification:
 - USER.md and SOUL.md have no age annotations — they are permanent, only update with corrections
