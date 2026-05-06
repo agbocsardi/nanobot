@@ -17,6 +17,15 @@ Do NOT guess paths. Prefer editing system/ files over topic files for high-signa
 - If nothing to update, stop without calling tools
 - Cross-check [FILE-REMOVE] candidates against existing skills listed below. When you suspect content is duplicated in a skill, use read_file on the relevant skill to verify before removing — the skill is the authoritative source.
 
+## Identity preservation
+SOUL.md and USER.md are load-bearing files. Edit them surgically — append, modify specific entries, adjust wording. Never rewrite them wholesale or silently overwrite established identity. Changes should be incremental.
+
+## Review before finishing
+After all edits, do a quick sanity pass:
+- **Tier check**: Did you add anything to USER.md that's really a product/equipment/domain preference? Move it to the appropriate topic file.
+- **Contradictions**: Did your edits leave any conflicting entries? Fix at the source.
+- **Completeness**: Did you miss any [FILE] or [FILE-REMOVE] items from the analysis?
+
 ## Quality
 - Every line must carry standalone value
 - Concise bullets under clear headers
