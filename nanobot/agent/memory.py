@@ -551,38 +551,48 @@ class Consolidator:
         except Exception:
             return truncate_text(text, budget * 4)
 
-    async def archive(self, messages: list[dict]) -> str | None:
-        """Summarize messages via LLM and append to history.jsonl.
+    @staticmethod
+    def _prune_messages(messages: list[dict]) -> list[dict]:
+        """Mechanically prune tool noise from messages before archiving.
 
-        Returns the summary text on success, None if nothing to archive.
+        Strips tool-role messages (raw results), removes empty assistant
+        messages (tool-call-only turns), and truncates long content.
+        Dream gets actual conversation context instead of LLM summaries.
+        """
+        pruned: list[dict] = []
+        for msg in messages:
+            role = msg.get("role", "")
+            if role == "tool":
+                continue
+            content = msg.get("content", "")
+            if not content.strip():
+                continue
+            if len(content) > 800:
+                content = content[:800] + f"... [truncated from {len(msg['content'])} chars]"
+            pruned.append({**msg, "content": content})
+        return pruned
+
+    async def archive(self, messages: list[dict]) -> str | None:
+        """Mechanically prune tool noise and append to history.jsonl.
+
+        No LLM call — keeps actual conversation context for Dream.
+        Returns formatted text on success, None if nothing to archive.
         """
         if not messages:
             return None
         try:
-            formatted = MemoryStore._format_messages(messages)
+            pruned = self._prune_messages(messages)
+            if not pruned:
+                return None
+            formatted = MemoryStore._format_messages(pruned)
             formatted = self._truncate_to_token_budget(formatted)
-            response = await self.provider.chat_with_retry(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": render_template(
-                            "agent/consolidator_archive.md",
-                            strip=True,
-                        ),
-                    },
-                    {"role": "user", "content": formatted},
-                ],
-                tools=None,
-                tool_choice=None,
+            self.store.append_history(
+                f"[CONV] {len(pruned)} messages\n{formatted}",
+                max_chars=_ARCHIVE_SUMMARY_MAX_CHARS,
             )
-            if response.finish_reason == "error":
-                raise RuntimeError(f"LLM returned error: {response.content}")
-            summary = response.content or "[no summary]"
-            self.store.append_history(summary, max_chars=_ARCHIVE_SUMMARY_MAX_CHARS)
-            return summary
+            return formatted
         except Exception:
-            logger.warning("Consolidation LLM call failed, raw-dumping to history")
+            logger.warning("Mechanical pruning failed, raw-dumping to history")
             self.store.raw_archive(messages)
             return None
 
