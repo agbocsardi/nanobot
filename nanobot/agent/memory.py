@@ -733,7 +733,7 @@ class Dream:
     _SOUL_FILE_MAX_CHARS = 16_000
     _USER_FILE_MAX_CHARS = 16_000
     _TOPIC_FILE_MAX_CHARS = 16_000
-    _HISTORY_ENTRY_PREVIEW_MAX_CHARS = 8_000
+    _HISTORY_ENTRY_PREVIEW_MAX_CHARS = 1_000_000  # effectively uncapped — 64K write cap is the real limit
 
     def __init__(
         self,
