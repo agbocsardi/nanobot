@@ -555,21 +555,25 @@ class Consolidator:
     def _prune_messages(messages: list[dict]) -> list[dict]:
         """Mechanically prune tool noise from messages before archiving.
 
-        Strips tool-role messages (raw results), removes empty assistant
-        messages (tool-call-only turns), and truncates long content.
+        Replaces tool-role messages with short placeholders showing the
+        tool name and output size. Removes empty assistant messages
+        (tool-call-only turns). Keeps all user/assistant text intact.
         Dream gets actual conversation context instead of LLM summaries.
         """
         pruned: list[dict] = []
         for msg in messages:
             role = msg.get("role", "")
-            if role == "tool":
-                continue
             content = msg.get("content", "")
+            if role == "tool":
+                name = msg.get("name", "tool")
+                lines = content.count("\n") + 1 if content else 0
+                chars = len(content) if content else 0
+                placeholder = f"[tool: {name} — {lines} lines, {chars} chars]"
+                pruned.append({**msg, "content": placeholder})
+                continue
             if not content.strip():
                 continue
-            if len(content) > 800:
-                content = content[:800] + f"... [truncated from {len(msg['content'])} chars]"
-            pruned.append({**msg, "content": content})
+            pruned.append(msg)
         return pruned
 
     async def archive(self, messages: list[dict]) -> str | None:
