@@ -833,8 +833,8 @@ class Dream:
 
     # -- main entry ----------------------------------------------------------
 
-    def _annotate_with_ages(self, content: str) -> str:
-        """Append per-line age suffixes to MEMORY.md content.
+    def _annotate_with_ages(self, content: str, file_path: str = "memory/MEMORY.md") -> str:
+        """Append per-line age suffixes to memory file content.
 
         Each non-blank line whose age exceeds ``_STALE_THRESHOLD_DAYS`` gets a
         suffix like ``← 30d`` indicating days since last modification.
@@ -844,7 +844,6 @@ class Dream:
         skip annotation than to tag the wrong line).
         SOUL.md and USER.md are never annotated.
         """
-        file_path = "memory/MEMORY.md"
         try:
             ages = self.store.git.line_ages(file_path)
         except Exception:
@@ -905,14 +904,34 @@ class Dream:
         # Current file contents + per-line age annotations (MEMORY.md only).
         # Each file is capped in the *prompt preview* only; Phase 2 still sees
         # the full file via the read_file tool.
+        #
+        # After the hierarchical memory migration, the monolithic MEMORY.md is
+        # a stub.  The real content lives in memory/system/*.md.  We read those
+        # files directly (same logic as MemoryStore.get_memory_context()) so
+        # Dream Phase 1 can actually see what needs updating.
         current_date = datetime.now().strftime("%Y-%m-%d")
-        raw_memory = self.store.read_memory() or "(empty)"
-        annotated_memory = (
-            self._annotate_with_ages(raw_memory)
-            if self.annotate_line_ages
-            else raw_memory
-        )
-        current_memory = truncate_text(annotated_memory, self._MEMORY_FILE_MAX_CHARS)
+
+        # Build system memory context from memory/system/*.md
+        system_parts: list[str] = []
+        for md_file in sorted(self.store.system_dir.glob("*.md")):
+            content = md_file.read_text(encoding="utf-8").strip()
+            if content:
+                rel_path = str(md_file.relative_to(self.store.workspace))
+                annotated = (
+                    self._annotate_with_ages(content, file_path=rel_path)
+                    if self.annotate_line_ages
+                    else content
+                )
+                system_parts.append(f"### {md_file.stem}\n{annotated}")
+        if system_parts:
+            raw_memory = "# System Memory\n\n" + "\n\n".join(system_parts)
+        else:
+            # Legacy fallback — workspace hasn't migrated to system/ yet
+            raw_memory = self.store.read_memory() or "(empty)"
+            if self.annotate_line_ages:
+                raw_memory = self._annotate_with_ages(raw_memory)
+        current_memory = truncate_text(raw_memory, self._MEMORY_FILE_MAX_CHARS)
+
         current_soul = truncate_text(
             self.store.read_soul() or "(empty)", self._SOUL_FILE_MAX_CHARS,
         )
@@ -922,7 +941,7 @@ class Dream:
 
         file_context = (
             f"## Current Date\n{current_date}\n\n"
-            f"## Current MEMORY.md ({len(current_memory)} chars)\n{current_memory}\n\n"
+            f"## Current Memory Files ({len(current_memory)} chars)\n{current_memory}\n\n"
             f"## Current SOUL.md ({len(current_soul)} chars)\n{current_soul}\n\n"
             f"## Current USER.md ({len(current_user)} chars)\n{current_user}"
         )
