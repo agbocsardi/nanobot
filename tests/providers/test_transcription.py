@@ -25,6 +25,7 @@ from nanobot.audio.transcription_registry import (
 from nanobot.config.schema import Config
 from nanobot.providers.transcription import (
     AssemblyAITranscriptionProvider,
+    FasterWhisperTranscriptionProvider,
     GroqTranscriptionProvider,
     OpenAITranscriptionProvider,
     OpenRouterTranscriptionProvider,
@@ -947,8 +948,6 @@ def test_groq_provider_normalizes_chat_style_api_base() -> None:
 
 
 # ── FasterWhisperTranscriptionProvider tests ─────────────────────────
-
-from nanobot.providers.transcription import FasterWhisperTranscriptionProvider
 
 
 def _make_proc(
