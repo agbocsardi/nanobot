@@ -7,7 +7,7 @@ import base64
 import os
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import pytest
@@ -956,7 +956,7 @@ def _make_proc(
     """Fake async subprocess with communicate() returning (stdout, stderr)."""
     proc = SimpleNamespace(
         returncode=returncode,
-        kill=AsyncMock(),
+        kill=Mock(),
         wait=AsyncMock(),
     )
     proc.communicate = AsyncMock(return_value=(stdout, stderr))
@@ -1049,7 +1049,7 @@ async def test_fw_transcribe_returns_empty_on_timeout(
 
     proc = SimpleNamespace(
         returncode=None,
-        kill=AsyncMock(),
+        kill=Mock(),
         wait=AsyncMock(),
     )
     proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError)
