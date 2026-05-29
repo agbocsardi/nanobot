@@ -84,8 +84,16 @@ class ContextBuilder:
         parts.append(render_template("agent/tool_contract.md"))
 
         memory = self.memory.get_memory_context()
-        if memory and not self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md"):
+        legacy_template_only = (
+            memory.startswith("## Long-term Memory")
+            and self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md")
+        )
+        if memory and not legacy_template_only:
             parts.append(f"# Memory\n\n{memory}")
+
+        memory_tree = self.memory.get_memory_tree_context()
+        if memory_tree:
+            parts.append(memory_tree)
 
         always_skills = self.skills.get_always_skills()
         if always_skills:

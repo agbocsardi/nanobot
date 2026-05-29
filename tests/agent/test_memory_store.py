@@ -44,6 +44,55 @@ class TestMemoryStoreBasicIO:
         assert "Long-term Memory" in ctx
         assert "important fact" in ctx
 
+    def test_get_memory_context_loads_system_files_without_frontmatter(self, store):
+        system_file = store.system_dir / "corrections.md"
+        system_file.write_text(
+            '---\ndescription: "Behavioral corrections"\n---\n\n- Use uv, not pip.\n',
+            encoding="utf-8",
+        )
+
+        ctx = store.get_memory_context()
+
+        assert "memory/system/corrections.md" in ctx
+        assert "Use uv, not pip" in ctx
+        assert "description:" not in ctx
+
+    def test_get_memory_tree_context_includes_descriptions(self, store):
+        (store.memory_dir / "homelab.md").write_text(
+            '---\ndescription: "Hardware, services, and network preferences."\n---\n\n# Homelab\n',
+            encoding="utf-8",
+        )
+        (store.system_dir / "procedures.md").write_text(
+            '---\ndescription: "Always-loaded operating procedures."\n---\n\n- Be brief.\n',
+            encoding="utf-8",
+        )
+
+        tree = store.get_memory_tree_context()
+
+        assert "Memory Tree" in tree
+        assert "`memory/homelab.md` (topic" in tree
+        assert "Hardware, services, and network preferences." in tree
+        assert "`memory/system/procedures.md` (loaded" in tree
+        assert "Always-loaded operating procedures." in tree
+
+    def test_get_memory_tree_context_marks_missing_description(self, store):
+        (store.memory_dir / "project.md").write_text("- fact\n", encoding="utf-8")
+
+        tree = store.get_memory_tree_context()
+
+        assert "`memory/project.md`" in tree
+        assert "(missing description)" in tree
+
+    def test_topic_files_discovers_nested_topic_files(self, tmp_path):
+        memory_dir = tmp_path / "memory"
+        (memory_dir / "projects").mkdir(parents=True)
+        (memory_dir / "projects" / "nanobot.md").write_text("x", encoding="utf-8")
+        (memory_dir / "system").mkdir()
+        (memory_dir / "system" / "now.md").write_text("x", encoding="utf-8")
+
+        assert "memory/projects/nanobot.md" in MemoryStore._topic_files(tmp_path)
+        assert "memory/system/now.md" not in MemoryStore._topic_files(tmp_path)
+
 
 class TestHistoryWithCursor:
     def test_append_history_returns_cursor(self, store):

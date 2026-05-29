@@ -53,6 +53,8 @@ class MemoryStore:
         "memory/system/corrections.md",
         "memory/system/now.md",
     ]
+    _MEMORY_TREE_MAX_FILES = 80
+    _DESCRIPTION_MAX_CHARS = 240
 
     @staticmethod
     def _topic_files(workspace: Path) -> list[str]:
@@ -60,8 +62,8 @@ class MemoryStore:
         memory_dir = workspace / "memory"
         return [
             str(f.relative_to(workspace))
-            for f in sorted(memory_dir.glob("*.md"))
-            if f.name != "MEMORY.md"
+            for f in sorted(memory_dir.rglob("*.md"))
+            if f.name != "MEMORY.md" and "system" not in f.relative_to(memory_dir).parts
         ]
 
     def __init__(self, workspace: Path, max_history_entries: int = _DEFAULT_MAX_HISTORY):
@@ -99,6 +101,60 @@ class MemoryStore:
             return path.read_text(encoding="utf-8")
         except FileNotFoundError:
             return ""
+
+    @staticmethod
+    def _split_frontmatter(content: str) -> tuple[dict[str, str], str]:
+        """Return ``(frontmatter, body)`` for simple YAML-ish markdown metadata.
+
+        We only need Letta-style ``description: ...`` / ``limit: ...`` parsing,
+        so keep this dependency-free and intentionally conservative.
+        """
+        if not content.startswith("---\n"):
+            return {}, content
+        end = content.find("\n---", 4)
+        if end == -1:
+            return {}, content
+        close_end = end + len("\n---")
+        if close_end < len(content) and content[close_end] == "\n":
+            close_end += 1
+        raw = content[4:end]
+        meta: dict[str, str] = {}
+        for line in raw.splitlines():
+            if ":" not in line or line.lstrip().startswith("#"):
+                continue
+            key, value = line.split(":", 1)
+            key = key.strip().lower()
+            value = value.strip().strip('"\'')
+            if key:
+                meta[key] = value
+        return meta, content[close_end:]
+
+    @classmethod
+    def _body_without_frontmatter(cls, content: str) -> str:
+        return cls._split_frontmatter(content)[1]
+
+    @classmethod
+    def _description_from_markdown(cls, content: str) -> str:
+        meta, body = cls._split_frontmatter(content)
+        description = meta.get("description", "").strip()
+        if description:
+            return truncate_text(description, cls._DESCRIPTION_MAX_CHARS)
+        for line in body.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                return truncate_text(stripped.lstrip("#").strip(), cls._DESCRIPTION_MAX_CHARS)
+        return "(missing description)"
+
+    def _iter_memory_markdown_files(self) -> list[Path]:
+        """Return memory markdown files visible in the memory tree."""
+        files = [
+            f for f in sorted(self.memory_dir.rglob("*.md"))
+            if f.name != "MEMORY.md"
+        ]
+        legacy = self.memory_file
+        if legacy.exists() and self._body_without_frontmatter(self.read_file(legacy)).strip():
+            files.insert(0, legacy)
+        return files
 
     def _maybe_migrate_legacy_history(self) -> None:
         """One-time upgrade from legacy HISTORY.md to history.jsonl.
@@ -250,21 +306,50 @@ class MemoryStore:
     def get_memory_context(self) -> str:
         """Return always-loaded memory context.
 
-        Reads all .md files from ``memory/system/`` and concatenates them.
-        Falls back to the legacy monolithic ``memory/MEMORY.md`` if the
-        system directory is empty (backward compat).
+        Reads all .md files from ``memory/system/`` and concatenates their
+        bodies. Falls back to the legacy monolithic ``memory/MEMORY.md`` if
+        the system directory is empty (backward compat).
         """
         parts: list[str] = []
         for md_file in sorted(self.system_dir.glob("*.md")):
-            content = md_file.read_text(encoding="utf-8").strip()
+            raw = md_file.read_text(encoding="utf-8")
+            content = self._body_without_frontmatter(raw).strip()
             if content:
-                parts.append(f"## {md_file.stem}\n\n{content}")
+                rel_path = str(md_file.relative_to(self.workspace))
+                parts.append(f"## {rel_path}\n\n{content}")
         if parts:
             return "# System Memory\n\n" + "\n\n".join(parts)
 
         # Legacy fallback — workspace hasn't migrated to system/ yet
-        long_term = self.read_memory()
+        long_term = self._body_without_frontmatter(self.read_memory()).strip()
         return f"## Long-term Memory\n{long_term}" if long_term else ""
+
+    def get_memory_tree_context(self) -> str:
+        """Return a compact index of memory files and their descriptions.
+
+        The tree makes topic files discoverable without loading their full
+        contents. ``memory/system/`` files are marked as already loaded.
+        """
+        entries: list[str] = []
+        files = self._iter_memory_markdown_files()
+        for md_file in files[: self._MEMORY_TREE_MAX_FILES]:
+            raw = md_file.read_text(encoding="utf-8")
+            body = self._body_without_frontmatter(raw).strip()
+            description = self._description_from_markdown(raw)
+            rel_path = str(md_file.relative_to(self.workspace))
+            loaded = "loaded" if md_file.is_relative_to(self.system_dir) else "topic"
+            entries.append(
+                f"- `{rel_path}` ({loaded}, {len(body)} chars): {description}"
+            )
+        if len(files) > self._MEMORY_TREE_MAX_FILES:
+            entries.append(f"- … {len(files) - self._MEMORY_TREE_MAX_FILES} more memory files")
+        if not entries:
+            return ""
+        return "\n".join([
+            "# Memory Tree",
+            "Files in `memory/system/` are already loaded in full. Other files are topic memories; use their descriptions to decide what may be relevant.",
+            *entries,
+        ])
 
     # -- history.jsonl — append-only, JSONL format ---------------------------
 
