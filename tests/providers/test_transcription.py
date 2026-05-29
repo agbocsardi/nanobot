@@ -1054,13 +1054,10 @@ async def test_fw_transcribe_returns_empty_on_timeout(
     )
     proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError)
 
-    with (
-        patch(
-            "nanobot.providers.transcription.asyncio.create_subprocess_exec",
-            new_callable=AsyncMock,
-            return_value=proc,
-        ),
-        patch("nanobot.providers.transcription.asyncio.wait_for", side_effect=asyncio.TimeoutError),
+    with patch(
+        "nanobot.providers.transcription.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+        return_value=proc,
     ):
         result = await fw_provider.transcribe(audio)
 
