@@ -24,6 +24,8 @@ Do NOT guess paths. Route each fact to its canonical file:
 
 Cross-boundary rule: no technical configs in USER.md, no user facts in SOUL.md, no operational details in MEMORY.md. If a fact fits multiple files, keep the most specific copy and remove the rest.
 
+For workflows with a dedicated skill, do not duplicate detailed workflow steps in MEMORY.md or memory/system/procedures.md. Keep only routing, ownership, schedules, non-negotiable invariants, and a pointer to the skill as source of truth.
+
 ## MECE enforcement
 - USER.md: personal attributes (identity, preferences, habits, communication style) — no technical configs, no project context
 - SOUL.md: agent behavior rules, guardrails, interaction patterns, tool-use strategy — no user facts
