@@ -375,6 +375,65 @@ class TestAppendHistoryHardCap:
         assert entry["content"] == msg
 
 
+class TestStructuredConversationHistory:
+    def test_append_conversation_history_writes_v2_record_with_preview(self, store):
+        messages = [
+            {
+                "timestamp": "2026-06-01T10:00:00+02:00",
+                "role": "user",
+                "content": "hello",
+            },
+            {
+                "timestamp": "2026-06-01T10:01:00+02:00",
+                "role": "assistant",
+                "content": "used a thing",
+                "tools_used": ["read_file"],
+            },
+            {
+                "timestamp": "2026-06-01T10:02:00+02:00",
+                "role": "tool",
+                "name": "read_file",
+                "content": "[tool: read_file — 2 lines, 20 chars]",
+            },
+        ]
+
+        cursor = store.append_conversation_history(
+            messages,
+            session_key="telegram:123",
+            content="[CONV] 3 messages\npreview",
+        )
+
+        entry = store.read_unprocessed_history(since_cursor=0)[0]
+        assert cursor == 1
+        assert entry["schema_version"] == 2
+        assert entry["kind"] == "conversation"
+        assert entry["session_key"] == "telegram:123"
+        assert entry["message_count"] == 3
+        assert entry["start_time"] == "2026-06-01T10:00:00+02:00"
+        assert entry["end_time"] == "2026-06-01T10:02:00+02:00"
+        assert entry["content"] == "[CONV] 3 messages\npreview"
+        assert entry["messages"][1]["tools_used"] == ["read_file"]
+        assert entry["messages"][2]["name"] == "read_file"
+
+    def test_append_conversation_history_strips_thinking_from_messages(self, store):
+        store.append_conversation_history([
+            {
+                "timestamp": "2026-06-01T10:00:00+02:00",
+                "role": "assistant",
+                "content": "<think>private</think>visible",
+            },
+            {
+                "timestamp": "2026-06-01T10:01:00+02:00",
+                "role": "assistant",
+                "content": "<think>only private</think>",
+            },
+        ])
+
+        entry = store.read_unprocessed_history(since_cursor=0)[0]
+        assert entry["message_count"] == 1
+        assert entry["messages"][0]["content"] == "visible"
+
+
 class TestDreamCursor:
     def test_initial_cursor_is_zero(self, store):
         assert store.get_last_dream_cursor() == 0

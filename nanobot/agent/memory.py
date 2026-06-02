@@ -388,19 +388,72 @@ class MemoryStore:
                 )
             raw = truncate_text(raw, limit)
         content = strip_think(raw)
+        record = {"timestamp": ts, "content": content}
+        if session_key:
+            record["session_key"] = session_key
+        cursor = self._append_history_record(record)
+        if raw and not content:
+            logger.debug(
+                "history entry {} stripped to empty (likely template leak); "
+                "persisting empty content to avoid re-polluting context",
+                cursor,
+            )
+        return cursor
+
+    def append_conversation_history(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        session_key: str | None = None,
+        content: str | None = None,
+        max_chars: int | None = None,
+    ) -> int:
+        """Append a structured conversation archive entry to history.jsonl.
+
+        The legacy ``content`` preview remains for grep/backward compatibility,
+        but downstream readers should prefer the structured ``messages`` field.
+        """
+        limit = max_chars if max_chars is not None else _HISTORY_ENTRY_HARD_CAP
+        now = datetime.now().astimezone().isoformat(timespec="minutes")
+        rendered = content if content is not None else self._format_messages(messages)
+        rendered = rendered.rstrip()
+        if len(rendered) > limit:
+            if not self._oversize_logged:
+                self._oversize_logged = True
+                logger.warning(
+                    "history conversation preview exceeds {} chars ({}); truncating. "
+                    "Structured messages are kept intact; further occurrences suppressed.",
+                    limit, len(rendered),
+                )
+            rendered = truncate_text(rendered, limit)
+        cleaned_messages = self._clean_history_messages(messages)
+        timestamps = [m.get("timestamp") for m in cleaned_messages if m.get("timestamp")]
+        record: dict[str, Any] = {
+            "schema_version": 2,
+            "kind": "conversation",
+            "timestamp": now,
+            "start_time": min(timestamps) if timestamps else None,
+            "end_time": max(timestamps) if timestamps else None,
+            "session_key": session_key or "unknown",
+            "message_count": len(cleaned_messages),
+            "messages": cleaned_messages,
+            "content": strip_think(rendered),
+        }
+        cursor = self._append_history_record(record)
+        if rendered and not record["content"]:
+            logger.debug(
+                "history conversation entry {} preview stripped to empty; "
+                "persisting structured messages only",
+                cursor,
+            )
+        return cursor
+
+    def _append_history_record(self, record: dict[str, Any]) -> int:
         # Cursor allocation and the append must be atomic: concurrent writers
         # could otherwise read the same current cursor and emit duplicates.
         with self._append_lock:
             cursor = self._next_cursor()
-            if raw and not content:
-                logger.debug(
-                    "history entry {} stripped to empty (likely template leak); "
-                    "persisting empty content to avoid re-polluting context",
-                    cursor,
-                )
-            record = {"cursor": cursor, "timestamp": ts, "content": content}
-            if session_key:
-                record["session_key"] = session_key
+            record["cursor"] = cursor
             with open(self.history_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
             self._cursor_file.write_text(str(cursor), encoding="utf-8")
@@ -668,20 +721,43 @@ class MemoryStore:
             )
         return "\n".join(lines)
 
+    @staticmethod
+    def _clean_history_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Keep only stable, JSON-friendly fields for structured history."""
+        cleaned: list[dict[str, Any]] = []
+        for message in messages:
+            content = strip_think(str(message.get("content") or ""))
+            if not content:
+                continue
+            record: dict[str, Any] = {
+                "timestamp": message.get("timestamp"),
+                "role": message.get("role"),
+                "content": content,
+            }
+            name = message.get("name")
+            if name:
+                record["name"] = name
+            tools_used = message.get("tools_used")
+            if tools_used:
+                record["tools_used"] = list(tools_used)
+            cleaned.append(record)
+        return cleaned
+
     def raw_archive(
         self,
         messages: list[dict],
         *,
-        max_chars: int | None = None,
         session_key: str | None = None,
+        max_chars: int | None = None,
     ) -> None:
         """Fallback: dump raw messages to history.jsonl without LLM summarization."""
         limit = max_chars if max_chars is not None else _RAW_ARCHIVE_MAX_CHARS
         formatted = truncate_text(self._format_messages(messages), limit)
-        self.append_history(
-            f"[RAW] {len(messages)} messages\n"
-            f"{formatted}",
+        self.append_conversation_history(
+            messages,
             session_key=session_key,
+            content=f"[RAW] {len(messages)} messages\n{formatted}",
+            max_chars=limit,
         )
         logger.warning(
             "Memory consolidation degraded: raw-archived {} messages", len(messages)
@@ -933,54 +1009,59 @@ class Consolidator:
         except Exception:
             return truncate_text(text, budget * 4)
 
+    @staticmethod
+    def _prune_messages(messages: list[dict]) -> list[dict]:
+        """Mechanically prune tool noise from messages before archiving.
+
+        Replaces tool-role messages with short placeholders showing the
+        tool name and output size. Removes empty assistant messages
+        (tool-call-only turns). Keeps all user/assistant text intact.
+        Dream gets actual conversation context instead of LLM summaries.
+        """
+        pruned: list[dict] = []
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if role == "tool":
+                name = msg.get("name", "tool")
+                lines = content.count("\n") + 1 if content else 0
+                chars = len(content) if content else 0
+                placeholder = f"[tool: {name} — {lines} lines, {chars} chars]"
+                pruned.append({**msg, "content": placeholder})
+                continue
+            if not str(content or "").strip():
+                continue
+            pruned.append(msg)
+        return pruned
+
     async def archive(
         self,
         messages: list[dict],
         *,
         session_key: str | None = None,
-        summary_messages: list[dict] | None = None,
     ) -> str | None:
-        """Summarize messages via LLM and append to history.jsonl.
+        """Mechanically prune tool noise and append to history.jsonl.
 
-        ``messages`` are the messages being archived (removed from the live
-        session); they are what gets raw-dumped if the LLM call fails.
-        ``summary_messages``, when given, lets callers include retained
-        messages in the summary without archiving them.
-
-        Returns the summary text on success, None if nothing to archive.
+        No LLM call — keeps actual conversation context for Dream.
+        Returns formatted text on success, None if nothing to archive.
         """
         if not messages:
             return None
-        messages_to_summarize = summary_messages if summary_messages is not None else messages
         try:
-            formatted = MemoryStore._format_messages(messages_to_summarize)
+            pruned = self._prune_messages(messages)
+            if not pruned:
+                return None
+            formatted = MemoryStore._format_messages(pruned)
             formatted = self._truncate_to_token_budget(formatted)
-            response = await self.provider.chat_with_retry(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": render_template(
-                            "agent/consolidator_archive.md",
-                            strip=True,
-                        ),
-                    },
-                    {"role": "user", "content": formatted},
-                ],
-                tools=None,
-                tool_choice=None,
-            )
-            if response.finish_reason == "error":
-                raise RuntimeError(f"LLM returned error: {response.content}")
-            summary = response.content or "[no summary]"
-            self.store.append_history(
-                summary,
-                max_chars=_ARCHIVE_SUMMARY_MAX_CHARS,
+            self.store.append_conversation_history(
+                pruned,
                 session_key=session_key,
+                content=f"[CONV] {len(pruned)} messages\n{formatted}",
+                max_chars=_ARCHIVE_SUMMARY_MAX_CHARS,
             )
-            return summary
+            return formatted
         except Exception:
-            logger.warning("Consolidation LLM call failed, raw-dumping to history")
+            logger.warning("Mechanical pruning failed, raw-dumping to history")
             self.store.raw_archive(messages, session_key=session_key)
             return None
 
@@ -1136,13 +1217,7 @@ class Consolidator:
             last_active = session.updated_at
             summary: str | None = ""
             if messages_to_remove:
-                # Summarize the retained suffix too, but only remove/raw-dump
-                # the messages that are no longer kept in the live session.
-                summary = await self.archive(
-                    messages_to_remove,
-                    session_key=session_key,
-                    summary_messages=messages_to_summarize,
-                )
+                summary = await self.archive(messages_to_remove, session_key=session.key)
 
             if summary and summary != "(nothing)":
                 session.metadata["_last_summary"] = {
