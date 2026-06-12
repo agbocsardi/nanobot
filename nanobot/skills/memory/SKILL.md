@@ -21,10 +21,17 @@ Topic files are lazy-loaded: only their descriptions appear in the Memory Tree i
 
 ## Topic files — your memory, manage it
 
-When you learn something durable mid-conversation (a decision, a project fact, a gotcha, infrastructure detail), write it to a topic file immediately — don't wait for Dream to reconstruct it from history.
+When you learn something durable mid-conversation (a decision, a project fact, a gotcha, infrastructure detail), save it immediately — don't wait for Dream to reconstruct it from history.
 
-- Organize by subject: `memory/projects/<name>.md`, `memory/people/<name>.md`, `memory/infra/<host>.md`, etc. Create new files/folders freely; prefer many small focused files over one large one.
-- Every topic file MUST start with YAML frontmatter containing a one-line `description:` — this is what appears in the Memory Tree and is your only navigational signal later. Keep it specific.
+**Hot update procedure:**
+1. Check the Memory Tree for an existing file covering the subject.
+2. If one exists, read it and edit in place — replace stale facts, don't append contradictions. Never create a second file for the same subject.
+3. If none exists, create one: `memory/projects/<name>.md`, `memory/people/<name>.md`, `memory/infra/<host>.md`, etc. Prefer many small focused files over one large one.
+4. Commit (see below).
+
+**Do NOT save:** transient status, temporary errors, conversational filler, or anything a quick web search would surface (public docs, standard APIs, common defaults). Memory is for context that can't be looked up.
+
+Every topic file MUST start with YAML frontmatter containing a one-line `description:` — this is what appears in the Memory Tree and is your only navigational signal later. Keep it specific.
 
 ```markdown
 ---
@@ -35,7 +42,6 @@ description: Fork maintenance for nanobot — branch list, sync workflow, deploy
 ...
 ```
 
-- Update in place; replace stale facts rather than appending contradictions.
 - The Memory Tree in your system prompt lists every file with its description. Read a topic file before answering questions it likely covers.
 
 ### Committing
