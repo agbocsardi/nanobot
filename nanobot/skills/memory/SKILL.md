@@ -6,18 +6,22 @@ always: true
 
 # Memory
 
-## Structure
+## Structure & ownership
 
-- `SOUL.md` — Bot personality and communication style. **Managed by Dream.** Do NOT edit.
-- `USER.md` — User profile and preferences. **Managed by Dream.** Do NOT edit.
-- `memory/system/*.md` — Pinned memory, always loaded in full. **Curated by Dream** (it promotes/demotes content between system/ and topic files). Do NOT edit.
-- `memory/MEMORY.md` — Legacy long-term facts. **Managed by Dream.** Do NOT edit.
-- `memory/**/*.md` (everything else) — **Topic files. Yours to create and edit.** Lazy-loaded: only their descriptions appear in the Memory Tree; read them on demand.
-- `memory/history.jsonl` — append-only JSONL, not loaded into context. Prefer the built-in `grep` tool to search it.
+| Path | What it is | Who edits it |
+|------|-----------|--------------|
+| `SOUL.md` | Bot personality and communication style | Dream only — do NOT edit |
+| `USER.md` | User profile and preferences | Dream only — do NOT edit |
+| `memory/system/*.md` | Pinned memory, always loaded in full | Dream only — do NOT edit |
+| `memory/<topic>/<name>.md` | Topic files: subject-specific knowledge | **You** — create and edit freely |
+| `memory/MEMORY.md` | Legacy, decommissioned | Nobody — ignore it |
+| `memory/history.jsonl` | Append-only conversation log, not in context | Nobody — search with `grep` |
+
+Topic files are lazy-loaded: only their descriptions appear in the Memory Tree in your system prompt; read the file when you need its contents.
 
 ## Topic files — your memory, manage it
 
-When you learn something durable mid-conversation (a decision, a project fact, a gotcha, infrastructure detail), write it to a topic file **while context is hot** — don't wait for Dream to reconstruct it from history.
+When you learn something durable mid-conversation (a decision, a project fact, a gotcha, infrastructure detail), write it to a topic file immediately — don't wait for Dream to reconstruct it from history.
 
 - Organize by subject: `memory/projects/<name>.md`, `memory/people/<name>.md`, `memory/infra/<host>.md`, etc. Create new files/folders freely; prefer many small focused files over one large one.
 - Every topic file MUST start with YAML frontmatter containing a one-line `description:` — this is what appears in the Memory Tree and is your only navigational signal later. Keep it specific.
