@@ -95,6 +95,41 @@ class TestAutoCommit:
         assert len(git_ready.log()) == 1  # only init commit
 
 
+class TestTrackedGlobs:
+    @pytest.fixture
+    def glob_git(self, tmp_path):
+        g = GitStore(
+            tmp_path,
+            tracked_files=["SOUL.md"],
+            tracked_globs=["memory/**/*.md"],
+        )
+        g.init()
+        return g
+
+    def test_commits_new_topic_file_created_after_init(self, glob_git):
+        ws = glob_git._workspace
+        topic = ws / "memory" / "projects" / "new-topic.md"
+        topic.parent.mkdir(parents=True, exist_ok=True)
+        topic.write_text("learned something", encoding="utf-8")
+        sha = glob_git.auto_commit("memory: new topic file")
+        assert sha is not None
+        # the file must actually be in the commit, not just trigger it
+        info, diff = glob_git.show_commit_diff(sha)
+        assert "new-topic.md" in diff
+
+    def test_glob_expansion_includes_existing_files(self, tmp_path):
+        (tmp_path / "memory").mkdir()
+        (tmp_path / "memory" / "pre.md").write_text("x", encoding="utf-8")
+        g = GitStore(tmp_path, tracked_files=[], tracked_globs=["memory/**/*.md"])
+        assert "memory/pre.md" in g._current_tracked_files()
+
+    def test_no_empty_commit_for_untracked_outside_globs(self, glob_git):
+        ws = glob_git._workspace
+        (ws / "memory").mkdir(exist_ok=True)
+        (ws / "memory" / "history.jsonl").write_text("{}", encoding="utf-8")
+        assert glob_git.auto_commit("nothing tracked changed") is None
+
+
 class TestLog:
     def test_empty_when_not_initialized(self, git):
         assert git.log() == []

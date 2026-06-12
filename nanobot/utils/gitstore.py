@@ -45,9 +45,27 @@ def _compute_line_ages(annotated) -> list[LineAge]:
 class GitStore:
     """Git-backed version control for memory files."""
 
-    def __init__(self, workspace: Path, tracked_files: list[str]):
+    def __init__(
+        self,
+        workspace: Path,
+        tracked_files: list[str],
+        tracked_globs: list[str] | None = None,
+    ):
         self._workspace = workspace
         self._tracked_files = tracked_files
+        self._tracked_globs = tracked_globs or []
+
+    def _current_tracked_files(self) -> list[str]:
+        """Expand tracked globs at call time so files created after init are versioned."""
+        files = list(self._tracked_files)
+        seen = set(files)
+        for pattern in self._tracked_globs:
+            for p in sorted(self._workspace.glob(pattern)):
+                rel = p.relative_to(self._workspace).as_posix()
+                if rel not in seen:
+                    seen.add(rel)
+                    files.append(rel)
+        return files
 
     def is_initialized(self) -> bool:
         """Check if the git repo has been initialized."""
@@ -62,6 +80,7 @@ class GitStore:
         Returns True if a new repo was created, False if already exists.
         """
         if self.is_initialized():
+            self.ensure_gitignore()  # pick up whitelist changes on existing repos
             return False
 
         if self._is_inside_git_repo():
@@ -77,22 +96,7 @@ class GitStore:
 
             porcelain.init(str(self._workspace))
 
-            # Write .gitignore (merge with existing if present)
-            gitignore = self._workspace / ".gitignore"
-            dream_entries = self._build_gitignore()
-            if gitignore.exists():
-                existing = gitignore.read_text(encoding="utf-8")
-                existing_lines = set(existing.splitlines())
-                new_lines = [
-                    line
-                    for line in dream_entries.splitlines()
-                    if line not in existing_lines
-                ]
-                if new_lines:
-                    merged = existing.rstrip("\n") + "\n" + "\n".join(new_lines) + "\n"
-                    gitignore.write_text(merged, encoding="utf-8")
-            else:
-                gitignore.write_text(dream_entries, encoding="utf-8")
+            self.ensure_gitignore()
 
             # Ensure tracked files exist (touch them if missing) so the initial
             # commit has something to track.
@@ -103,7 +107,9 @@ class GitStore:
                     p.write_text("", encoding="utf-8")
 
             # Initial commit
-            porcelain.add(str(self._workspace), paths=[".gitignore"] + self._tracked_files)
+            porcelain.add(
+                str(self._workspace), paths=[".gitignore"] + self._current_tracked_files()
+            )
             porcelain.commit(
                 str(self._workspace),
                 message=b"init: nanobot memory store",
@@ -129,14 +135,22 @@ class GitStore:
         try:
             from dulwich import porcelain
 
+            tracked = self._current_tracked_files()
+            tracked_set = set(tracked)
+
             # .gitignore excludes everything except tracked files,
             # so any staged/unstaged change must be in our files.
-            st = porcelain.status(str(self._workspace))
-            if not st.unstaged and not any(st.staged.values()):
+            # New (untracked) files only count when they match the tracked set.
+            st = porcelain.status(str(self._workspace), untracked_files="all")
+            untracked = [
+                f.decode() if isinstance(f, bytes) else f for f in st.untracked
+            ]
+            new_tracked = [f for f in untracked if f in tracked_set]
+            if not st.unstaged and not any(st.staged.values()) and not new_tracked:
                 return None
 
             msg_bytes = message.encode("utf-8") if isinstance(message, str) else message
-            porcelain.add(str(self._workspace), paths=self._tracked_files)
+            porcelain.add(str(self._workspace), paths=tracked)
             sha_bytes = porcelain.commit(
                 str(self._workspace),
                 message=msg_bytes,
@@ -192,16 +206,48 @@ class GitStore:
             current = current.parent
         return False
 
+    def ensure_gitignore(self) -> None:
+        """Write .gitignore, merging missing whitelist lines into an existing file."""
+        gitignore = self._workspace / ".gitignore"
+        dream_entries = self._build_gitignore()
+        if gitignore.exists():
+            existing = gitignore.read_text(encoding="utf-8")
+            existing_lines = set(existing.splitlines())
+            new_lines = [
+                line
+                for line in dream_entries.splitlines()
+                if line not in existing_lines
+            ]
+            if new_lines:
+                merged = existing.rstrip("\n") + "\n" + "\n".join(new_lines) + "\n"
+                gitignore.write_text(merged, encoding="utf-8")
+        else:
+            gitignore.write_text(dream_entries, encoding="utf-8")
+
     def _build_gitignore(self) -> str:
-        """Generate .gitignore content from tracked files."""
+        """Generate .gitignore content from tracked files and globs."""
         dirs: set[str] = set()
         for f in self._tracked_files:
             parent = str(Path(f).parent)
             if parent != ".":
                 dirs.add(parent)
+        for pattern in self._tracked_globs:
+            # Whitelist the literal directory prefix of each glob (e.g.
+            # "memory/**/*.md" -> "memory") so new files inside it are visible.
+            literal_parts = []
+            for part in Path(pattern).parts:
+                if "*" in part or "?" in part or "[" in part:
+                    break
+                literal_parts.append(part)
+            if literal_parts:
+                dirs.add(str(Path(*literal_parts)))
         lines = ["/*"]
         for d in sorted(dirs):
             lines.append(f"!{d}/")
+        for pattern in sorted(self._tracked_globs):
+            # dulwich matches ignore rules against full paths, so the dir
+            # whitelist alone doesn't re-include nested files; add the glob too.
+            lines.append(f"!{pattern}")
         for f in self._tracked_files:
             lines.append(f"!{f}")
         lines.append("!.gitignore")

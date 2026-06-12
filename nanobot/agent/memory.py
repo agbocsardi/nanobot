@@ -82,11 +82,18 @@ class MemoryStore:
         self._malformed_entry_logged = False  # rate-limit bad history shape warning
         self._oversize_logged = False  # rate-limit oversized-entry warning
         self._append_lock = threading.Lock()  # serialize cursor allocation + append
-        self._git = GitStore(workspace, tracked_files=[
-            "SOUL.md", "USER.md", "memory/MEMORY.md", "memory/.dream_cursor",
-            *self._SYSTEM_FILES,
-            *self._topic_files(workspace),
-        ])
+        self._git = GitStore(
+            workspace,
+            tracked_files=[
+                "SOUL.md", "USER.md", "memory/MEMORY.md", "memory/.dream_cursor",
+                *self._SYSTEM_FILES,
+            ],
+            tracked_globs=["memory/**/*.md"],
+        )
+        if self._git.is_initialized():
+            # Existing repos were bootstrapped without the topic-file glob;
+            # refresh the whitelist so agent-created files get versioned.
+            self._git.ensure_gitignore()
         self._maybe_migrate_legacy_history()
 
     @property

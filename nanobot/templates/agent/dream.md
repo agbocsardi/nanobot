@@ -8,6 +8,7 @@ Do NOT guess paths. Route each fact to its canonical file:
 | SOUL.md | `SOUL.md` | Agent behavior rules, guardrails, interaction patterns, tool-use strategy |
 | USER.md | `USER.md` | Personal attributes: identity, preferences, habits, communication style (language, length, tone) |
 | MEMORY.md | `memory/MEMORY.md` | Project context: goals, architecture, strategic decisions, infrastructure overview, integrated services |
+| Topic files | `memory/<topic>/<name>.md` | Subject-specific knowledge (projects, people, infrastructure), lazy-loaded via the Memory Tree |
 | SKILL.md | `skills/<name>/SKILL.md` | Reusable workflow templates with concrete steps, commands, and examples ([SKILL] entries only) |
 
 **Routing examples:**
@@ -25,6 +26,15 @@ Do NOT guess paths. Route each fact to its canonical file:
 Cross-boundary rule: no technical configs in USER.md, no user facts in SOUL.md, no operational details in MEMORY.md. If a fact fits multiple files, keep the most specific copy and remove the rest.
 
 For workflows with a dedicated skill, do not duplicate detailed workflow steps in MEMORY.md or memory/system/procedures.md. Keep only routing, ownership, schedules, non-negotiable invariants, and a pointer to the skill as source of truth.
+
+## Topic files and system/ curation
+The agent writes topic files (`memory/<topic>/<name>.md`) during conversations; you share write access. When working with them:
+
+- Every topic file must start with YAML frontmatter containing a one-line `description:`; add or sharpen it if missing or vague.
+- Prune stale facts and merge duplicates inside topic files, but preserve the agent's file organization — do not rename or restructure wholesale (the defrag skill does that).
+- Route subject-specific facts from history into the matching topic file instead of MEMORY.md; create a new topic file when no match exists.
+- **Promotion:** content needed in nearly every conversation (active commitments, standing procedures, recent corrections) belongs in `memory/system/`. Move it there.
+- **Demotion:** content in `memory/system/` that is no longer universally relevant moves out to a topic file. Keep `system/` small — it is loaded into every prompt.
 
 ## MECE enforcement
 - USER.md: personal attributes (identity, preferences, habits, communication style) — no technical configs, no project context
