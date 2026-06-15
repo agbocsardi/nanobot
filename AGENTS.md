@@ -1,3 +1,5 @@
+# Nanobot Agent Guidance
+
 This file provides guidance to AI coding agents working with this repository.
 
 ## Project Overview
@@ -61,7 +63,7 @@ Messages flow through an async `MessageBus` (`nanobot/bus/queue.py`) that decoup
 - Security boundaries: [`.agent/security.md`](.agent/security.md)
 - Common gotchas: [`.agent/gotchas.md`](.agent/gotchas.md)
 
-## Contribution Flow
+## Upstream Branching Strategy
 
 See [`CONTRIBUTING.md`](./CONTRIBUTING.md) for contribution flow and PR guidelines.
 
@@ -80,3 +82,127 @@ See [`CONTRIBUTING.md`](./CONTRIBUTING.md) for contribution flow and PR guidelin
 - Tool registry: `nanobot/agent/tools/registry.py`
 - WebUI dev proxy config: `webui/vite.config.ts`
 - Tests mirror the `nanobot/` package structure.
+
+---
+
+# Nanobot Fork Workflow
+
+## Remote layout
+
+- `upstream` = `HKUDS/nanobot` (source of truth)
+- `origin` = `agbocsardi/nanobot` (this fork)
+- `origin/main` should mirror `upstream/main`
+- Long-lived fork features live as topic branches off `main`
+- `personal-build` is a disposable integration/deploy branch
+
+```
+upstream/main ─── origin/main
+        ├── feat/hierarchical-memory-next
+        ├── feat/faster-whisper-next
+        └── docs/personal-build-workflow
+
+personal-build = main + selected topic branches
+```
+
+## Sync workflow
+
+Use this when updating the fork after upstream releases. Keep conflicts isolated by rebasing topic branches one at a time, then rebuilding `personal-build` from scratch.
+
+Before changing branches:
+
+```bash
+git status --short --branch
+git remote -v
+git fetch upstream
+git fetch origin
+```
+
+If the working tree is dirty, stop and inspect the diff. Stash or commit intentional edits before continuing.
+
+### 1. Mirror upstream main
+
+```bash
+git checkout main
+git reset --hard upstream/main
+git push --force-with-lease origin main
+```
+
+### 2. Rebase each topic branch
+
+```bash
+git checkout feat/hierarchical-memory-next
+git rebase main
+git push --force-with-lease origin feat/hierarchical-memory-next
+
+git checkout feat/faster-whisper-next
+git rebase main
+git push --force-with-lease origin feat/faster-whisper-next
+
+git checkout docs/personal-build-workflow
+git rebase main
+git push --force-with-lease origin docs/personal-build-workflow
+```
+
+Resolve conflicts on the topic branch where they belong.
+
+### 3. Rebuild personal-build
+
+`personal-build` is cattle, not pet. Recreate it from `main` and merge the selected topic branches:
+
+```bash
+git checkout -B personal-build main
+git merge --no-ff origin/docs/personal-build-workflow
+git merge --no-ff origin/feat/hierarchical-memory-next
+git merge --no-ff origin/feat/faster-whisper-next
+
+# verify the branch is only main + integration merges
+git log --oneline --first-parent main..personal-build
+
+git push --force-with-lease origin personal-build
+```
+
+## Active topic branches
+
+- `feat/hierarchical-memory-next` — hierarchical memory, Memory Tree, Dream prompt changes
+- `feat/faster-whisper-next` — local faster-whisper STT provider
+- `docs/personal-build-workflow` — this workflow doc
+
+Old branches may exist for history. Prefer the `*-next` branches above for future maintenance.
+
+## Conflict minimization
+
+1. **Surgical diffs.** Change only the lines you need. Don't reformat adjacent code.
+2. **Topic branches off `main`.** Do not develop directly on `personal-build`.
+3. **New files > modified files.** New files conflict less during rebase.
+4. **Enable `rerere`.** Remembers conflict resolutions:
+   ```bash
+   git config --global rerere.enabled true
+   ```
+5. **Drop superseded patches.** If upstream ships equivalent behavior, remove the topic branch from the rebuild.
+
+## Server deploy (`uhl`)
+
+Use this only after `origin/personal-build` is updated and verified.
+
+```bash
+ssh uhl
+cd ~/nanobot
+git status --short --branch
+git fetch origin
+git checkout personal-build
+git reset --hard origin/personal-build
+```
+
+The live install on `uhl` is editable, so code changes are live after checkout/reset. Restart any already-running Nanobot process to pick up imported Python changes. Run nanobot from a workspace directory, not from inside the repo.
+
+## Verification
+
+Targeted checks are more useful than broad lint during an update:
+
+```bash
+uv run ruff check nanobot/agent/memory.py nanobot/agent/context.py nanobot/config/schema.py
+uv run --extra dev python -m pytest tests/agent/test_memory_store.py tests/agent/test_context_builder.py
+uv run --extra dev python -m pytest tests/providers/test_transcription.py tests/channels/test_base_channel.py
+```
+
+If STT changed, restart Nanobot and send a voice note. A successful transcription is the real end-to-end check.
