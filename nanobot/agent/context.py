@@ -53,8 +53,10 @@ class ContextBuilder:
 
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
-    _MAX_RECENT_HISTORY = 50
+    _MAX_RECENT_HISTORY = 20
     _MAX_HISTORY_CHARS = 32_000  # hard cap on recent history section size
+    _MAX_ARCHIVED_SUMMARY_CHARS = 32_000
+    _ARCHIVED_SUMMARY_BUDGET_FRACTION = 0.25
     _RUNTIME_CONTEXT_END = "[/Runtime Context]"
 
     def __init__(self, workspace: Path, timezone: str | None = None, disabled_skills: list[str] | None = None):
@@ -72,6 +74,7 @@ class ContextBuilder:
         include_memory_recent_history: bool = True,
         session_key: str | None = None,
         unified_session: bool = False,
+        input_token_budget: int | None = None,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         root = workspace or self.workspace
@@ -84,8 +87,16 @@ class ContextBuilder:
         parts.append(render_template("agent/tool_contract.md"))
 
         memory = self.memory.get_memory_context()
-        if memory and not self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md"):
+        legacy_template_only = (
+            memory.startswith("## Long-term Memory")
+            and self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md")
+        )
+        if memory and not legacy_template_only:
             parts.append(f"# Memory\n\n{memory}")
+
+        memory_tree = self.memory.get_memory_tree_context()
+        if memory_tree:
+            parts.append(memory_tree)
 
         always_skills = self.skills.get_always_skills()
         if always_skills:
@@ -112,9 +123,27 @@ class ContextBuilder:
                 parts.append("# Recent History\n\n" + history_text)
 
         if session_summary:
+            session_summary = self._cap_archived_summary(
+                session_summary,
+                input_token_budget=input_token_budget,
+            )
             parts.append(f"[Archived Context Summary]\n\n{session_summary}")
 
         return "\n\n---\n\n".join(parts)
+
+    @classmethod
+    def _cap_archived_summary(
+        cls,
+        text: str,
+        *,
+        input_token_budget: int | None = None,
+    ) -> str:
+        """Cap archived summaries so a prior large-context model cannot poison replay."""
+        limit = cls._MAX_ARCHIVED_SUMMARY_CHARS
+        if input_token_budget and input_token_budget > 0:
+            budget_chars = int(input_token_budget * 4 * cls._ARCHIVED_SUMMARY_BUDGET_FRACTION)
+            limit = min(limit, max(1_000, budget_chars))
+        return truncate_text(text, limit)
 
     def _get_identity(self, channel: str | None = None, workspace: Path | None = None) -> str:
         """Get the core identity section."""
@@ -204,6 +233,7 @@ class ContextBuilder:
         include_memory_recent_history: bool = True,
         session_key: str | None = None,
         unified_session: bool = False,
+        input_token_budget: int | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         root = workspace or self.workspace
@@ -242,6 +272,7 @@ class ContextBuilder:
                     include_memory_recent_history=include_memory_recent_history,
                     session_key=session_key,
                     unified_session=unified_session,
+                    input_token_budget=input_token_budget,
                 ),
             },
             *history,

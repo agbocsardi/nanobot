@@ -31,6 +31,8 @@ _TOOL_CALL_ECHO_RE = re.compile(r'^\s*(?:generate_image|message)\([^)]*\)\s*$')
 _SESSION_PREVIEW_MAX_CHARS = 120
 _SESSION_LIST_PREVIEW_MAX_RECORDS = 200
 _SESSION_LIST_PREVIEW_MAX_CHARS = 1_000_000
+_PERSISTED_TOOL_RESULT_PREVIEW_CHARS = 0
+_RUNTIME_CHECKPOINT_KEY = "runtime_checkpoint"
 _FORK_VOLATILE_METADATA_KEYS = {
     "goal_state",
     "pending_user_turn",
@@ -95,6 +97,81 @@ def _metadata_title(metadata: Any) -> str:
     if metadata.get("title_user_edited") is True:
         return title
     return strip_think(title)
+
+
+def _content_size(content: Any) -> int:
+    if isinstance(content, str):
+        return len(content)
+    with suppress(Exception):
+        return len(json.dumps(content, ensure_ascii=False))
+    return len(str(content))
+
+
+def _compact_tool_call(tool_call: Any) -> dict[str, Any] | None:
+    if not isinstance(tool_call, dict):
+        return None
+    function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+    name = function.get("name") or tool_call.get("name") or "tool"
+    compact: dict[str, Any] = {
+        "id": tool_call.get("id"),
+        "type": tool_call.get("type") or "function",
+        "function": {"name": str(name), "arguments": "{}"},
+    }
+    if compact["id"] is None:
+        compact.pop("id")
+    return compact
+
+
+def _tool_result_placeholder(message: dict[str, Any]) -> str:
+    content = message.get("content", "")
+    if isinstance(content, str) and content.startswith("[tool result omitted:"):
+        return content
+    name = str(message.get("name") or "tool")
+    chars = _content_size(content)
+    return f"[tool result omitted: {name}, {chars} chars]"
+
+
+def sanitize_message_for_persistence(message: dict[str, Any]) -> dict[str, Any]:
+    """Return a replay-safe persisted message without hidden/tool payload bloat."""
+    entry = deepcopy(message)
+    entry.pop("reasoning_content", None)
+    role = entry.get("role")
+    if role == "assistant" and entry.get("tool_calls"):
+        compacted = [tc for tc in (_compact_tool_call(tc) for tc in entry.get("tool_calls") or []) if tc]
+        if compacted:
+            entry["tool_calls"] = compacted
+        else:
+            entry.pop("tool_calls", None)
+    if role == "tool":
+        entry["content"] = _tool_result_placeholder(entry)
+    return entry
+
+
+def sanitize_messages_for_persistence(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [sanitize_message_for_persistence(m) if isinstance(m, dict) else m for m in messages]
+
+
+def sanitize_metadata_for_persistence(metadata: dict[str, Any]) -> dict[str, Any]:
+    out = deepcopy(metadata)
+    checkpoint = out.get(_RUNTIME_CHECKPOINT_KEY)
+    if isinstance(checkpoint, dict):
+        checkpoint = dict(checkpoint)
+        assistant = checkpoint.get("assistant_message")
+        if isinstance(assistant, dict):
+            checkpoint["assistant_message"] = sanitize_message_for_persistence(assistant)
+        completed = checkpoint.get("completed_tool_results")
+        if isinstance(completed, list):
+            checkpoint["completed_tool_results"] = [
+                sanitize_message_for_persistence(m) if isinstance(m, dict) else m
+                for m in completed
+            ]
+        pending = checkpoint.get("pending_tool_calls")
+        if isinstance(pending, list):
+            checkpoint["pending_tool_calls"] = [
+                tc for tc in (_compact_tool_call(tc) for tc in pending) if tc
+            ]
+        out[_RUNTIME_CHECKPOINT_KEY] = checkpoint
+    return out
 
 
 @dataclass
@@ -179,9 +256,10 @@ class Session:
             sliced = sliced[start:]
 
         out: list[dict[str, Any]] = []
-        for message in sliced:
-            if message.get("_command"):
+        for raw_message in sliced:
+            if raw_message.get("_command"):
                 continue
+            message = sanitize_message_for_persistence(raw_message)
             content = message.get("content", "")
             role = message.get("role")
             if role == "assistant" and isinstance(content, str):
@@ -239,10 +317,10 @@ class Session:
             if include_timestamps:
                 content = self._annotate_message_time(message, content)
             if role == "assistant" and isinstance(content, str) and not content.strip():
-                if not any(key in message for key in ("tool_calls", "reasoning_content", "thinking_blocks")):
+                if not any(key in message for key in ("tool_calls", "thinking_blocks")):
                     continue
             entry: dict[str, Any] = {"role": message["role"], "content": content}
-            for key in ("tool_calls", "tool_call_id", "name", "reasoning_content", "thinking_blocks"):
+            for key in ("tool_calls", "tool_call_id", "name", "thinking_blocks"):
                 if key in message:
                     entry[key] = message[key]
             out.append(entry)
@@ -474,10 +552,10 @@ class SessionManager:
 
             return Session(
                 key=key,
-                messages=messages,
+                messages=sanitize_messages_for_persistence(messages),
                 created_at=created_at or datetime.now(),
                 updated_at=updated_at or datetime.now(),
-                metadata=metadata,
+                metadata=sanitize_metadata_for_persistence(metadata),
                 last_consolidated=last_consolidated
             )
         except Exception as e:
@@ -532,10 +610,10 @@ class SessionManager:
 
             return Session(
                 key=key,
-                messages=messages,
+                messages=sanitize_messages_for_persistence(messages),
                 created_at=created_at or datetime.now(),
                 updated_at=updated_at or datetime.now(),
-                metadata=metadata,
+                metadata=sanitize_metadata_for_persistence(metadata),
                 last_consolidated=last_consolidated
             )
         except Exception as e:
@@ -564,6 +642,10 @@ class SessionManager:
         """
         path = self._get_session_path(session.key)
         tmp_path = path.with_suffix(".jsonl.tmp")
+        session.messages = sanitize_messages_for_persistence(session.messages)
+        sanitized_metadata = sanitize_metadata_for_persistence(session.metadata)
+        session.metadata.clear()
+        session.metadata.update(sanitized_metadata)
 
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
@@ -721,6 +803,8 @@ class SessionManager:
                         stored_key = data.get("key")
                     else:
                         messages.append(data)
+            messages = sanitize_messages_for_persistence(messages)
+            metadata = sanitize_metadata_for_persistence(metadata)
             return {
                 "key": stored_key or key,
                 "created_at": created_at,

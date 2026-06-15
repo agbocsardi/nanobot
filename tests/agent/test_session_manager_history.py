@@ -239,7 +239,7 @@ def test_empty_session_history():
     assert history == []
 
 
-def test_get_history_preserves_reasoning_content():
+def test_get_history_drops_reasoning_content():
     session = Session(key="test:reasoning")
     session.messages.append({"role": "user", "content": "hi"})
     session.messages.append({
@@ -256,7 +256,6 @@ def test_get_history_preserves_reasoning_content():
         {
             "role": "assistant",
             "content": "done",
-            "reasoning_content": "hidden chain of thought",
             "thinking_blocks": [{
                 "type": "thinking",
                 "thinking": "hidden chain of thought",
@@ -338,7 +337,7 @@ def test_get_history_does_not_annotate_tool_results_with_timestamps():
 
     tool_result = history[-1]
     assert tool_result["role"] == "tool"
-    assert tool_result["content"] == "ok"
+    assert tool_result["content"] == "[tool result omitted: y, 2 chars]"
 
 
 # --- Window cuts mid-group: assistant present but some tool results orphaned ---
@@ -775,3 +774,61 @@ def test_retain_recent_legal_suffix_last_consolidated_correct_in_else_branch():
     assert session.last_consolidated == 3
     # already_cons should count dropped messages with original index < 12
     assert already_cons == 9
+
+
+def test_session_save_sanitizes_hidden_and_tool_payloads(tmp_path):
+    manager = SessionManager(tmp_path)
+    session = manager.get_or_create("telegram:bloated")
+    huge_args = "x" * 10_000
+    session.messages = [
+        {"role": "user", "content": "please read"},
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "private chain",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": huge_args},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "name": "read_file", "content": "y" * 20_000},
+        {"role": "assistant", "content": "visible answer", "reasoning_content": "private"},
+    ]
+
+    manager.save(session)
+    raw = manager._get_session_path("telegram:bloated").read_text(encoding="utf-8")
+
+    assert "reasoning_content" not in raw
+    assert huge_args not in raw
+    assert "y" * 1000 not in raw
+    assert "visible answer" in raw
+    assert "[tool result omitted: read_file, 20000 chars]" in raw
+
+    manager.invalidate("telegram:bloated")
+    reloaded = manager.get_or_create("telegram:bloated")
+    assistant_tool = reloaded.messages[1]["tool_calls"][0]
+    assert assistant_tool["function"] == {"name": "read_file", "arguments": "{}"}
+    assert reloaded.messages[2]["content"] == "[tool result omitted: read_file, 20000 chars]"
+
+
+def test_get_history_sanitizes_legacy_bloated_messages() -> None:
+    session = Session(key="telegram:legacy")
+    session.messages = [
+        {"role": "user", "content": "hello"},
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "private",
+            "tool_calls": [{"id": "c", "type": "function", "function": {"name": "exec", "arguments": "x" * 5000}}],
+        },
+        {"role": "tool", "tool_call_id": "c", "name": "exec", "content": "z" * 5000},
+    ]
+
+    history = session.get_history(max_messages=10)
+
+    assert "reasoning_content" not in history[1]
+    assert history[1]["tool_calls"][0]["function"]["arguments"] == "{}"
+    assert history[2]["content"] == "[tool result omitted: exec, 5000 chars]"

@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator
 import tiktoken
 from loguru import logger
 
-from nanobot.session.manager import Session
+from nanobot.session.manager import Session, sanitize_message_for_persistence
 from nanobot.utils.gitstore import GitStore
 from nanobot.utils.helpers import (
     ensure_dir,
@@ -48,11 +48,29 @@ class MemoryStore:
     _LEGACY_RAW_MESSAGE_RE = re.compile(
         r"^\[\d{4}-\d{2}-\d{2}[^\]]*\]\s+[A-Z][A-Z0-9_]*(?:\s+\[tools:\s*[^\]]+\])?:"
     )
+    _SYSTEM_FILES = [
+        "memory/system/procedures.md",
+        "memory/system/corrections.md",
+        "memory/system/now.md",
+    ]
+    _MEMORY_TREE_MAX_FILES = 80
+    _DESCRIPTION_MAX_CHARS = 240
+
+    @staticmethod
+    def _topic_files(workspace: Path) -> list[str]:
+        """Discover topic files in memory/ dynamically (excludes MEMORY.md and system/)."""
+        memory_dir = workspace / "memory"
+        return [
+            str(f.relative_to(workspace))
+            for f in sorted(memory_dir.rglob("*.md"))
+            if f.name != "MEMORY.md" and "system" not in f.relative_to(memory_dir).parts
+        ]
 
     def __init__(self, workspace: Path, max_history_entries: int = _DEFAULT_MAX_HISTORY):
         self.workspace = workspace
         self.max_history_entries = max_history_entries
         self.memory_dir = ensure_dir(workspace / "memory")
+        self.system_dir = ensure_dir(self.memory_dir / "system")
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.history_file = self.memory_dir / "history.jsonl"
         self.legacy_history_file = self.memory_dir / "HISTORY.md"
@@ -64,9 +82,18 @@ class MemoryStore:
         self._malformed_entry_logged = False  # rate-limit bad history shape warning
         self._oversize_logged = False  # rate-limit oversized-entry warning
         self._append_lock = threading.Lock()  # serialize cursor allocation + append
-        self._git = GitStore(workspace, tracked_files=[
-            "SOUL.md", "USER.md", "memory/MEMORY.md", "memory/.dream_cursor",
-        ])
+        self._git = GitStore(
+            workspace,
+            tracked_files=[
+                "SOUL.md", "USER.md", "memory/MEMORY.md", "memory/.dream_cursor",
+                *self._SYSTEM_FILES,
+            ],
+            tracked_globs=["memory/**/*.md"],
+        )
+        if self._git.is_initialized():
+            # Existing repos were bootstrapped without the topic-file glob;
+            # refresh the whitelist so agent-created files get versioned.
+            self._git.ensure_gitignore()
         self._maybe_migrate_legacy_history()
 
     @property
@@ -81,6 +108,60 @@ class MemoryStore:
             return path.read_text(encoding="utf-8")
         except FileNotFoundError:
             return ""
+
+    @staticmethod
+    def _split_frontmatter(content: str) -> tuple[dict[str, str], str]:
+        """Return ``(frontmatter, body)`` for simple YAML-ish markdown metadata.
+
+        We only need Letta-style ``description: ...`` / ``limit: ...`` parsing,
+        so keep this dependency-free and intentionally conservative.
+        """
+        if not content.startswith("---\n"):
+            return {}, content
+        end = content.find("\n---", 4)
+        if end == -1:
+            return {}, content
+        close_end = end + len("\n---")
+        if close_end < len(content) and content[close_end] == "\n":
+            close_end += 1
+        raw = content[4:end]
+        meta: dict[str, str] = {}
+        for line in raw.splitlines():
+            if ":" not in line or line.lstrip().startswith("#"):
+                continue
+            key, value = line.split(":", 1)
+            key = key.strip().lower()
+            value = value.strip().strip('"\'')
+            if key:
+                meta[key] = value
+        return meta, content[close_end:]
+
+    @classmethod
+    def _body_without_frontmatter(cls, content: str) -> str:
+        return cls._split_frontmatter(content)[1]
+
+    @classmethod
+    def _description_from_markdown(cls, content: str) -> str:
+        meta, body = cls._split_frontmatter(content)
+        description = meta.get("description", "").strip()
+        if description:
+            return truncate_text(description, cls._DESCRIPTION_MAX_CHARS)
+        for line in body.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                return truncate_text(stripped.lstrip("#").strip(), cls._DESCRIPTION_MAX_CHARS)
+        return "(missing description)"
+
+    def _iter_memory_markdown_files(self) -> list[Path]:
+        """Return memory markdown files visible in the memory tree."""
+        files = [
+            f for f in sorted(self.memory_dir.rglob("*.md"))
+            if f.name != "MEMORY.md"
+        ]
+        legacy = self.memory_file
+        if legacy.exists() and self._body_without_frontmatter(self.read_file(legacy)).strip():
+            files.insert(0, legacy)
+        return files
 
     def _maybe_migrate_legacy_history(self) -> None:
         """One-time upgrade from legacy HISTORY.md to history.jsonl.
@@ -230,8 +311,52 @@ class MemoryStore:
     # -- context injection (used by context.py) ------------------------------
 
     def get_memory_context(self) -> str:
-        long_term = self.read_memory()
+        """Return always-loaded memory context.
+
+        Reads all .md files from ``memory/system/`` and concatenates their
+        bodies. Falls back to the legacy monolithic ``memory/MEMORY.md`` if
+        the system directory is empty (backward compat).
+        """
+        parts: list[str] = []
+        for md_file in sorted(self.system_dir.glob("*.md")):
+            raw = md_file.read_text(encoding="utf-8")
+            content = self._body_without_frontmatter(raw).strip()
+            if content:
+                rel_path = str(md_file.relative_to(self.workspace))
+                parts.append(f"## {rel_path}\n\n{content}")
+        if parts:
+            return "# System Memory\n\n" + "\n\n".join(parts)
+
+        # Legacy fallback — workspace hasn't migrated to system/ yet
+        long_term = self._body_without_frontmatter(self.read_memory()).strip()
         return f"## Long-term Memory\n{long_term}" if long_term else ""
+
+    def get_memory_tree_context(self) -> str:
+        """Return a compact index of memory files and their descriptions.
+
+        The tree makes topic files discoverable without loading their full
+        contents. ``memory/system/`` files are marked as already loaded.
+        """
+        entries: list[str] = []
+        files = self._iter_memory_markdown_files()
+        for md_file in files[: self._MEMORY_TREE_MAX_FILES]:
+            raw = md_file.read_text(encoding="utf-8")
+            body = self._body_without_frontmatter(raw).strip()
+            description = self._description_from_markdown(raw)
+            rel_path = str(md_file.relative_to(self.workspace))
+            loaded = "loaded" if md_file.is_relative_to(self.system_dir) else "topic"
+            entries.append(
+                f"- `{rel_path}` ({loaded}, {len(body)} chars): {description}"
+            )
+        if len(files) > self._MEMORY_TREE_MAX_FILES:
+            entries.append(f"- … {len(files) - self._MEMORY_TREE_MAX_FILES} more memory files")
+        if not entries:
+            return ""
+        return "\n".join([
+            "# Memory Tree",
+            "Files in `memory/system/` are already loaded in full. Other files are topic memories; use their descriptions to decide what may be relevant.",
+            *entries,
+        ])
 
     # -- history.jsonl — append-only, JSONL format ---------------------------
 
@@ -270,19 +395,72 @@ class MemoryStore:
                 )
             raw = truncate_text(raw, limit)
         content = strip_think(raw)
+        record = {"timestamp": ts, "content": content}
+        if session_key:
+            record["session_key"] = session_key
+        cursor = self._append_history_record(record)
+        if raw and not content:
+            logger.debug(
+                "history entry {} stripped to empty (likely template leak); "
+                "persisting empty content to avoid re-polluting context",
+                cursor,
+            )
+        return cursor
+
+    def append_conversation_history(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        session_key: str | None = None,
+        content: str | None = None,
+        max_chars: int | None = None,
+    ) -> int:
+        """Append a structured conversation archive entry to history.jsonl.
+
+        The legacy ``content`` preview remains for grep/backward compatibility,
+        but downstream readers should prefer the structured ``messages`` field.
+        """
+        limit = max_chars if max_chars is not None else _HISTORY_ENTRY_HARD_CAP
+        now = datetime.now().astimezone().isoformat(timespec="minutes")
+        cleaned_messages = self._clean_history_messages(messages)
+        rendered = content if content is not None else self._format_messages(cleaned_messages)
+        rendered = rendered.rstrip()
+        if len(rendered) > limit:
+            if not self._oversize_logged:
+                self._oversize_logged = True
+                logger.warning(
+                    "history conversation preview exceeds {} chars ({}); truncating. "
+                    "Structured messages are kept intact; further occurrences suppressed.",
+                    limit, len(rendered),
+                )
+            rendered = truncate_text(rendered, limit)
+        timestamps = [m.get("timestamp") for m in cleaned_messages if m.get("timestamp")]
+        record: dict[str, Any] = {
+            "schema_version": 2,
+            "kind": "conversation",
+            "timestamp": now,
+            "start_time": min(timestamps) if timestamps else None,
+            "end_time": max(timestamps) if timestamps else None,
+            "session_key": session_key or "unknown",
+            "message_count": len(cleaned_messages),
+            "messages": cleaned_messages,
+            "content": strip_think(rendered),
+        }
+        cursor = self._append_history_record(record)
+        if rendered and not record["content"]:
+            logger.debug(
+                "history conversation entry {} preview stripped to empty; "
+                "persisting structured messages only",
+                cursor,
+            )
+        return cursor
+
+    def _append_history_record(self, record: dict[str, Any]) -> int:
         # Cursor allocation and the append must be atomic: concurrent writers
         # could otherwise read the same current cursor and emit duplicates.
         with self._append_lock:
             cursor = self._next_cursor()
-            if raw and not content:
-                logger.debug(
-                    "history entry {} stripped to empty (likely template leak); "
-                    "persisting empty content to avoid re-polluting context",
-                    cursor,
-                )
-            record = {"cursor": cursor, "timestamp": ts, "content": content}
-            if session_key:
-                record["session_key"] = session_key
+            record["cursor"] = cursor
             with open(self.history_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
             self._cursor_file.write_text(str(cursor), encoding="utf-8")
@@ -550,20 +728,45 @@ class MemoryStore:
             )
         return "\n".join(lines)
 
+    @staticmethod
+    def _clean_history_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Keep only stable, JSON-friendly fields for structured history."""
+        cleaned: list[dict[str, Any]] = []
+        for original in messages:
+            message = sanitize_message_for_persistence(original)
+            content = strip_think(str(message.get("content") or ""))
+            if not content:
+                continue
+            record: dict[str, Any] = {
+                "timestamp": message.get("timestamp"),
+                "role": message.get("role"),
+                "content": content,
+            }
+            name = message.get("name")
+            if name:
+                record["name"] = name
+            tools_used = message.get("tools_used")
+            if tools_used:
+                record["tools_used"] = list(tools_used)
+            cleaned.append(record)
+        return cleaned
+
     def raw_archive(
         self,
         messages: list[dict],
         *,
-        max_chars: int | None = None,
         session_key: str | None = None,
+        max_chars: int | None = None,
     ) -> None:
         """Fallback: dump raw messages to history.jsonl without LLM summarization."""
         limit = max_chars if max_chars is not None else _RAW_ARCHIVE_MAX_CHARS
-        formatted = truncate_text(self._format_messages(messages), limit)
-        self.append_history(
-            f"[RAW] {len(messages)} messages\n"
-            f"{formatted}",
+        cleaned_messages = [sanitize_message_for_persistence(m) for m in messages]
+        formatted = truncate_text(self._format_messages(cleaned_messages), limit)
+        self.append_conversation_history(
+            cleaned_messages,
             session_key=session_key,
+            content=f"[RAW] {len(messages)} messages\n{formatted}",
+            max_chars=limit,
         )
         logger.warning(
             "Memory consolidation degraded: raw-archived {} messages", len(messages)
@@ -788,6 +991,7 @@ class Consolidator:
             session_metadata=session.metadata,
             session_key=session.key,
             unified_session=self.unified_session,
+            input_token_budget=self._input_token_budget,
         )
         return estimate_prompt_tokens_chain(
             self.provider,
@@ -795,6 +999,44 @@ class Consolidator:
             probe_messages,
             self._get_tool_definitions(),
         )
+
+    def _prompt_diagnostics(self, session: Session) -> dict[str, int]:
+        """Estimate fixed/replay prompt components for consolidation logs."""
+        history = self._full_unconsolidated_history(session, include_timestamps=True)
+        channel, chat_id = (session.key.split(":", 1) if ":" in session.key else (None, None))
+        meta = session.metadata.get("_last_summary")
+        summary = meta.get("text") if isinstance(meta, dict) else (meta if isinstance(meta, str) else "")
+        system_messages = self._build_messages(
+            history=[],
+            current_message="[token-probe]",
+            channel=channel,
+            chat_id=chat_id,
+            sender_id=None,
+            session_summary=summary or None,
+            session_metadata=session.metadata,
+            session_key=session.key,
+            unified_session=self.unified_session,
+            input_token_budget=self._input_token_budget,
+        )[:1]
+        def _safe_estimate(message: dict[str, Any]) -> int:
+            try:
+                return estimate_message_tokens(message)
+            except Exception:
+                content = message.get("content", "")
+                return max(4, len(str(content)) // 4 + 4)
+
+        system_tokens = sum(_safe_estimate(m) for m in system_messages)
+        replay_tokens = sum(_safe_estimate(m) for m in history)
+        summary_tokens = _safe_estimate(
+            {"role": "system", "content": f"[Archived Context Summary]\n\n{summary}"}
+        ) if summary else 0
+        return {
+            "system_tokens": system_tokens,
+            "summary_chars": len(summary or ""),
+            "summary_tokens": summary_tokens,
+            "replay_tokens": replay_tokens,
+            "message_count": len(history),
+        }
 
     @property
     def _input_token_budget(self) -> int:
@@ -815,54 +1057,59 @@ class Consolidator:
         except Exception:
             return truncate_text(text, budget * 4)
 
+    @staticmethod
+    def _prune_messages(messages: list[dict]) -> list[dict]:
+        """Mechanically prune tool noise from messages before archiving.
+
+        Replaces tool-role messages with short placeholders showing the
+        tool name and output size. Removes empty assistant messages
+        (tool-call-only turns). Keeps all user/assistant text intact.
+        Dream gets actual conversation context instead of LLM summaries.
+        """
+        pruned: list[dict] = []
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if role == "tool":
+                name = msg.get("name", "tool")
+                lines = content.count("\n") + 1 if content else 0
+                chars = len(content) if content else 0
+                placeholder = f"[tool: {name} — {lines} lines, {chars} chars]"
+                pruned.append({**msg, "content": placeholder})
+                continue
+            if not str(content or "").strip():
+                continue
+            pruned.append(msg)
+        return pruned
+
     async def archive(
         self,
         messages: list[dict],
         *,
         session_key: str | None = None,
-        summary_messages: list[dict] | None = None,
     ) -> str | None:
-        """Summarize messages via LLM and append to history.jsonl.
+        """Mechanically prune tool noise and append to history.jsonl.
 
-        ``messages`` are the messages being archived (removed from the live
-        session); they are what gets raw-dumped if the LLM call fails.
-        ``summary_messages``, when given, lets callers include retained
-        messages in the summary without archiving them.
-
-        Returns the summary text on success, None if nothing to archive.
+        No LLM call — keeps actual conversation context for Dream.
+        Returns formatted text on success, None if nothing to archive.
         """
         if not messages:
             return None
-        messages_to_summarize = summary_messages if summary_messages is not None else messages
         try:
-            formatted = MemoryStore._format_messages(messages_to_summarize)
+            pruned = self._prune_messages(messages)
+            if not pruned:
+                return None
+            formatted = MemoryStore._format_messages(pruned)
             formatted = self._truncate_to_token_budget(formatted)
-            response = await self.provider.chat_with_retry(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": render_template(
-                            "agent/consolidator_archive.md",
-                            strip=True,
-                        ),
-                    },
-                    {"role": "user", "content": formatted},
-                ],
-                tools=None,
-                tool_choice=None,
-            )
-            if response.finish_reason == "error":
-                raise RuntimeError(f"LLM returned error: {response.content}")
-            summary = response.content or "[no summary]"
-            self.store.append_history(
-                summary,
-                max_chars=_ARCHIVE_SUMMARY_MAX_CHARS,
+            self.store.append_conversation_history(
+                pruned,
                 session_key=session_key,
+                content=f"[CONV] {len(pruned)} messages\n{formatted}",
+                max_chars=_ARCHIVE_SUMMARY_MAX_CHARS,
             )
-            return summary
+            return formatted
         except Exception:
-            logger.warning("Consolidation LLM call failed, raw-dumping to history")
+            logger.warning("Mechanical pruning failed, raw-dumping to history")
             self.store.raw_archive(messages, session_key=session_key)
             return None
 
@@ -905,6 +1152,32 @@ class Consolidator:
             if estimated <= 0:
                 self._persist_last_summary(session, last_summary)
                 return
+            if estimated >= budget:
+                diag = self._prompt_diagnostics(session)
+                logger.info(
+                    "Token consolidation diagnostics for {}: total={}/{} via {}, "
+                    "system_tokens={}, archived_summary={} chars/{} tokens, "
+                    "replay_tokens={}, replay_msgs={}, target={}",
+                    session.key,
+                    estimated,
+                    self.context_window_tokens,
+                    source,
+                    diag["system_tokens"],
+                    diag["summary_chars"],
+                    diag["summary_tokens"],
+                    diag["replay_tokens"],
+                    diag["message_count"],
+                    target,
+                )
+                if diag["system_tokens"] >= target:
+                    logger.warning(
+                        "Prompt bloat for {} is unreducible by message consolidation: "
+                        "system+archived context is already {} tokens (target {}, budget {}).",
+                        session.key,
+                        diag["system_tokens"],
+                        target,
+                        budget,
+                    )
             if estimated < budget:
                 unconsolidated_count = len(session.messages) - session.last_consolidated
                 logger.debug(
@@ -924,10 +1197,17 @@ class Consolidator:
 
                 boundary = self.pick_consolidation_boundary(session, max(1, estimated - target))
                 if boundary is None:
-                    logger.debug(
-                        "Token consolidation: no safe boundary for {} (round {})",
+                    diag = self._prompt_diagnostics(session)
+                    logger.warning(
+                        "Token consolidation cannot shrink {} (round {}): no safe boundary; "
+                        "system_tokens={}, archived_summary={} chars/{} tokens, replay_tokens={}, budget={}",
                         session.key,
                         round_num,
+                        diag["system_tokens"],
+                        diag["summary_chars"],
+                        diag["summary_tokens"],
+                        diag["replay_tokens"],
+                        budget,
                     )
                     break
 
@@ -1018,13 +1298,7 @@ class Consolidator:
             last_active = session.updated_at
             summary: str | None = ""
             if messages_to_remove:
-                # Summarize the retained suffix too, but only remove/raw-dump
-                # the messages that are no longer kept in the live session.
-                summary = await self.archive(
-                    messages_to_remove,
-                    session_key=session_key,
-                    summary_messages=messages_to_summarize,
-                )
+                summary = await self.archive(messages_to_remove, session_key=session.key)
 
             if summary and summary != "(nothing)":
                 session.metadata["_last_summary"] = {

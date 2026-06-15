@@ -44,6 +44,55 @@ class TestMemoryStoreBasicIO:
         assert "Long-term Memory" in ctx
         assert "important fact" in ctx
 
+    def test_get_memory_context_loads_system_files_without_frontmatter(self, store):
+        system_file = store.system_dir / "corrections.md"
+        system_file.write_text(
+            '---\ndescription: "Behavioral corrections"\n---\n\n- Use uv, not pip.\n',
+            encoding="utf-8",
+        )
+
+        ctx = store.get_memory_context()
+
+        assert "memory/system/corrections.md" in ctx
+        assert "Use uv, not pip" in ctx
+        assert "description:" not in ctx
+
+    def test_get_memory_tree_context_includes_descriptions(self, store):
+        (store.memory_dir / "homelab.md").write_text(
+            '---\ndescription: "Hardware, services, and network preferences."\n---\n\n# Homelab\n',
+            encoding="utf-8",
+        )
+        (store.system_dir / "procedures.md").write_text(
+            '---\ndescription: "Always-loaded operating procedures."\n---\n\n- Be brief.\n',
+            encoding="utf-8",
+        )
+
+        tree = store.get_memory_tree_context()
+
+        assert "Memory Tree" in tree
+        assert "`memory/homelab.md` (topic" in tree
+        assert "Hardware, services, and network preferences." in tree
+        assert "`memory/system/procedures.md` (loaded" in tree
+        assert "Always-loaded operating procedures." in tree
+
+    def test_get_memory_tree_context_marks_missing_description(self, store):
+        (store.memory_dir / "project.md").write_text("- fact\n", encoding="utf-8")
+
+        tree = store.get_memory_tree_context()
+
+        assert "`memory/project.md`" in tree
+        assert "(missing description)" in tree
+
+    def test_topic_files_discovers_nested_topic_files(self, tmp_path):
+        memory_dir = tmp_path / "memory"
+        (memory_dir / "projects").mkdir(parents=True)
+        (memory_dir / "projects" / "nanobot.md").write_text("x", encoding="utf-8")
+        (memory_dir / "system").mkdir()
+        (memory_dir / "system" / "now.md").write_text("x", encoding="utf-8")
+
+        assert "memory/projects/nanobot.md" in MemoryStore._topic_files(tmp_path)
+        assert "memory/system/now.md" not in MemoryStore._topic_files(tmp_path)
+
 
 class TestHistoryWithCursor:
     def test_append_history_returns_cursor(self, store):
@@ -324,6 +373,96 @@ class TestAppendHistoryHardCap:
         store.append_history(msg)
         entry = store.read_unprocessed_history(since_cursor=0)[0]
         assert entry["content"] == msg
+
+
+class TestStructuredConversationHistory:
+    def test_append_conversation_history_writes_v2_record_with_preview(self, store):
+        messages = [
+            {
+                "timestamp": "2026-06-01T10:00:00+02:00",
+                "role": "user",
+                "content": "hello",
+            },
+            {
+                "timestamp": "2026-06-01T10:01:00+02:00",
+                "role": "assistant",
+                "content": "used a thing",
+                "tools_used": ["read_file"],
+            },
+            {
+                "timestamp": "2026-06-01T10:02:00+02:00",
+                "role": "tool",
+                "name": "read_file",
+                "content": "[tool: read_file — 2 lines, 20 chars]",
+            },
+        ]
+
+        cursor = store.append_conversation_history(
+            messages,
+            session_key="telegram:123",
+            content="[CONV] 3 messages\npreview",
+        )
+
+        entry = store.read_unprocessed_history(since_cursor=0)[0]
+        assert cursor == 1
+        assert entry["schema_version"] == 2
+        assert entry["kind"] == "conversation"
+        assert entry["session_key"] == "telegram:123"
+        assert entry["message_count"] == 3
+        assert entry["start_time"] == "2026-06-01T10:00:00+02:00"
+        assert entry["end_time"] == "2026-06-01T10:02:00+02:00"
+        assert entry["content"] == "[CONV] 3 messages\npreview"
+        assert entry["messages"][1]["tools_used"] == ["read_file"]
+        assert entry["messages"][2]["name"] == "read_file"
+
+    def test_append_conversation_history_strips_thinking_from_messages(self, store):
+        store.append_conversation_history([
+            {
+                "timestamp": "2026-06-01T10:00:00+02:00",
+                "role": "assistant",
+                "content": "<think>private</think>visible",
+            },
+            {
+                "timestamp": "2026-06-01T10:01:00+02:00",
+                "role": "assistant",
+                "content": "<think>only private</think>",
+            },
+        ])
+
+        entry = store.read_unprocessed_history(since_cursor=0)[0]
+        assert entry["message_count"] == 1
+        assert entry["messages"][0]["content"] == "visible"
+
+    def test_append_conversation_history_sanitizes_structured_tool_payloads(self, store):
+        huge_args = "x" * 5000
+        store.append_conversation_history([
+            {"timestamp": "2026-06-01T10:00:00", "role": "user", "content": "visible user"},
+            {
+                "timestamp": "2026-06-01T10:01:00",
+                "role": "assistant",
+                "content": "visible assistant",
+                "reasoning_content": "private",
+                "tool_calls": [
+                    {"id": "c", "type": "function", "function": {"name": "read_file", "arguments": huge_args}}
+                ],
+            },
+            {
+                "timestamp": "2026-06-01T10:02:00",
+                "role": "tool",
+                "tool_call_id": "c",
+                "name": "read_file",
+                "content": "y" * 4000,
+            },
+        ])
+
+        entry = store.read_unprocessed_history(since_cursor=0)[0]
+        raw = store.history_file.read_text(encoding="utf-8")
+        assert "private" not in raw
+        assert huge_args not in raw
+        assert "y" * 1000 not in raw
+        assert entry["messages"][0]["content"] == "visible user"
+        assert entry["messages"][1]["content"] == "visible assistant"
+        assert entry["messages"][2]["content"] == "[tool result omitted: read_file, 4000 chars]"
 
 
 class TestDreamCursor:

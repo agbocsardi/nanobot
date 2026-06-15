@@ -1,17 +1,58 @@
 ---
 name: memory
-description: Two-layer memory system with Dream-managed knowledge files.
+description: Hierarchical git-backed memory — agent-managed topic files, Dream-managed system files.
 always: true
 ---
 
 # Memory
 
-## Structure
+## Structure & ownership
 
-- `SOUL.md` — Bot personality and communication style. **Managed by Dream.** Do NOT edit.
-- `USER.md` — User profile and preferences. **Managed by Dream.** Do NOT edit.
-- `memory/MEMORY.md` — Long-term facts (project context, important events). **Managed by Dream.** Do NOT edit.
-- `memory/history.jsonl` — append-only JSONL, not loaded into context. Prefer the built-in `grep` tool to search it.
+| Path | What it is | Who edits it |
+|------|-----------|--------------|
+| `SOUL.md` | Bot personality and communication style | Dream only — do NOT edit |
+| `USER.md` | User profile and preferences | Dream only — do NOT edit |
+| `memory/system/*.md` | Pinned memory, always loaded in full | Dream only — do NOT edit |
+| `memory/<topic>/<name>.md` | Topic files: subject-specific knowledge | **You** — create and edit freely |
+| `memory/MEMORY.md` | Legacy, decommissioned | Nobody — ignore it |
+| `memory/history.jsonl` | Append-only conversation log, not in context | Nobody — search with `grep` |
+
+Topic files are lazy-loaded: only their descriptions appear in the Memory Tree in your system prompt; read the file when you need its contents.
+
+## Topic files — your memory, manage it
+
+When you learn something durable mid-conversation (a decision, a project fact, a gotcha, infrastructure detail), save it immediately — don't wait for Dream to reconstruct it from history.
+
+**Hot update procedure:**
+1. Check the Memory Tree for an existing file covering the subject.
+2. If one exists, read it and edit in place — replace stale facts, don't append contradictions. Never create a second file for the same subject.
+3. If none exists, create one: `memory/projects/<name>.md`, `memory/people/<name>.md`, `memory/infra/<host>.md`, etc. Prefer many small focused files over one large one.
+4. Commit (see below).
+
+**Do NOT save:** transient status, temporary errors, conversational filler, or anything a quick web search would surface (public docs, standard APIs, common defaults). Memory is for context that can't be looked up.
+
+Every topic file MUST start with YAML frontmatter containing a one-line `description:` — this is what appears in the Memory Tree and is your only navigational signal later. Keep it specific.
+
+```markdown
+---
+description: Fork maintenance for nanobot — branch list, sync workflow, deploy host
+---
+
+# Nanobot fork
+...
+```
+
+- The Memory Tree in your system prompt lists every file with its description. Read a topic file before answering questions it likely covers.
+
+### Committing
+
+The workspace is a git repo. After creating or editing memory files, commit with an informative message:
+
+```bash
+git add memory/ && git commit -m "memory: <what you learned and why it changed>"
+```
+
+If the commit fails (e.g. git unavailable), don't worry — Dream auto-commits leftovers on its next run.
 
 ## Search Past Events
 
@@ -31,6 +72,8 @@ Examples (replace `keyword`):
 
 ## Important
 
-- **Do NOT edit SOUL.md, USER.md, or MEMORY.md.** They are automatically managed by Dream.
-- If you notice outdated information, it will be corrected when Dream runs next.
+- **Do NOT edit SOUL.md, USER.md, or memory/system/.** They are automatically managed by Dream.
+- **DO edit topic files** — they are your working memory. If you notice outdated information in a topic file, fix it immediately.
+- If you notice outdated information in Dream-managed files, it will be corrected when Dream runs next.
 - Users can view Dream's activity with the `/dream-log` command.
+- When memory feels disorganized, suggest the user run the `memory-defrag` skill.
