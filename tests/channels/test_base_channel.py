@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -93,3 +94,20 @@ async def test_handle_message_group_ignores_unknown() -> None:
 
     assert channel._sent == []
 
+
+async def test_transcribe_audio_skips_groq_without_api_key() -> None:
+    channel = _DummyChannel({}, MessageBus())
+    channel.transcription_provider = "groq"
+    channel.transcription_api_key = ""
+
+    result = await channel.transcribe_audio("/tmp/fake.ogg")
+    assert result == ""
+
+
+async def test_transcribe_audio_skips_openai_without_api_key() -> None:
+    channel = _DummyChannel({}, MessageBus())
+    channel.transcription_provider = "openai"
+    channel.transcription_api_key = ""
+
+    result = await channel.transcribe_audio("/tmp/fake.ogg")
+    assert result == ""
