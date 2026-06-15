@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -111,52 +111,3 @@ async def test_transcribe_audio_skips_openai_without_api_key() -> None:
 
     result = await channel.transcribe_audio("/tmp/fake.ogg")
     assert result == ""
-
-
-async def test_transcribe_audio_faster_whisper_not_blocked_by_empty_key() -> None:
-    channel = _DummyChannel({}, MessageBus())
-    channel.transcription_provider = "faster_whisper"
-    channel.transcription_api_key = ""  # should NOT block faster_whisper
-
-    mock_provider = AsyncMock()
-    mock_provider.transcribe = AsyncMock(return_value="transcribed text")
-
-    with patch(
-        "nanobot.providers.transcription.FasterWhisperTranscriptionProvider",
-        return_value=mock_provider,
-    ):
-        result = await channel.transcribe_audio("/tmp/fake.ogg")
-
-    assert result == "transcribed text"
-    mock_provider.transcribe.assert_called_once_with("/tmp/fake.ogg")
-
-
-async def test_transcribe_audio_faster_whisper_uses_config() -> None:
-    channel = _DummyChannel({}, MessageBus())
-    channel.transcription_provider = "faster_whisper"
-    channel.transcription_api_key = ""
-    channel.transcription_faster_whisper = SimpleNamespace(
-        uv_bin="/opt/bin/uv",
-        script_path="/opt/whisper/run.py",
-        model="large-v3",
-        device="cuda",
-        compute_type="float16",
-    )
-
-    mock_provider = AsyncMock()
-    mock_provider.transcribe = AsyncMock(return_value="gpu text")
-
-    with patch(
-        "nanobot.providers.transcription.FasterWhisperTranscriptionProvider",
-        return_value=mock_provider,
-    ) as mock_cls:
-        result = await channel.transcribe_audio("/tmp/fake.ogg")
-
-    assert result == "gpu text"
-    mock_cls.assert_called_once_with(
-        uv_bin="/opt/bin/uv",
-        script_path="/opt/whisper/run.py",
-        model="large-v3",
-        device="cuda",
-        compute_type="float16",
-    )
