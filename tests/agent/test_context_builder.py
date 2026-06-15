@@ -400,3 +400,28 @@ class TestBuildMessages:
         user_msg = messages[-1]["content"]
         assert isinstance(user_msg, list)
         assert any(b.get("type") == "image_url" for b in user_msg)
+
+
+def test_archived_summary_is_capped_against_current_budget(tmp_path):
+    builder = _builder(tmp_path)
+    huge = "s" * 20_000
+
+    prompt = builder.build_system_prompt(
+        session_summary=huge,
+        input_token_budget=2_000,
+    )
+
+    summary = prompt.split("[Archived Context Summary]\n\n", 1)[1]
+    assert len(summary) < 3_000
+    assert "truncated" in summary
+
+
+def test_archived_summary_default_cap(tmp_path):
+    builder = _builder(tmp_path)
+    huge = "s" * 40_000
+
+    prompt = builder.build_system_prompt(session_summary=huge)
+
+    summary = prompt.split("[Archived Context Summary]\n\n", 1)[1]
+    assert len(summary) < 33_000
+    assert "truncated" in summary

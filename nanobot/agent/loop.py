@@ -57,7 +57,7 @@ from nanobot.session.goal_state import (
     sustained_goal_active,
 )
 from nanobot.session.keys import UNIFIED_SESSION_KEY, session_key_for_channel
-from nanobot.session.manager import Session, SessionManager
+from nanobot.session.manager import Session, SessionManager, sanitize_message_for_persistence
 from nanobot.utils.document import extract_documents, reference_non_image_attachments
 from nanobot.utils.helpers import image_placeholder_text
 from nanobot.utils.helpers import truncate_text as truncate_text_fn
@@ -630,6 +630,7 @@ class AgentLoop:
             include_memory_recent_history=include_memory_recent_history,
             session_key=session.key,
             unified_session=self._unified_session,
+            input_token_budget=self._replay_token_budget(),
         )
 
     async def _dispatch_command_inline(
@@ -1190,6 +1191,7 @@ class AgentLoop:
             skip_runtime_lines=is_subagent,
             session_key=key,
             unified_session=self._unified_session,
+            input_token_budget=self._replay_token_budget(),
         )
         t_wall = time.time()
         final_content, _, all_msgs, stop_reason, _ = await self._run_agent_loop(
@@ -1659,6 +1661,7 @@ class AgentLoop:
                         continue
                     entry["content"] = filtered
             entry.setdefault("timestamp", datetime.now().isoformat())
+            entry = sanitize_message_for_persistence(entry)
             session.messages.append(entry)
             if role == "assistant":
                 last_assistant_idx = len(session.messages) - 1
@@ -1697,8 +1700,23 @@ class AgentLoop:
 
     def _set_runtime_checkpoint(self, session: Session, payload: dict[str, Any]) -> None:
         """Persist the latest in-flight turn state into session metadata."""
-        session.metadata[self._RUNTIME_CHECKPOINT_KEY] = payload
-        self.sessions.save(session)
+        checkpoint = dict(payload)
+        assistant = checkpoint.get("assistant_message")
+        if isinstance(assistant, dict):
+            checkpoint["assistant_message"] = sanitize_message_for_persistence(assistant)
+        completed = checkpoint.get("completed_tool_results")
+        if isinstance(completed, list):
+            checkpoint["completed_tool_results"] = [
+                sanitize_message_for_persistence(m) if isinstance(m, dict) else m
+                for m in completed
+            ]
+        pending = checkpoint.get("pending_tool_calls")
+        if isinstance(pending, list):
+            compact = sanitize_message_for_persistence({"role": "assistant", "tool_calls": pending})
+            checkpoint["pending_tool_calls"] = compact.get("tool_calls", [])
+        session.metadata[self._RUNTIME_CHECKPOINT_KEY] = checkpoint
+        if hasattr(self, "sessions"):
+            self.sessions.save(session)
 
     def _mark_pending_user_turn(self, session: Session) -> None:
         session.metadata[self._PENDING_USER_TURN_KEY] = True
@@ -1712,13 +1730,13 @@ class AgentLoop:
 
     @staticmethod
     def _checkpoint_message_key(message: dict[str, Any]) -> tuple[Any, ...]:
+        message = sanitize_message_for_persistence(message)
         return (
             message.get("role"),
             message.get("content"),
             message.get("tool_call_id"),
             message.get("name"),
             message.get("tool_calls"),
-            message.get("reasoning_content"),
             message.get("thinking_blocks"),
         )
 
@@ -1758,6 +1776,8 @@ class AgentLoop:
                     "timestamp": datetime.now().isoformat(),
                 }
             )
+
+        restored_messages = [sanitize_message_for_persistence(m) for m in restored_messages]
 
         overlap = 0
         max_overlap = min(len(session.messages), len(restored_messages))

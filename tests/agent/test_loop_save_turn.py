@@ -340,7 +340,7 @@ def test_save_turn_skips_string_user_when_only_runtime_context_suffix() -> None:
     assert session.messages == []
 
 
-def test_save_turn_keeps_tool_results_under_16k() -> None:
+def test_save_turn_omits_persisted_tool_results() -> None:
     loop = _mk_loop()
     session = Session(key="test:tool-result")
     content = "x" * 12_000
@@ -362,7 +362,7 @@ def test_save_turn_keeps_tool_results_under_16k() -> None:
         skip=0,
     )
 
-    assert session.messages[1]["content"] == content
+    assert session.messages[1]["content"] == "[tool result omitted: read_file, 12000 chars]"
 
 
 def test_save_turn_stamps_latency_on_last_assistant() -> None:
@@ -432,7 +432,7 @@ def test_restore_runtime_checkpoint_rehydrates_completed_and_pending_tools() -> 
     assert session.messages[0]["role"] == "assistant"
     assert session.messages[1]["tool_call_id"] == "call_done"
     assert session.messages[2]["tool_call_id"] == "call_pending"
-    assert "interrupted before this tool finished" in session.messages[2]["content"].lower()
+    assert session.messages[2]["content"] == "[tool result omitted: exec, 50 chars]"
 
 
 def test_restore_runtime_checkpoint_dedupes_overlapping_tail() -> None:
@@ -1107,12 +1107,12 @@ async def test_stop_preserves_runtime_checkpoint_for_next_turn(tmp_path: Path) -
     ] == [
         {"role": "user", "content": "keep progress"},
         {"role": "assistant", "content": "working"},
-        {"role": "tool", "tool_call_id": "call_done", "name": "read_file", "content": "ok"},
+        {"role": "tool", "tool_call_id": "call_done", "name": "read_file", "content": "[tool result omitted: read_file, 2 chars]"},
         {
             "role": "tool",
             "tool_call_id": "call_pending",
             "name": "exec",
-            "content": "Error: Task interrupted before this tool finished.",
+            "content": "[tool result omitted: exec, 50 chars]",
         },
         {"role": "user", "content": "continue here"},
         {"role": "assistant", "content": "next answer"},
@@ -1434,9 +1434,7 @@ def test_save_turn_keeps_placeholder_for_empty_tool_result_blocks() -> None:
     )
 
     assert [m["role"] for m in session.messages] == ["assistant", "tool"]
-    assert session.messages[1]["content"] == [
-        {"type": "text", "text": "[tool result omitted during persistence]"}
-    ]
+    assert session.messages[1]["content"] == "[tool result omitted: exec, 70 chars]"
 
 
 def test_save_turn_drops_orphaned_tool_results() -> None:
@@ -1493,3 +1491,38 @@ def test_save_turn_keeps_tool_results_declared_in_prior_history() -> None:
     )
 
     assert [m["role"] for m in session.messages] == ["assistant", "tool"]
+
+
+def test_set_runtime_checkpoint_sanitizes_hidden_tool_payloads() -> None:
+    loop = _mk_loop()
+    session = Session(key="test:checkpoint-sanitize")
+    huge_args = "x" * 5000
+
+    loop._set_runtime_checkpoint(
+        session,
+        {
+            "assistant_message": {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "private",
+                "tool_calls": [
+                    {"id": "c", "type": "function", "function": {"name": "read_file", "arguments": huge_args}}
+                ],
+            },
+            "completed_tool_results": [
+                {"role": "tool", "tool_call_id": "c", "name": "read_file", "content": "y" * 4000}
+            ],
+            "pending_tool_calls": [
+                {"id": "p", "type": "function", "function": {"name": "exec", "arguments": "z" * 4000}}
+            ],
+        },
+    )
+
+    checkpoint = session.metadata[AgentLoop._RUNTIME_CHECKPOINT_KEY]
+    raw = str(checkpoint)
+    assert "reasoning_content" not in raw
+    assert huge_args not in raw
+    assert "y" * 1000 not in raw
+    assert checkpoint["assistant_message"]["tool_calls"][0]["function"]["arguments"] == "{}"
+    assert checkpoint["completed_tool_results"][0]["content"] == "[tool result omitted: read_file, 4000 chars]"
+    assert checkpoint["pending_tool_calls"][0]["function"] == {"name": "exec", "arguments": "{}"}

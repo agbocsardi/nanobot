@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator
 import tiktoken
 from loguru import logger
 
-from nanobot.session.manager import Session
+from nanobot.session.manager import Session, sanitize_message_for_persistence
 from nanobot.utils.gitstore import GitStore
 from nanobot.utils.helpers import (
     ensure_dir,
@@ -422,7 +422,8 @@ class MemoryStore:
         """
         limit = max_chars if max_chars is not None else _HISTORY_ENTRY_HARD_CAP
         now = datetime.now().astimezone().isoformat(timespec="minutes")
-        rendered = content if content is not None else self._format_messages(messages)
+        cleaned_messages = self._clean_history_messages(messages)
+        rendered = content if content is not None else self._format_messages(cleaned_messages)
         rendered = rendered.rstrip()
         if len(rendered) > limit:
             if not self._oversize_logged:
@@ -433,7 +434,6 @@ class MemoryStore:
                     limit, len(rendered),
                 )
             rendered = truncate_text(rendered, limit)
-        cleaned_messages = self._clean_history_messages(messages)
         timestamps = [m.get("timestamp") for m in cleaned_messages if m.get("timestamp")]
         record: dict[str, Any] = {
             "schema_version": 2,
@@ -732,7 +732,8 @@ class MemoryStore:
     def _clean_history_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Keep only stable, JSON-friendly fields for structured history."""
         cleaned: list[dict[str, Any]] = []
-        for message in messages:
+        for original in messages:
+            message = sanitize_message_for_persistence(original)
             content = strip_think(str(message.get("content") or ""))
             if not content:
                 continue
@@ -759,9 +760,10 @@ class MemoryStore:
     ) -> None:
         """Fallback: dump raw messages to history.jsonl without LLM summarization."""
         limit = max_chars if max_chars is not None else _RAW_ARCHIVE_MAX_CHARS
-        formatted = truncate_text(self._format_messages(messages), limit)
+        cleaned_messages = [sanitize_message_for_persistence(m) for m in messages]
+        formatted = truncate_text(self._format_messages(cleaned_messages), limit)
         self.append_conversation_history(
-            messages,
+            cleaned_messages,
             session_key=session_key,
             content=f"[RAW] {len(messages)} messages\n{formatted}",
             max_chars=limit,
@@ -989,6 +991,7 @@ class Consolidator:
             session_metadata=session.metadata,
             session_key=session.key,
             unified_session=self.unified_session,
+            input_token_budget=self._input_token_budget,
         )
         return estimate_prompt_tokens_chain(
             self.provider,
@@ -996,6 +999,44 @@ class Consolidator:
             probe_messages,
             self._get_tool_definitions(),
         )
+
+    def _prompt_diagnostics(self, session: Session) -> dict[str, int]:
+        """Estimate fixed/replay prompt components for consolidation logs."""
+        history = self._full_unconsolidated_history(session, include_timestamps=True)
+        channel, chat_id = (session.key.split(":", 1) if ":" in session.key else (None, None))
+        meta = session.metadata.get("_last_summary")
+        summary = meta.get("text") if isinstance(meta, dict) else (meta if isinstance(meta, str) else "")
+        system_messages = self._build_messages(
+            history=[],
+            current_message="[token-probe]",
+            channel=channel,
+            chat_id=chat_id,
+            sender_id=None,
+            session_summary=summary or None,
+            session_metadata=session.metadata,
+            session_key=session.key,
+            unified_session=self.unified_session,
+            input_token_budget=self._input_token_budget,
+        )[:1]
+        def _safe_estimate(message: dict[str, Any]) -> int:
+            try:
+                return estimate_message_tokens(message)
+            except Exception:
+                content = message.get("content", "")
+                return max(4, len(str(content)) // 4 + 4)
+
+        system_tokens = sum(_safe_estimate(m) for m in system_messages)
+        replay_tokens = sum(_safe_estimate(m) for m in history)
+        summary_tokens = _safe_estimate(
+            {"role": "system", "content": f"[Archived Context Summary]\n\n{summary}"}
+        ) if summary else 0
+        return {
+            "system_tokens": system_tokens,
+            "summary_chars": len(summary or ""),
+            "summary_tokens": summary_tokens,
+            "replay_tokens": replay_tokens,
+            "message_count": len(history),
+        }
 
     @property
     def _input_token_budget(self) -> int:
@@ -1111,6 +1152,32 @@ class Consolidator:
             if estimated <= 0:
                 self._persist_last_summary(session, last_summary)
                 return
+            if estimated >= budget:
+                diag = self._prompt_diagnostics(session)
+                logger.info(
+                    "Token consolidation diagnostics for {}: total={}/{} via {}, "
+                    "system_tokens={}, archived_summary={} chars/{} tokens, "
+                    "replay_tokens={}, replay_msgs={}, target={}",
+                    session.key,
+                    estimated,
+                    self.context_window_tokens,
+                    source,
+                    diag["system_tokens"],
+                    diag["summary_chars"],
+                    diag["summary_tokens"],
+                    diag["replay_tokens"],
+                    diag["message_count"],
+                    target,
+                )
+                if diag["system_tokens"] >= target:
+                    logger.warning(
+                        "Prompt bloat for {} is unreducible by message consolidation: "
+                        "system+archived context is already {} tokens (target {}, budget {}).",
+                        session.key,
+                        diag["system_tokens"],
+                        target,
+                        budget,
+                    )
             if estimated < budget:
                 unconsolidated_count = len(session.messages) - session.last_consolidated
                 logger.debug(
@@ -1130,10 +1197,17 @@ class Consolidator:
 
                 boundary = self.pick_consolidation_boundary(session, max(1, estimated - target))
                 if boundary is None:
-                    logger.debug(
-                        "Token consolidation: no safe boundary for {} (round {})",
+                    diag = self._prompt_diagnostics(session)
+                    logger.warning(
+                        "Token consolidation cannot shrink {} (round {}): no safe boundary; "
+                        "system_tokens={}, archived_summary={} chars/{} tokens, replay_tokens={}, budget={}",
                         session.key,
                         round_num,
+                        diag["system_tokens"],
+                        diag["summary_chars"],
+                        diag["summary_tokens"],
+                        diag["replay_tokens"],
+                        budget,
                     )
                     break
 

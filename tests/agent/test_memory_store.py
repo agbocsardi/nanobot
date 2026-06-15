@@ -433,6 +433,37 @@ class TestStructuredConversationHistory:
         assert entry["message_count"] == 1
         assert entry["messages"][0]["content"] == "visible"
 
+    def test_append_conversation_history_sanitizes_structured_tool_payloads(self, store):
+        huge_args = "x" * 5000
+        store.append_conversation_history([
+            {"timestamp": "2026-06-01T10:00:00", "role": "user", "content": "visible user"},
+            {
+                "timestamp": "2026-06-01T10:01:00",
+                "role": "assistant",
+                "content": "visible assistant",
+                "reasoning_content": "private",
+                "tool_calls": [
+                    {"id": "c", "type": "function", "function": {"name": "read_file", "arguments": huge_args}}
+                ],
+            },
+            {
+                "timestamp": "2026-06-01T10:02:00",
+                "role": "tool",
+                "tool_call_id": "c",
+                "name": "read_file",
+                "content": "y" * 4000,
+            },
+        ])
+
+        entry = store.read_unprocessed_history(since_cursor=0)[0]
+        raw = store.history_file.read_text(encoding="utf-8")
+        assert "private" not in raw
+        assert huge_args not in raw
+        assert "y" * 1000 not in raw
+        assert entry["messages"][0]["content"] == "visible user"
+        assert entry["messages"][1]["content"] == "visible assistant"
+        assert entry["messages"][2]["content"] == "[tool result omitted: read_file, 4000 chars]"
+
 
 class TestDreamCursor:
     def test_initial_cursor_is_zero(self, store):
