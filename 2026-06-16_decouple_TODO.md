@@ -320,10 +320,57 @@ This is already close to Letta MemFS. The main gap is not storage; it is memory 
    - Add frontmatter/description validation.
    - Add duplicate/overlap audit via doctor/defrag.
 
+### PR #3990 / old Dream safeguard findings
+
+User observed Dream going off the rails in a read/write/edit loop for ~200 iterations. Investigation:
+
+- PR #3990 (`d1a94dae`, final PR branch fetched as `upstream/pr-3990`) replaced the old two-phase `Dream` class with `AgentLoop.process_direct(..., ephemeral=True)`.
+- The old `Dream` class had real guardrails:
+  - `max_batch_size` default 20: maximum `history.jsonl` entries per Dream run.
+  - `max_iterations` default 10 in `Dream.__init__`, wired from config default 15: maximum Phase 2 agent/tool iterations.
+  - `max_tool_result_chars` default 16,000.
+  - per-entry prompt preview cap: `_HISTORY_ENTRY_PREVIEW_MAX_CHARS = 4_000`.
+  - prompt preview caps for memory files.
+  - `model_override` config field for a Dream-specific model.
+  - cursor advanced only on successful completion.
+- After #3990, the fields still exist in `DreamConfig` but are explicitly marked deprecated/no longer used:
+  - `model_override` comment: "pending implementation"
+  - `max_batch_size`: "Deprecated: no longer used"
+  - `max_iterations`: "Deprecated: no longer used"
+  - `annotate_line_ages`: "Deprecated: no longer used"
+- Current single-phase Dream still caps history entries internally via `MemoryStore.build_dream_prompt(max_entries=20)`, but the cron handler calls it with the default hardcoded value and does not read config.
+- Current single-phase Dream inherits the normal agent's `max_iterations` via `process_direct`, which explains a 200-iteration read/write/edit loop if runtime max iterations had been raised.
+- Current single-phase Dream has no Dream-specific timeout, no max changed files/diff-size validation, and no rollback of file edits when the run is incomplete. It only avoids cursor advancement.
+
+Conclusion: restore safeguards **around** the current process-direct Dream path, not by reviving the old two-phase Dream class.
+
+Minimal restoration plan:
+
+1. Rewire existing config fields:
+   - Rename comments to active again.
+   - `dream.max_batch_size` passed to `store.build_dream_prompt(max_entries=...)`.
+   - `dream.max_iterations` passed through to the Dream-only agent run.
+   - `dream.model_override` resolves a separate provider/model snapshot for Dream.
+2. Add Dream-specific process-direct override:
+   - Extend `AgentLoop.process_direct(..., max_iterations: int | None = None, provider: LLMProvider | None = None, model: str | None = None, context_window_tokens: int | None = None)` or add a small `run_ephemeral_dream(...)` wrapper that calls `runner.run(AgentRunSpec(... max_iterations=dream_cfg.max_iterations ...))`.
+   - Prefer wrapper to avoid making normal direct calls more complex.
+3. Add incomplete-run protection:
+   - Before Dream, record git `HEAD` and dirty diff for memory files.
+   - If stop reason is not `completed`, rollback Dream edits and do not advance cursor.
+   - If rollback feels too broad, first MVP can `git diff -- memory SOUL.md USER.md skills` and refuse to commit while leaving cursor unchanged; better is rollback.
+4. Add new guardrail fields:
+   - `timeout_s` default 300–600.
+   - `max_changed_files` default 8.
+   - `max_diff_chars` default 32,000.
+   - `keep_sessions` default 10.
+5. Keep existing single-phase prompt and tools for now.
+   - Do not restore `dream_phase1.md` / `dream_phase2.md` or the old `Dream` class.
+   - Keep the simpler file-edit tool registry from current `MemoryStore.build_dream_tools()`.
+
 ### Proposed next memory phases
 
 - [ ] M0. Document current memory architecture and Letta/MemFS target model.
-- [ ] M1. Add Dream guardrails: dedicated config (`max_iterations`, `timeout_s`, `max_files_changed`, `max_diff_chars`, `batch_size`) and rollback-on-incomplete.
+- [ ] M1. Restore Dream safeguards without restoring the old class: config-wired batch size, Dream-specific model, Dream-specific max iterations, timeout, changed-file/diff limits, and rollback-on-incomplete.
 - [ ] M2. Change Dream trigger policy from pure cron to hybrid turn-count + idle timer + manual, with compaction as optional extra.
 - [ ] M3. Add `/remember` for targeted memory writes and `/memory status|diff|backup|tokens` command surface.
 - [ ] M4. Split Dream and Defrag responsibilities in prompts/tools: Dream = recent deltas; Defrag/Doctor = reorganization.
@@ -355,3 +402,4 @@ This is already close to Letta MemFS. The main gap is not storage; it is memory 
 - Updated provider registry/config to keep `custom`, `openrouter`, `openai_codex`, `anthropic`, `openai`, `deepseek`, `dashscope`, `minimax`, `minimax_anthropic`, `moonshot`, `xiaomi_mimo`, `zai`, and `zhipu`.
 - Verification: targeted lint/compile passed; `uv run nanobot --help` no longer lists `serve`/API or WebUI commands; combined kept-channel/provider/security/config subset passed (`327 passed, 1 skipped`). Full suite still has unrelated/stale failures, first observed in `tests/agent/test_auto_compact.py::TestAutoCompactEdgeCases::test_auto_compact_with_nothing_summary`.
 - Added planning notes from Letta Code Memory/MemFS docs, Letta/Letta Code READMEs, and Cameron Pfiffer's Co-3 post. Key conclusion: nanobot is already structurally close to MemFS; next work should focus on Dream guardrails, hybrid triggers, memory command surface, and clearer Dream-vs-Defrag ownership.
+- Investigated upstream PR #3990 (`d1a94dae`, final PR branch fetched as `upstream/pr-3990`). Found that old Dream safeguards were mostly config fields and runner limits removed from the execution path, not storage architecture. Plan is to restore those guardrails around current single-phase `process_direct` Dream instead of restoring the old two-phase Dream class.
