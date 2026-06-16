@@ -373,7 +373,21 @@ Minimal restoration plan:
 - [ ] M1. Restore Dream safeguards without restoring the old class: config-wired batch size, Dream-specific model, Dream-specific max iterations, timeout, changed-file/diff limits, and rollback-on-incomplete.
   - [x] M1a. Rewire `max_batch_size`, `model_override`, `max_iterations`, and 300s timeout into current single-phase Dream path.
   - [ ] M1b. Add changed-file/diff limits.
+    - Add `dream.max_changed_files` (suggested default: 8).
+    - Add `dream.max_diff_chars` (suggested default: 32,000).
+    - After Dream returns `completed`, inspect git diff for tracked memory surfaces before auto-commit.
+    - If the diff is too broad, treat the run as incomplete: do not commit and do not advance cursor.
+    - Count only memory-owned surfaces: `SOUL.md`, `USER.md`, `memory/**/*.md`, `skills/**/SKILL.md`.
+    - Add tests for successful small diff, too many files, and too-large diff.
   - [ ] M1c. Add rollback-on-incomplete.
+    - Before Dream starts, snapshot memory working tree state.
+    - If Dream times out, raises, hits max iterations, or violates diff limits, restore the pre-Dream state.
+    - First implementation can require a clean memory git state before Dream and use `git restore`/dulwich checkout for tracked memory files plus removal of new untracked memory files.
+    - Better later implementation: run Dream in a temporary git worktree/branch and merge only validated commits.
+    - Add tests that incomplete Dream leaves memory files unchanged and cursor unchanged.
+  - [ ] M1d. Add observability.
+    - Log Dream model, batch size, max iterations, timeout, stop reason, changed files, and diff size.
+    - Include incomplete reason in Dream session metadata or commit/log output.
 - [ ] M2. Change Dream trigger policy from pure cron to hybrid turn-count + idle timer + manual, with compaction as optional extra.
 - [ ] M3. Add `/remember` for targeted memory writes and `/memory status|diff|backup|tokens` command surface.
 - [ ] M4. Split Dream and Defrag responsibilities in prompts/tools: Dream = recent deltas; Defrag/Doctor = reorganization.
@@ -407,3 +421,4 @@ Minimal restoration plan:
 - Added planning notes from Letta Code Memory/MemFS docs, Letta/Letta Code READMEs, and Cameron Pfiffer's Co-3 post. Key conclusion: nanobot is already structurally close to MemFS; next work should focus on Dream guardrails, hybrid triggers, memory command surface, and clearer Dream-vs-Defrag ownership.
 - Investigated upstream PR #3990 (`d1a94dae`, final PR branch fetched as `upstream/pr-3990`). Found that old Dream safeguards were mostly config fields and runner limits removed from the execution path, not storage architecture. Plan is to restore those guardrails around current single-phase `process_direct` Dream instead of restoring the old two-phase Dream class.
 - Implemented M1a: Dream now honors `dream.max_batch_size`, `dream.model_override`, `dream.max_iterations`, and `dream.timeout_s` (default 300s). Incomplete/timed-out Dream runs no longer auto-commit. Targeted tests passed: `tests/config/test_dream_config.py`, `tests/agent/test_dream.py`, `tests/command/test_builtin_dream.py`, `tests/agent/test_dream_tools.py`.
+- Documented remaining Dream hardening work: changed-file limits, diff-size limits, rollback-on-incomplete, and observability.
