@@ -9,8 +9,8 @@
 - **Decoupling mode:** keep the `upstream` remote for read-only reference (security/provider change review), but stop all rebasing/merging. Retire `personal-build`; `origin/main` becomes the integration branch.
 - **Channels to keep:** Telegram, Discord, Email.
 - **Channels to remove:** DingTalk, Feishu/Lark, Matrix, MoChat, MS Teams, QQ/NapCat, Signal, Slack, WebSocket, WeCom, WeChat/Weixin, WhatsApp.
-- **Subsystems to keep:** bridge services, built-in skills, all providers/tools, agent core, memory/session, CLI.
-- **Subsystems to remove now:** WebUI (`webui/`, `nanobot/web/`, `nanobot/webui/`), OpenAI-compatible API server (`nanobot/api/`), and unused channels.
+- **Subsystems to keep:** built-in skills, all providers/tools, agent core, memory/session, CLI.
+- **Subsystems to remove now:** WebUI (`webui/`, `nanobot/web/`, `nanobot/webui/`), OpenAI-compatible API server (`nanobot/api/`), unused channels, and the WhatsApp bridge (`bridge/`).
 - **Strip strategy:** bounded deletion for WebUI/API/channels (well-defined surfaces), then lazy-load evaluation for future provider/tool pruning.
 
 ## Top-level checklist
@@ -23,12 +23,13 @@
 - [ ] 6. Remove WebUI source app (`webui/`)
 - [ ] 7. Strip WebUI/API config and CLI commands
 - [ ] 8. Remove unused channels
-- [ ] 9. Clean up provider/tool references to removed surfaces
-- [ ] 10. Update `pyproject.toml` build config and dependencies
-- [ ] 11. Delete or update affected tests
-- [ ] 12. Run targeted test/lint checks
-- [ ] 13. Merge `2026-06-16_decouple` into `main` and push to `origin`
-- [ ] 14. (Later) audit providers, tools, skills for removal
+- [ ] 9. Remove WhatsApp bridge (`bridge/`)
+- [ ] 10. Clean up provider/tool references to removed surfaces
+- [ ] 11. Update `pyproject.toml` build config and dependencies
+- [ ] 12. Delete or update affected tests
+- [ ] 13. Run targeted test/lint checks
+- [ ] 14. Merge `2026-06-16_decouple` into `main` and push to `origin`
+- [ ] 15. (Later) audit providers, tools, skills for removal
 
 ## Detailed plan
 
@@ -114,7 +115,14 @@ Then update:
 - `nanobot/config/schema.py` channel config fields.
 - Tests under `tests/channels/` for removed channels.
 
-### 8. Update `pyproject.toml`
+### 8. Remove WhatsApp bridge
+
+- Delete `bridge/`.
+- Remove `bridge/` from `pyproject.toml` source distribution includes.
+- Remove `[tool.hatch.build.targets.wheel.force-include]` entry that maps `bridge` to `nanobot/bridge`.
+- Remove bridge build/runtime docs from `README.md` if present.
+
+### 9. Update `pyproject.toml`
 
 - Remove `aiohttp` from `[project.optional-dependencies] api` (already optional, but verify it is not needed elsewhere; note `dev` may still use it).
 - Remove optional dependencies for deleted channels:
@@ -133,9 +141,9 @@ Then update:
 - Keep Discord optional dependency (`discord.py`) and Telegram dependency (`python-telegram-bot`).
 - Remove `nanobot/web/dist/**/*` artifacts/includes.
 - Review build hook in `hatch_build.py` for WebUI build steps; remove if present.
-- Remove `bridge` `force-include` only if bridge is also being removed; **keep it** since bridge services are retained.
+- Remove `bridge` `force-include` since WhatsApp bridge is removed.
 
-### 9. Clean up remaining references
+### 10. Clean up remaining references
 
 Run these searches and fix any remaining imports:
 
@@ -145,7 +153,7 @@ grep -RIn "WebuiTurnCoordinator\|webui_turns\|webui_allow_local" nanobot/ tests/
 grep -RIn "get_webui_dir" nanobot/ tests/
 ```
 
-### 10. Tests
+### 11. Tests
 
 - Delete tests that only cover WebUI/API.
 - Update any tests that import removed modules.
@@ -155,7 +163,7 @@ grep -RIn "get_webui_dir" nanobot/ tests/
   uv run --extra dev python -m pytest tests/config tests/agent -x -q
   ```
 
-### 11. Final verification
+### 12. Final verification
 
 - `uv run nanobot --help` should still work and not list `api`/`webui` commands.
 - `uv run nanobot gateway` should start without WebUI attachment errors.
@@ -178,3 +186,4 @@ grep -RIn "get_webui_dir" nanobot/ tests/
 - Decided to keep `upstream` remote read-only, retire `personal-build`, and remove WebUI/API server as the first bounded deletion.
 - Wrote this plan.
 - Updated channel scope: keep Telegram, Discord, and Email; remove all other channels including WebSocket unless explicitly needed later.
+- Reclassified `bridge/` as removable because it is WhatsApp-specific and WhatsApp is no longer in scope.
