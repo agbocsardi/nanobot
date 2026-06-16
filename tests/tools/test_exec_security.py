@@ -9,7 +9,11 @@ from unittest.mock import patch
 import pytest
 
 from nanobot.agent.tools.shell import ExecTool
-from nanobot.security.workspace_access import bind_workspace_scope, build_workspace_scope, reset_workspace_scope
+from nanobot.security.workspace_access import (
+    bind_workspace_scope,
+    build_workspace_scope,
+    reset_workspace_scope,
+)
 
 
 def _fake_resolve_private(hostname, port, family=0, type_=0):
@@ -43,18 +47,6 @@ async def test_exec_blocks_wget_localhost():
     assert "Error" in result
 
 
-def test_exec_full_workspace_scope_allows_loopback(tmp_path):
-    tool = ExecTool(working_dir=str(tmp_path))
-    scope = build_workspace_scope(tmp_path, "full", source_channel="websocket")
-    token = bind_workspace_scope(scope)
-    try:
-        with patch("nanobot.security.network.socket.getaddrinfo", _fake_resolve_localhost):
-            error = tool._guard_command("curl http://localhost:8765/", str(tmp_path))
-    finally:
-        reset_workspace_scope(token)
-    assert error is None
-
-
 def test_exec_core_full_workspace_scope_blocks_loopback(tmp_path):
     tool = ExecTool(working_dir=str(tmp_path))
     scope = build_workspace_scope(tmp_path, "full")
@@ -69,7 +61,7 @@ def test_exec_core_full_workspace_scope_blocks_loopback(tmp_path):
 
 
 def test_exec_full_workspace_scope_blocks_loopback_when_local_service_disabled(tmp_path):
-    tool = ExecTool(working_dir=str(tmp_path), webui_allow_local_service_access=False)
+    tool = ExecTool(working_dir=str(tmp_path))
     scope = build_workspace_scope(tmp_path, "full", source_channel="websocket")
     token = bind_workspace_scope(scope)
     try:

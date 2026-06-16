@@ -19,18 +19,18 @@
 
 - [ ] 1. Update remotes and branch model
 - [ ] 2. Update documentation (AGENTS.md, CONTRIBUTING.md, README)
-- [ ] 3. Remove API server (`nanobot/api/`)
-- [ ] 4. Remove WebUI runtime (`nanobot/webui/`)
-- [ ] 5. Remove bundled WebUI dist (`nanobot/web/`)
-- [ ] 6. Remove WebUI source app (`webui/`)
-- [ ] 7. Strip WebUI/API config and CLI commands
-- [ ] 8. Remove unused channels
-- [ ] 9. Remove WhatsApp bridge (`bridge/`)
-- [ ] 10. Prune unused providers
-- [ ] 11. Clean up provider/tool references to removed surfaces
-- [ ] 12. Update `pyproject.toml` build config and dependencies
-- [ ] 13. Delete or update affected tests
-- [ ] 14. Run targeted test/lint checks
+- [x] 3. Remove API server (`nanobot/api/`)
+- [x] 4. Remove WebUI runtime (`nanobot/webui/`)
+- [x] 5. Remove bundled WebUI dist (`nanobot/web/`)
+- [x] 6. Remove WebUI source app (`webui/`)
+- [x] 7. Strip WebUI/API config and CLI commands
+- [x] 8. Remove unused channels
+- [x] 9. Remove WhatsApp bridge (`bridge/`)
+- [x] 10. Prune unused providers
+- [x] 11. Clean up provider/tool references to removed surfaces
+- [x] 12. Update `pyproject.toml` build config and dependencies
+- [x] 13. Delete or update affected tests
+- [x] 14. Run targeted test/lint checks
 - [ ] 15. Merge `2026-06-16_decouple` into `main` and push to `origin`
 - [ ] 16. (Later) audit tools and skills for removal
 
@@ -266,3 +266,7 @@ grep -RIn "get_webui_dir" nanobot/ tests/
 - Revised channel scope again: keep WebSocket for programmatic/dev use.
 - Reclassified `bridge/` as removable because it is WhatsApp-specific and WhatsApp is no longer in scope.
 - Added provider-pruning scope: keep active OpenCode-backed providers, `custom`, `openrouter`, and `openai_codex`; remove empty/unused provider specs and native backends.
+- Executed the first code-pruning pass: removed WebUI/API, unused channels, WhatsApp bridge, and unused native provider backends; kept Telegram, Discord, Email, and a minimal programmatic WebSocket channel.
+- Simplified WebSocket so it no longer depends on WebUI gateway services; it now supports plain text, `new_chat`, `attach`, and `message` JSON envelopes.
+- Updated provider registry/config to keep `custom`, `openrouter`, `openai_codex`, `anthropic`, `openai`, `deepseek`, `dashscope`, `minimax`, `minimax_anthropic`, `moonshot`, `xiaomi_mimo`, `zai`, and `zhipu`.
+- Verification: targeted lint/compile passed; `uv run nanobot --help` no longer lists `serve`/API or WebUI commands; combined kept-channel/provider/security/config subset passed (`327 passed, 1 skipped`). Full suite still has unrelated/stale failures, first observed in `tests/agent/test_auto_compact.py::TestAutoCompactEdgeCases::test_auto_compact_with_nothing_summary`.

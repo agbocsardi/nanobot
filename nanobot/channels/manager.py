@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from collections.abc import Callable
 from contextlib import suppress
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
@@ -19,16 +17,6 @@ from nanobot.utils.restart import consume_restart_notice_from_env, format_restar
 
 if TYPE_CHECKING:
     from nanobot.session.manager import SessionManager
-
-
-def _default_webui_dist() -> Path | None:
-    """Return the absolute path to the bundled webui dist directory if it exists."""
-    try:
-        import nanobot.web as web_pkg  # type: ignore[import-not-found]
-    except ImportError:
-        return None
-    candidate = Path(web_pkg.__file__).resolve().parent / "dist"
-    return candidate if candidate.is_dir() else None
 
 
 # Retry delays for message sending (exponential backoff: 1s, 2s, 4s)
@@ -57,21 +45,11 @@ class ChannelManager:
         *,
         session_manager: "SessionManager | None" = None,
         cron_service: Any | None = None,
-        webui_runtime_model_name: Callable[[], str | None] | None = None,
-        webui_cron_pending_job_ids: Callable[[str], set[str]] | None = None,
-        webui_static_dist: bool = True,
-        webui_runtime_surface: str = "browser",
-        webui_runtime_capabilities: dict[str, Any] | None = None,
     ):
         self.config = config
         self.bus = bus
         self._session_manager = session_manager
         self._cron_service = cron_service
-        self._webui_runtime_model_name = webui_runtime_model_name
-        self._webui_cron_pending_job_ids = webui_cron_pending_job_ids
-        self._webui_static_dist = webui_static_dist
-        self._webui_runtime_surface = webui_runtime_surface
-        self._webui_runtime_capabilities = dict(webui_runtime_capabilities or {})
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
         self._origin_reply_fingerprints: dict[tuple[str, str, str], str] = {}
@@ -108,31 +86,7 @@ class ChannelManager:
             if section is None:
                 continue
             try:
-                kwargs: dict[str, Any] = {}
-                if cls.name == "websocket":
-                    from nanobot.channels.websocket import WebSocketConfig
-                    from nanobot.webui.gateway_services import build_gateway_services
-
-                    parsed = WebSocketConfig.model_validate(section)
-                    static_path = _default_webui_dist() if self._webui_static_dist else None
-                    workspace = Path(self.config.workspace_path)
-                    gateway = build_gateway_services(
-                        config=parsed,
-                        bus=self.bus,
-                        session_manager=self._session_manager,
-                        static_dist_path=static_path,
-                        workspace_path=workspace,
-                        default_restrict_to_workspace=self.config.tools.restrict_to_workspace,
-                        disabled_skills=set(self.config.agents.defaults.disabled_skills),
-                        runtime_model_name=self._webui_runtime_model_name,
-                        runtime_surface=self._webui_runtime_surface,
-                        runtime_capabilities_overrides=self._webui_runtime_capabilities,
-                        cron_service=self._cron_service,
-                        cron_pending_job_ids=self._webui_cron_pending_job_ids,
-                        logger=logger,
-                    )
-                    kwargs["gateway"] = gateway
-                channel = cls(section, self.bus, **kwargs)
+                channel = cls(section, self.bus)
                 channel.send_progress = self._resolve_bool_override(
                     section, "send_progress", self.config.channels.send_progress,
                 )

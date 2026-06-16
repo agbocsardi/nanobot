@@ -632,84 +632,6 @@ def _migrate_cron_store(config: "Config") -> None:
 
 
 # ============================================================================
-# OpenAI-Compatible API Server
-# ============================================================================
-
-
-@app.command()
-def serve(
-    port: int | None = typer.Option(None, "--port", "-p", help="API server port"),
-    host: str | None = typer.Option(None, "--host", "-H", help="Bind address"),
-    timeout: float | None = typer.Option(None, "--timeout", "-t", help="Per-request timeout (seconds)"),
-    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show nanobot runtime logs"),
-    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
-    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
-):
-    """Start the OpenAI-compatible API server (/v1/chat/completions)."""
-    try:
-        from aiohttp import web  # noqa: F401
-    except ImportError:
-        console.print("[red]aiohttp is required. Install with: pip install 'nanobot-ai[api]'[/red]")
-        raise typer.Exit(1)
-
-    from loguru import logger
-
-    from nanobot.api.server import create_app
-    from nanobot.bus.queue import MessageBus
-    from nanobot.providers.image_generation import image_gen_provider_configs
-    from nanobot.session.manager import SessionManager
-
-    if verbose:
-        logger.enable("nanobot")
-    else:
-        logger.disable("nanobot")
-
-    runtime_config = _load_runtime_config(config, workspace)
-    api_cfg = runtime_config.api
-    host = host if host is not None else api_cfg.host
-    port = port if port is not None else api_cfg.port
-    timeout = timeout if timeout is not None else api_cfg.timeout
-    sync_workspace_templates(runtime_config.workspace_path)
-    bus = MessageBus()
-    session_manager = SessionManager(runtime_config.workspace_path)
-    try:
-        agent_loop = AgentLoop.from_config(
-            runtime_config, bus,
-            session_manager=session_manager,
-            image_generation_provider_configs=image_gen_provider_configs(runtime_config),
-        )
-    except ValueError as exc:
-        console.print(f"[red]Error: {exc}[/red]")
-        raise typer.Exit(1) from exc
-
-    model_name, preset_tag = _model_display(runtime_config)
-    console.print(f"{__logo__} Starting OpenAI-compatible API server")
-    console.print(f"  [cyan]Endpoint[/cyan] : http://{host}:{port}/v1/chat/completions")
-    console.print(f"  [cyan]Model[/cyan]    : {model_name}{preset_tag}")
-    console.print("  [cyan]Session[/cyan]  : api:default")
-    console.print(f"  [cyan]Timeout[/cyan]  : {timeout}s")
-    if host in {"0.0.0.0", "::"}:
-        console.print(
-            "[yellow]Warning:[/yellow] API is bound to all interfaces. "
-            "Only do this behind a trusted network boundary, firewall, or reverse proxy."
-        )
-    console.print()
-
-    api_app = create_app(agent_loop, model_name=model_name, request_timeout=timeout)
-
-    async def on_startup(_app):
-        await agent_loop._connect_mcp()
-
-    async def on_cleanup(_app):
-        await agent_loop.close_mcp()
-
-    api_app.on_startup.append(on_startup)
-    api_app.on_cleanup.append(on_cleanup)
-
-    web.run_app(api_app, host=host, port=port, print=lambda msg: logger.info(msg))
-
-
-# ============================================================================
 # Gateway / Server
 # ============================================================================
 
@@ -744,13 +666,9 @@ def _run_gateway(
     config: Config,
     *,
     port: int | None = None,
-    open_browser_url: str | None = None,
-    webui_static_dist: bool = True,
-    webui_runtime_surface: str = "browser",
-    webui_runtime_capabilities: dict[str, Any] | None = None,
     health_server_enabled: bool = True,
 ) -> None:
-    """Shared gateway runtime; ``open_browser_url`` opens a tab once channels are up."""
+    """Shared gateway runtime for enabled channels."""
     from nanobot.agent.tools.message import MessageTool
     from nanobot.bus.queue import MessageBus
     from nanobot.bus.runtime_events import RuntimeEventBus
@@ -762,8 +680,6 @@ def _run_gateway(
     from nanobot.providers.factory import build_provider_snapshot, load_provider_snapshot
     from nanobot.providers.image_generation import image_gen_provider_configs
     from nanobot.session.manager import SessionManager
-    from nanobot.session.webui_turns import WebuiTurnCoordinator
-    from nanobot.webui.token_usage import TokenUsageHook
 
     port = port if port is not None else config.gateway.port
 
@@ -798,13 +714,7 @@ def _run_gateway(
         provider_snapshot_loader=load_provider_snapshot,
         runtime_events=runtime_events,
         provider_signature=provider_snapshot.signature,
-        hooks=[TokenUsageHook(timezone_name=config.agents.defaults.timezone)],
     )
-    WebuiTurnCoordinator(
-        bus=bus,
-        sessions=session_manager,
-        schedule_background=lambda coro: agent._schedule_background(coro),
-    ).subscribe(runtime_events)
 
     from nanobot.bus.events import OutboundMessage
     from nanobot.session.keys import session_key_for_channel
@@ -893,13 +803,6 @@ def _run_gateway(
             except Exception:
                 logger.exception("Dream cron job failed")
             finally:
-                from nanobot.webui.token_usage import record_response_token_usage
-
-                record_response_token_usage(
-                    resp,
-                    source="dream",
-                    timezone_name=config.agents.defaults.timezone,
-                )
                 if store.git.is_initialized():
                     msg = build_dream_commit_message(
                         "dream: periodic memory consolidation", resp,
@@ -987,25 +890,11 @@ def _run_gateway(
 
     cron.on_job = on_cron_job
 
-    def _webui_runtime_model_name() -> str | None:
-        model = getattr(agent, "model", None)
-        if isinstance(model, str):
-            stripped = model.strip()
-            return stripped or None
-        return None
-
-    # Create channel manager (forwards SessionManager so the WebSocket channel
-    # can serve the embedded webui's REST surface).
     channels = ChannelManager(
         config,
         bus,
         session_manager=session_manager,
         cron_service=cron,
-        webui_runtime_model_name=_webui_runtime_model_name,
-        webui_cron_pending_job_ids=getattr(agent, "pending_cron_job_ids_for_session", None),
-        webui_static_dist=webui_static_dist,
-        webui_runtime_surface=webui_runtime_surface,
-        webui_runtime_capabilities=webui_runtime_capabilities,
     )
 
     def _pick_heartbeat_target() -> tuple[str, str]:
@@ -1106,29 +995,6 @@ def _run_gateway(
             payload=CronPayload(kind="system_event"),
         ))
 
-    async def _open_browser_when_ready() -> None:
-        """Wait for the gateway to bind, then point the user's browser at the webui."""
-        if not open_browser_url:
-            return
-        import webbrowser
-        # Channels start asynchronously; a short poll lets us avoid racing the bind.
-        for _ in range(40):  # ~4s max
-            try:
-                reader, writer = await asyncio.open_connection(
-                    config.gateway.host or "127.0.0.1", port
-                )
-                writer.close()
-                with suppress(Exception):
-                    await writer.wait_closed()
-                break
-            except OSError:
-                await asyncio.sleep(0.1)
-        try:
-            webbrowser.open(open_browser_url)
-            console.print(f"[green]✓[/green] Opened browser at {open_browser_url}")
-        except Exception as e:
-            console.print(f"[yellow]Could not open browser ({e}); visit {open_browser_url}[/yellow]")
-
     async def run():
         try:
             await cron.start()
@@ -1138,8 +1004,6 @@ def _run_gateway(
             ]
             if health_server_enabled:
                 tasks.append(_health_server(config.gateway.host, port))
-            if open_browser_url:
-                tasks.append(_open_browser_when_ready())
             await asyncio.gather(*tasks)
         except KeyboardInterrupt:
             console.print("\nShutting down...")
@@ -1605,7 +1469,6 @@ _LOGOUT_HANDLERS: dict[str, Callable[[], None]] = {}
 
 _PROVIDER_DISPLAY: dict[str, str] = {
     "openai_codex": "OpenAI Codex",
-    "github_copilot": "GitHub Copilot",
 }
 
 
@@ -1641,7 +1504,7 @@ def _resolve_oauth_provider(provider: str):
 
 @provider_app.command("login")
 def provider_login(
-    provider: str = typer.Argument(..., help="OAuth provider (e.g. 'openai-codex', 'github-copilot')"),
+    provider: str = typer.Argument(..., help="OAuth provider (e.g. 'openai-codex')"),
 ):
     """Authenticate with an OAuth provider."""
     spec = _resolve_oauth_provider(provider)
@@ -1657,7 +1520,7 @@ def provider_login(
 
 @provider_app.command("logout")
 def provider_logout(
-    provider: str = typer.Argument(..., help="OAuth provider (e.g. 'openai-codex', 'github-copilot')"),
+    provider: str = typer.Argument(..., help="OAuth provider (e.g. 'openai-codex')"),
 ):
     """Log out from an OAuth provider."""
     spec = _resolve_oauth_provider(provider)
@@ -1708,19 +1571,6 @@ def _logout_openai_codex() -> None:
     _delete_oauth_files(storage.get_token_path(), _PROVIDER_DISPLAY["openai_codex"])
 
 
-@_register_logout("github_copilot")
-def _logout_github_copilot() -> None:
-    """Clear local OAuth credentials for GitHub Copilot."""
-    try:
-        from nanobot.providers.github_copilot_provider import get_storage
-    except ImportError:
-        console.print("[red]GitHub Copilot provider unavailable. Ensure oauth-cli-kit is installed.[/red]")
-        raise typer.Exit(1)
-
-    storage = get_storage()
-    _delete_oauth_files(storage.get_token_path(), _PROVIDER_DISPLAY["github_copilot"])
-
-
 def _delete_oauth_files(token_path: Path, provider_label: str) -> None:
     """Delete OAuth token and lock files, reporting the result."""
     removed_paths: list[Path] = []
@@ -1745,23 +1595,6 @@ def _delete_oauth_files(token_path: Path, provider_label: str) -> None:
             console.print(f"[dim]Removed: {path}[/dim]")
     for path, exc in skipped:
         console.print(f"[yellow]! Could not remove {path}: {exc}[/yellow]")
-
-
-@_register_login("github_copilot")
-def _login_github_copilot() -> None:
-    try:
-        from nanobot.providers.github_copilot_provider import login_github_copilot
-
-        console.print("[cyan]Starting GitHub Copilot device flow...[/cyan]\n")
-        token = login_github_copilot(
-            print_fn=lambda s: console.print(s),
-            prompt_fn=lambda s: typer.prompt(s),
-        )
-        account = token.account_id or "GitHub"
-        console.print(f"[green]✓ Authenticated with GitHub Copilot[/green]  [dim]{account}[/dim]")
-    except Exception as e:
-        console.print(f"[red]Authentication error: {e}[/red]")
-        raise typer.Exit(1)
 
 
 if __name__ == "__main__":

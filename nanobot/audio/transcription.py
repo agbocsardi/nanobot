@@ -26,7 +26,7 @@ from nanobot.utils.media_decode import FileSizeExceeded, save_base64_data_url
 
 TranscriptionProviderName = str
 
-_DEFAULT_PROVIDER: TranscriptionProviderName = "groq"
+_DEFAULT_PROVIDER: TranscriptionProviderName = "faster_whisper"
 _MAX_AUDIO_BYTES_FALLBACK = 25 * 1024 * 1024
 _AUDIO_MIME_ALLOWED: frozenset[str] = frozenset({
     "audio/aac",

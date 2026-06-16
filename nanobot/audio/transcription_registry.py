@@ -44,11 +44,6 @@ class TranscriptionProviderSpec:
 
 TRANSCRIPTION_PROVIDERS: tuple[TranscriptionProviderSpec, ...] = (
     TranscriptionProviderSpec(
-        name="groq",
-        default_model="whisper-large-v3",
-        adapter="nanobot.providers.transcription:GroqTranscriptionProvider",
-    ),
-    TranscriptionProviderSpec(
         name="openai",
         default_model="whisper-1",
         adapter="nanobot.providers.transcription:OpenAITranscriptionProvider",
@@ -63,22 +58,6 @@ TRANSCRIPTION_PROVIDERS: tuple[TranscriptionProviderSpec, ...] = (
         default_model="mimo-v2.5-asr",
         adapter="nanobot.providers.transcription:XiaomiMiMoTranscriptionProvider",
         aliases=("mimo", "xiaomi"),
-    ),
-    TranscriptionProviderSpec(
-        name="stepfun",
-        default_model="stepaudio-2.5-asr",
-        adapter="nanobot.providers.transcription:StepFunTranscriptionProvider",
-    ),
-    TranscriptionProviderSpec(
-        name="assemblyai",
-        default_model="universal-3-pro,universal-2",
-        adapter="nanobot.providers.transcription:AssemblyAITranscriptionProvider",
-    ),
-    TranscriptionProviderSpec(
-        name="siliconflow",
-        default_model="FunAudioLLM/SenseVoiceSmall",
-        adapter="nanobot.providers.transcription:OpenAITranscriptionProvider",
-        aliases=("silicon",),
     ),
     TranscriptionProviderSpec(
         name="faster_whisper",
