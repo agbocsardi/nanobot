@@ -7,10 +7,11 @@
 ## Decisions
 
 - **Decoupling mode:** keep the `upstream` remote for read-only reference (security/provider change review), but stop all rebasing/merging. Retire `personal-build`; `origin/main` becomes the integration branch.
-- **Channels:** keep all for now. No channel deletion in this pass.
+- **Channels to keep:** Telegram, Discord, Email.
+- **Channels to remove:** DingTalk, Feishu/Lark, Matrix, MoChat, MS Teams, QQ/NapCat, Signal, Slack, WebSocket, WeCom, WeChat/Weixin, WhatsApp.
 - **Subsystems to keep:** bridge services, built-in skills, all providers/tools, agent core, memory/session, CLI.
-- **Subsystems to remove now:** WebUI (`webui/`, `nanobot/web/`, `nanobot/webui/`) and the OpenAI-compatible API server (`nanobot/api/`).
-- **Strip strategy:** bounded deletion for WebUI/API (well-defined surface), then lazy-load evaluation for future channel/provider/tool pruning.
+- **Subsystems to remove now:** WebUI (`webui/`, `nanobot/web/`, `nanobot/webui/`), OpenAI-compatible API server (`nanobot/api/`), and unused channels.
+- **Strip strategy:** bounded deletion for WebUI/API/channels (well-defined surfaces), then lazy-load evaluation for future provider/tool pruning.
 
 ## Top-level checklist
 
@@ -21,12 +22,13 @@
 - [ ] 5. Remove bundled WebUI dist (`nanobot/web/`)
 - [ ] 6. Remove WebUI source app (`webui/`)
 - [ ] 7. Strip WebUI/API config and CLI commands
-- [ ] 8. Clean up provider/tool references to removed surfaces
-- [ ] 9. Update `pyproject.toml` build config and dependencies
-- [ ] 10. Delete or update affected tests
-- [ ] 11. Run targeted test/lint checks
-- [ ] 12. Merge `2026-06-16_decouple` into `main` and push to `origin`
-- [ ] 13. (Later) audit channels, providers, tools, skills for removal
+- [ ] 8. Remove unused channels
+- [ ] 9. Clean up provider/tool references to removed surfaces
+- [ ] 10. Update `pyproject.toml` build config and dependencies
+- [ ] 11. Delete or update affected tests
+- [ ] 12. Run targeted test/lint checks
+- [ ] 13. Merge `2026-06-16_decouple` into `main` and push to `origin`
+- [ ] 14. (Later) audit providers, tools, skills for removal
 
 ## Detailed plan
 
@@ -80,14 +82,60 @@
 - Delete `webui/` directory entirely.
 - Remove `webui/` references from `.gitignore` if any are no longer needed.
 
-### 7. Update `pyproject.toml`
+### 7. Remove unused channels
 
-- Remove `aiohttp` from `[project.optional-dependencies] api` (already optional, but verify it is not needed elsewhere; note `matrix` and `dev` also use it).
+Keep:
+
+- `nanobot/channels/telegram.py`
+- `nanobot/channels/discord.py`
+- `nanobot/channels/email.py`
+- `nanobot/channels/base.py`, `manager.py`, `registry.py`, `__init__.py`
+
+Remove:
+
+- `nanobot/channels/dingtalk.py`
+- `nanobot/channels/feishu.py`
+- `nanobot/channels/matrix.py`
+- `nanobot/channels/mochat.py`
+- `nanobot/channels/msteams.py`
+- `nanobot/channels/napcat.py`
+- `nanobot/channels/qq.py`
+- `nanobot/channels/signal.py`
+- `nanobot/channels/slack.py`
+- `nanobot/channels/websocket.py`
+- `nanobot/channels/wecom.py`
+- `nanobot/channels/weixin.py`
+- `nanobot/channels/whatsapp.py`
+
+Then update:
+
+- `nanobot/channels/__init__.py`
+- `nanobot/channels/manager.py` / `registry.py` if they assume removed modules exist.
+- `nanobot/config/schema.py` channel config fields.
+- Tests under `tests/channels/` for removed channels.
+
+### 8. Update `pyproject.toml`
+
+- Remove `aiohttp` from `[project.optional-dependencies] api` (already optional, but verify it is not needed elsewhere; note `dev` may still use it).
+- Remove optional dependencies for deleted channels:
+  - `wecom`
+  - `weixin`
+  - `msteams`
+  - `matrix`
+- Remove base dependencies used only by deleted channels, if no remaining imports need them:
+  - `dingtalk-stream`
+  - `lark-oapi`
+  - `python-socketio`
+  - `slack-sdk`
+  - `slackify-markdown`
+  - `qq-botpy`
+  - `python-socks[asyncio]` if only proxy support for removed channels used it
+- Keep Discord optional dependency (`discord.py`) and Telegram dependency (`python-telegram-bot`).
 - Remove `nanobot/web/dist/**/*` artifacts/includes.
 - Review build hook in `hatch_build.py` for WebUI build steps; remove if present.
 - Remove `bridge` `force-include` only if bridge is also being removed; **keep it** since bridge services are retained.
 
-### 8. Clean up remaining references
+### 9. Clean up remaining references
 
 Run these searches and fix any remaining imports:
 
@@ -97,7 +145,7 @@ grep -RIn "WebuiTurnCoordinator\|webui_turns\|webui_allow_local" nanobot/ tests/
 grep -RIn "get_webui_dir" nanobot/ tests/
 ```
 
-### 9. Tests
+### 10. Tests
 
 - Delete tests that only cover WebUI/API.
 - Update any tests that import removed modules.
@@ -107,7 +155,7 @@ grep -RIn "get_webui_dir" nanobot/ tests/
   uv run --extra dev python -m pytest tests/config tests/agent -x -q
   ```
 
-### 10. Final verification
+### 11. Final verification
 
 - `uv run nanobot --help` should still work and not list `api`/`webui` commands.
 - `uv run nanobot gateway` should start without WebUI attachment errors.
@@ -115,7 +163,8 @@ grep -RIn "get_webui_dir" nanobot/ tests/
 
 ## Future work (do not do in this pass)
 
-- Audit channels: if only 1–2 are used, delete the rest and their optional deps.
+- Audit whether Email is actually used; if not, delete it in a later pass.
+- Consider whether a minimal WebSocket/dev channel is worth adding back later for local testing.
 - Audit providers: keep only OpenAI-compatible + Anthropic if that covers all models.
 - Audit tools: remove `image_generation`, `long_task`, `cron`, `mcp`, etc. if unused.
 - Audit skills: many `nanobot/skills/` directories may be WebUI or API-specific.
@@ -128,3 +177,4 @@ grep -RIn "get_webui_dir" nanobot/ tests/
 - Created `2026-06-16_decouple` branch off `personal-build`.
 - Decided to keep `upstream` remote read-only, retire `personal-build`, and remove WebUI/API server as the first bounded deletion.
 - Wrote this plan.
+- Updated channel scope: keep Telegram, Discord, and Email; remove all other channels including WebSocket unless explicitly needed later.
