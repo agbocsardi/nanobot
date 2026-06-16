@@ -371,6 +371,9 @@ Minimal restoration plan:
 
 - [ ] M0. Document current memory architecture and Letta/MemFS target model.
 - [ ] M1. Restore Dream safeguards without restoring the old class: config-wired batch size, Dream-specific model, Dream-specific max iterations, timeout, changed-file/diff limits, and rollback-on-incomplete.
+  - [x] M1a. Rewire `max_batch_size`, `model_override`, `max_iterations`, and 300s timeout into current single-phase Dream path.
+  - [ ] M1b. Add changed-file/diff limits.
+  - [ ] M1c. Add rollback-on-incomplete.
 - [ ] M2. Change Dream trigger policy from pure cron to hybrid turn-count + idle timer + manual, with compaction as optional extra.
 - [ ] M3. Add `/remember` for targeted memory writes and `/memory status|diff|backup|tokens` command surface.
 - [ ] M4. Split Dream and Defrag responsibilities in prompts/tools: Dream = recent deltas; Defrag/Doctor = reorganization.
@@ -403,3 +406,4 @@ Minimal restoration plan:
 - Verification: targeted lint/compile passed; `uv run nanobot --help` no longer lists `serve`/API or WebUI commands; combined kept-channel/provider/security/config subset passed (`327 passed, 1 skipped`). Full suite still has unrelated/stale failures, first observed in `tests/agent/test_auto_compact.py::TestAutoCompactEdgeCases::test_auto_compact_with_nothing_summary`.
 - Added planning notes from Letta Code Memory/MemFS docs, Letta/Letta Code READMEs, and Cameron Pfiffer's Co-3 post. Key conclusion: nanobot is already structurally close to MemFS; next work should focus on Dream guardrails, hybrid triggers, memory command surface, and clearer Dream-vs-Defrag ownership.
 - Investigated upstream PR #3990 (`d1a94dae`, final PR branch fetched as `upstream/pr-3990`). Found that old Dream safeguards were mostly config fields and runner limits removed from the execution path, not storage architecture. Plan is to restore those guardrails around current single-phase `process_direct` Dream instead of restoring the old two-phase Dream class.
+- Implemented M1a: Dream now honors `dream.max_batch_size`, `dream.model_override`, `dream.max_iterations`, and `dream.timeout_s` (default 300s). Incomplete/timed-out Dream runs no longer auto-commit. Targeted tests passed: `tests/config/test_dream_config.py`, `tests/agent/test_dream.py`, `tests/command/test_builtin_dream.py`, `tests/agent/test_dream_tools.py`.

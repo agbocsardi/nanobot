@@ -677,7 +677,12 @@ def _run_gateway(
     from nanobot.cron.service import CronJobSkippedError, CronService
     from nanobot.cron.session_turns import is_bound_cron_job
     from nanobot.cron.types import CronJob
-    from nanobot.providers.factory import build_provider_snapshot, load_provider_snapshot
+    from nanobot.providers.factory import (
+        ProviderSnapshot,
+        build_provider_snapshot,
+        load_provider_snapshot,
+        make_provider,
+    )
     from nanobot.providers.image_generation import image_gen_provider_configs
     from nanobot.session.manager import SessionManager
 
@@ -762,6 +767,28 @@ def _run_gateway(
     if isinstance(message_tool, MessageTool):
         message_tool.set_send_callback(_deliver_to_channel)
 
+    def _dream_snapshot() -> ProviderSnapshot | None:
+        dream_model = config.agents.defaults.dream.model_override
+        if not dream_model:
+            return None
+        name = dream_model.strip()
+        if not name:
+            return None
+        try:
+            if name == "default" or name in config.model_presets:
+                return build_provider_snapshot(config, preset_name=name)
+            preset = config.resolve_default_preset()
+            provider = make_provider(config, preset=preset, model=name)
+            return ProviderSnapshot(
+                provider=provider,
+                model=name,
+                context_window_tokens=preset.context_window_tokens,
+                signature=("dream_model_override", name),
+            )
+        except Exception:
+            logger.exception("Failed to resolve Dream model override {!r}; using main model", name)
+            return None
+
     # Set cron callback (needs agent)
     async def on_cron_job(job: CronJob) -> str | None:
         """Execute a cron job through the agent."""
@@ -777,33 +804,58 @@ def _run_gateway(
             prune_dream_sessions = MemoryStore.prune_dream_sessions
 
             store = agent.context.memory
+            dream_cfg = config.agents.defaults.dream
+            dream_snapshot = _dream_snapshot()
+            completed = False
             resp = None
             try:
-                result = store.build_dream_prompt()
+                result = store.build_dream_prompt(max_entries=dream_cfg.max_batch_size)
                 if result is None:
                     logger.info("Dream: nothing to process")
                     return None
                 prompt, last_cursor = result
                 key = dream_session_key()
-                resp = await agent.process_direct(
-                    prompt,
-                    session_key=key,
-                    ephemeral=True,
-                    tools=store.build_dream_tools(),
-                    on_progress=_silent,
+                resp = await asyncio.wait_for(
+                    agent.process_direct(
+                        prompt,
+                        session_key=key,
+                        ephemeral=True,
+                        tools=store.build_dream_tools(),
+                        on_progress=_silent,
+                        run_provider=(dream_snapshot.provider if dream_snapshot else None),
+                        run_model=(dream_snapshot.model if dream_snapshot else None),
+                        run_context_window_tokens=(
+                            dream_snapshot.context_window_tokens if dream_snapshot else None
+                        ),
+                        run_max_iterations=dream_cfg.max_iterations,
+                        run_llm_timeout_s=dream_cfg.timeout_s,
+                    ),
+                    timeout=dream_cfg.timeout_s,
                 )
-                if MemoryStore.dream_run_completed(resp):
+                completed = MemoryStore.dream_run_completed(resp)
+                if completed:
                     store.set_last_dream_cursor(last_cursor)
-                    logger.info("Dream cron job completed, cursor advanced to {}", last_cursor)
+                    logger.info(
+                        "Dream cron job completed, cursor advanced to {} (model={}, max_iter={})",
+                        last_cursor,
+                        dream_snapshot.model if dream_snapshot else agent.model,
+                        dream_cfg.max_iterations,
+                    )
                 else:
                     logger.warning(
                         "Dream cron job did not complete; cursor remains at {}",
                         store.get_last_dream_cursor(),
                     )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Dream timed out after {}s; cursor remains at {}",
+                    dream_cfg.timeout_s,
+                    store.get_last_dream_cursor(),
+                )
             except Exception:
                 logger.exception("Dream cron job failed")
             finally:
-                if store.git.is_initialized():
+                if completed and store.git.is_initialized():
                     msg = build_dream_commit_message(
                         "dream: periodic memory consolidation", resp,
                     )

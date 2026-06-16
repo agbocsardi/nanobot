@@ -6,6 +6,9 @@ def test_dream_config_defaults_to_interval_hours() -> None:
 
     assert cfg.interval_h == 2
     assert cfg.cron is None
+    assert cfg.max_batch_size == 20
+    assert cfg.max_iterations == 10
+    assert cfg.timeout_s == 300
 
 
 def test_dream_config_builds_every_schedule_from_interval() -> None:

@@ -60,10 +60,11 @@ class DreamConfig(Base):
     model_override: str | None = Field(
         default=None,
         validation_alias=AliasChoices("modelOverride", "model", "model_override"),
-    )  # Override model for Dream sessions (pending implementation)
-    max_batch_size: int = Field(default=20, ge=1)  # Deprecated: no longer used
-    max_iterations: int = Field(default=15, ge=1)  # Deprecated: no longer used
-    annotate_line_ages: bool = True  # Deprecated: no longer used
+    )  # Optional Dream-specific model or preset name
+    max_batch_size: int = Field(default=20, ge=1)  # Max history entries per Dream run
+    max_iterations: int = Field(default=10, ge=1, le=100)  # Max Dream tool iterations
+    timeout_s: int = Field(default=300, ge=30, le=3600)  # Whole Dream run timeout (seconds)
+    annotate_line_ages: bool = True  # Reserved for future Dream prompt aging hints
 
     def build_schedule(self, timezone: str) -> CronSchedule:
         """Build the runtime schedule, preferring the legacy cron override if present."""

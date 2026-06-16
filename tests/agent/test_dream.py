@@ -258,6 +258,40 @@ class TestEphemeralDirect:
         assert resp.metadata["_stop_reason"] == "error"
         assert MemoryStore.dream_run_completed(resp) is False
 
+    async def test_direct_run_accepts_dream_runtime_limits(self, tmp_path, _make_loop):
+        from unittest.mock import AsyncMock, patch
+
+        from nanobot.agent.runner import AgentRunResult
+
+        loop, store = _make_loop
+        captured = {}
+
+        async def fake_run(spec):
+            captured["max_iterations"] = spec.max_iterations
+            captured["llm_timeout_s"] = spec.llm_timeout_s
+            captured["model"] = spec.model
+            return AgentRunResult(
+                final_content="done",
+                messages=[{"role": "assistant", "content": "done"}],
+                stop_reason="completed",
+            )
+
+        with patch.object(loop.runner, "run", AsyncMock(side_effect=fake_run)):
+            await loop.process_direct(
+                "test",
+                session_key="dream:limits",
+                ephemeral=True,
+                run_model="dream-model",
+                run_max_iterations=7,
+                run_llm_timeout_s=300,
+            )
+
+        assert captured == {
+            "max_iterations": 7,
+            "llm_timeout_s": 300,
+            "model": "dream-model",
+        }
+
     async def test_dream_turn_can_skip_unbatched_recent_history(self, tmp_path):
         """Dream must only see the batch selected by build_dream_prompt."""
         from unittest.mock import MagicMock

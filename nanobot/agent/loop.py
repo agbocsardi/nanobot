@@ -130,6 +130,12 @@ class TurnContext:
 
     ephemeral: bool = False
     tools: ToolRegistry | None = None
+    run_provider: LLMProvider | None = None
+    run_model: str | None = None
+    run_context_window_tokens: int | None = None
+    run_max_iterations: int | None = None
+    run_max_tool_result_chars: int | None = None
+    run_llm_timeout_s: int | None = None
 
     turn_wall_started_at: float = field(default_factory=time.time)
     visible_run_started_at: float | None = None
@@ -696,6 +702,12 @@ class AgentLoop:
         pending_queue: asyncio.Queue | None = None,
         ephemeral: bool = False,
         tools: ToolRegistry | None = None,
+        run_provider: LLMProvider | None = None,
+        run_model: str | None = None,
+        run_context_window_tokens: int | None = None,
+        run_max_iterations: int | None = None,
+        run_max_tool_result_chars: int | None = None,
+        run_llm_timeout_s: int | None = None,
     ) -> tuple[str | None, list[str], list[dict], str, bool]:
         """Run the agent iteration loop.
 
@@ -807,19 +819,30 @@ class AgentLoop:
             "or call complete_goal if the work is truly finished."
         ) if _goal_lines else SUSTAINED_GOAL_CONTINUE_PROMPT
         session_metadata = session.metadata if session is not None else None
+        runner = AgentRunner(run_provider) if run_provider is not None else self.runner
+        effective_model = run_model or self.model
+        effective_max_iterations = run_max_iterations or self.max_iterations
+        effective_max_tool_result_chars = run_max_tool_result_chars or self.max_tool_result_chars
+        effective_context_window_tokens = run_context_window_tokens or self.context_window_tokens
+        effective_llm_timeout_s = run_llm_timeout_s or runner_wall_llm_timeout_s(
+            self.sessions,
+            session.key if session is not None else session_key,
+            metadata=session_metadata,
+            message_metadata=metadata,
+        )
         try:
-            result = await self.runner.run(AgentRunSpec(
+            result = await runner.run(AgentRunSpec(
                 initial_messages=initial_messages,
                 tools=tools or self.tools,
-                model=self.model,
-                max_iterations=self.max_iterations,
-                max_tool_result_chars=self.max_tool_result_chars,
+                model=effective_model,
+                max_iterations=effective_max_iterations,
+                max_tool_result_chars=effective_max_tool_result_chars,
                 hook=hook,
                 error_message="Sorry, I encountered an error calling the AI model.",
                 concurrent_tools=True,
                 workspace=effective_scope.project_path,
                 session_key=session.key if session else None,
-                context_window_tokens=self.context_window_tokens,
+                context_window_tokens=effective_context_window_tokens,
                 context_block_limit=self.context_block_limit,
                 provider_retry_mode=self.provider_retry_mode,
                 progress_callback=on_progress,
@@ -829,12 +852,7 @@ class AgentLoop:
                 injection_callback=_drain_pending,
                 # Sustained goals may legitimately exceed NANOBOT_LLM_TIMEOUT_S; idle stall
                 # is still capped by NANOBOT_STREAM_IDLE_TIMEOUT_S in streaming providers.
-                llm_timeout_s=runner_wall_llm_timeout_s(
-                    self.sessions,
-                    session.key if session is not None else session_key,
-                    metadata=session_metadata,
-                    message_metadata=metadata,
-                ),
+                llm_timeout_s=effective_llm_timeout_s,
                 goal_active_predicate=lambda: sustained_goal_active(session.metadata) if session is not None else False,
                 goal_continue_message=_goal_continue,
                 finalize_on_max_iterations=turn_continuation.should_finalize_on_max_iterations(
@@ -849,7 +867,7 @@ class AgentLoop:
             reset_file_states(file_state_token)
         self._last_usage = result.usage
         if result.stop_reason == "max_iterations":
-            logger.warning("Max iterations ({}) reached", self.max_iterations)
+            logger.warning("Max iterations ({}) reached", effective_max_iterations)
             should_stream = turn_continuation.should_stream_budget_response(
                 stop_reason=result.stop_reason,
                 pending_queue_available=pending_queue is not None and session is not None,
@@ -1239,6 +1257,12 @@ class AgentLoop:
         pending_queue: asyncio.Queue | None = None,
         ephemeral: bool = False,
         tools: ToolRegistry | None = None,
+        run_provider: LLMProvider | None = None,
+        run_model: str | None = None,
+        run_context_window_tokens: int | None = None,
+        run_max_iterations: int | None = None,
+        run_max_tool_result_chars: int | None = None,
+        run_llm_timeout_s: int | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         self._refresh_provider_snapshot()
@@ -1271,6 +1295,12 @@ class AgentLoop:
             pending_queue=pending_queue,
             ephemeral=ephemeral,
             tools=tools,
+            run_provider=run_provider,
+            run_model=run_model,
+            run_context_window_tokens=run_context_window_tokens,
+            run_max_iterations=run_max_iterations,
+            run_max_tool_result_chars=run_max_tool_result_chars,
+            run_llm_timeout_s=run_llm_timeout_s,
         )
 
         while ctx.state is not TurnState.DONE:
@@ -1496,6 +1526,12 @@ class AgentLoop:
             pending_queue=ctx.pending_queue,
             ephemeral=ctx.ephemeral,
             tools=ctx.tools,
+            run_provider=ctx.run_provider,
+            run_model=ctx.run_model,
+            run_context_window_tokens=ctx.run_context_window_tokens,
+            run_max_iterations=ctx.run_max_iterations,
+            run_max_tool_result_chars=ctx.run_max_tool_result_chars,
+            run_llm_timeout_s=ctx.run_llm_timeout_s,
         )
         final_content, tools_used, all_msgs, stop_reason, had_injections = result
         ctx.final_content = final_content
@@ -1828,6 +1864,12 @@ class AgentLoop:
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         ephemeral: bool = False,
         tools: ToolRegistry | None = None,
+        run_provider: LLMProvider | None = None,
+        run_model: str | None = None,
+        run_context_window_tokens: int | None = None,
+        run_max_iterations: int | None = None,
+        run_max_tool_result_chars: int | None = None,
+        run_llm_timeout_s: int | None = None,
     ) -> OutboundMessage | None:
         """Process a message directly and return the outbound payload."""
         await self._connect_mcp()
@@ -1845,6 +1887,12 @@ class AgentLoop:
                     "on_stream": on_stream,
                     "on_stream_end": on_stream_end,
                     "ephemeral": ephemeral,
+                    "run_provider": run_provider,
+                    "run_model": run_model,
+                    "run_context_window_tokens": run_context_window_tokens,
+                    "run_max_iterations": run_max_iterations,
+                    "run_max_tool_result_chars": run_max_tool_result_chars,
+                    "run_llm_timeout_s": run_llm_timeout_s,
                 }
                 if tools is not None:
                     kwargs["tools"] = tools
