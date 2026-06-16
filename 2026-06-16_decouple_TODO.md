@@ -245,6 +245,90 @@ grep -RIn "get_webui_dir" nanobot/ tests/
 - `uv run nanobot gateway` should start without WebUI attachment errors.
 - `uv run ruff check nanobot/` should pass.
 
+## Memory redesign notes — Letta/MemFS inspiration
+
+Sources reviewed:
+
+- Letta Code Memory docs: agents vs conversations, `/init`, `/remember`, `/sleeptime`, `/doctor`, MemFS default for new agents.
+- Letta Code MemFS docs: git-backed markdown memory repository, required `description:` frontmatter, special `system/` directory loaded every turn, agent-scoped skills, memory CLI (`status`, `diff`, `backup`, `restore`, `tokens`), memory subagents using git worktrees.
+- Letta / Letta Code READMEs: stateful agents, memory blocks/MemFS, subagents, schedules/channels, skills, model-agnostic provider setup.
+- Cameron Pfiffer's Co-3 post: lived example of a long-running personal Letta agent; memory organized around `system/cameron.md`, `system/how_we_work.md`, `system/persona.md`, `system/procedures.md`, `system/recursive_improvement.md`, `system/now.md`, and `system/subconscious.md`.
+
+### What nanobot already has
+
+- Git-backed workspace memory (`GitStore`) with markdown files.
+- `memory/system/*.md` loaded fully into every prompt.
+- Lazy topic memory via Memory Tree descriptions.
+- Frontmatter `description:` parsing for discoverability.
+- Agent-editable topic files and Dream-managed system files.
+- Agent-scoped skills under `skills/`.
+- Dream/reflection and memory-defrag concepts.
+
+This is already close to Letta MemFS. The main gap is not storage; it is memory lifecycle control.
+
+### Lessons to import
+
+1. **Make memory a first-class filesystem, not a hidden Dream side effect.**
+   - Add explicit CLI/command affordances inspired by Letta: memory status, diff, backup, restore, tokens.
+   - Make memory git state visible before/after background edits.
+
+2. **Split Dream from Defrag.**
+   - Dream/reflection should only ingest recent events and make small targeted updates.
+   - Defrag/doctor should own restructuring, deduplication, splitting/merging files, and system/ promotion/demotion.
+   - Dream must not perform wholesale hierarchy redesign.
+
+3. **Adopt a better `system/` taxonomy.**
+   Current files are `procedures.md`, `corrections.md`, `now.md`. Consider expanding toward:
+   - `system/user.md` or keep `USER.md`: stable user profile and preferences.
+   - `system/persona.md` or keep `SOUL.md`: agent identity and behavioral principles.
+   - `system/how_we_work.md`: interaction style, anti-patterns, collaboration norms.
+   - `system/recursive_improvement.md`: corrections, recurring model/agent failure modes.
+   - `system/procedures.md`: general policies and memory rules.
+   - `system/now.md`: high-churn active context, aggressively pruned.
+   - `system/subconscious.md`: scratch/catcher's-mitt area for background reflection observations that are not yet promoted.
+
+4. **Use trigger policy matched to actual usage.**
+   - Compaction-only is not enough here because sessions are usually short and rarely compact.
+   - Prefer a hybrid trigger:
+     - every N user turns across all channels, e.g. 8–12;
+     - plus idle/background timer, e.g. every 6–12 hours if new history exists;
+     - plus manual `/remember` and `/dream-now`;
+     - plus optional compaction trigger as a bonus, not the main trigger.
+
+5. **Guardrails for Dream are mandatory.**
+   - Separate Dream config from regular max tool iterations.
+   - Small max iterations, e.g. 6–10.
+   - Wall-clock timeout.
+   - Max changed files and max diff size.
+   - Require final explicit completion marker/tool.
+   - If Dream times out or hits max iterations, rollback memory working tree and do not advance cursor.
+   - Commit only if changed files pass validation.
+
+6. **Use git worktrees or checkpoints for background memory writes.**
+   - Letta memory subagents use git worktrees so background edits do not collide with the main agent.
+   - Minimum viable nanobot version: take a git checkpoint before Dream and rollback on failure.
+   - Better version: Dream edits in a temporary worktree/branch, validates, then merges into memory.
+
+7. **Make primary-agent memory updates more direct.**
+   - Keep topic files hot-editable by the main agent.
+   - Add `/remember <text>` for targeted user-directed memory writes.
+   - Consider allowing the main agent to propose small updates to user/profile/correction memory via a constrained memory-write tool, instead of waiting for Dream to infer everything later.
+
+8. **Track memory health explicitly.**
+   - Add memory token accounting for `system/`.
+   - Add stale `now.md` checks.
+   - Add frontmatter/description validation.
+   - Add duplicate/overlap audit via doctor/defrag.
+
+### Proposed next memory phases
+
+- [ ] M0. Document current memory architecture and Letta/MemFS target model.
+- [ ] M1. Add Dream guardrails: dedicated config (`max_iterations`, `timeout_s`, `max_files_changed`, `max_diff_chars`, `batch_size`) and rollback-on-incomplete.
+- [ ] M2. Change Dream trigger policy from pure cron to hybrid turn-count + idle timer + manual, with compaction as optional extra.
+- [ ] M3. Add `/remember` for targeted memory writes and `/memory status|diff|backup|tokens` command surface.
+- [ ] M4. Split Dream and Defrag responsibilities in prompts/tools: Dream = recent deltas; Defrag/Doctor = reorganization.
+- [ ] M5. Consider worktree-based Dream execution after rollback/checkpoint MVP is stable.
+
 ## Future work (do not do in this pass)
 
 - Audit whether Email is actually used; if not, delete it in a later pass.
@@ -270,3 +354,4 @@ grep -RIn "get_webui_dir" nanobot/ tests/
 - Simplified WebSocket so it no longer depends on WebUI gateway services; it now supports plain text, `new_chat`, `attach`, and `message` JSON envelopes.
 - Updated provider registry/config to keep `custom`, `openrouter`, `openai_codex`, `anthropic`, `openai`, `deepseek`, `dashscope`, `minimax`, `minimax_anthropic`, `moonshot`, `xiaomi_mimo`, `zai`, and `zhipu`.
 - Verification: targeted lint/compile passed; `uv run nanobot --help` no longer lists `serve`/API or WebUI commands; combined kept-channel/provider/security/config subset passed (`327 passed, 1 skipped`). Full suite still has unrelated/stale failures, first observed in `tests/agent/test_auto_compact.py::TestAutoCompactEdgeCases::test_auto_compact_with_nothing_summary`.
+- Added planning notes from Letta Code Memory/MemFS docs, Letta/Letta Code READMEs, and Cameron Pfiffer's Co-3 post. Key conclusion: nanobot is already structurally close to MemFS; next work should focus on Dream guardrails, hybrid triggers, memory command surface, and clearer Dream-vs-Defrag ownership.
