@@ -7,8 +7,8 @@
 ## Decisions
 
 - **Decoupling mode:** keep the `upstream` remote for read-only reference (security/provider change review), but stop all rebasing/merging. Retire `personal-build`; `origin/main` becomes the integration branch.
-- **Channels to keep:** Telegram, Discord, Email.
-- **Channels to remove:** DingTalk, Feishu/Lark, Matrix, MoChat, MS Teams, QQ/NapCat, Signal, Slack, WebSocket, WeCom, WeChat/Weixin, WhatsApp.
+- **Channels to keep:** Telegram, Discord, Email, WebSocket.
+- **Channels to remove:** DingTalk, Feishu/Lark, Matrix, MoChat, MS Teams, QQ/NapCat, Signal, Slack, WeCom, WeChat/Weixin, WhatsApp.
 - **Subsystems to keep:** built-in skills, all providers/tools, agent core, memory/session, CLI.
 - **Subsystems to remove now:** WebUI (`webui/`, `nanobot/web/`, `nanobot/webui/`), OpenAI-compatible API server (`nanobot/api/`), unused channels, and the WhatsApp bridge (`bridge/`).
 - **Strip strategy:** bounded deletion for WebUI/API/channels (well-defined surfaces), then lazy-load evaluation for future provider/tool pruning.
@@ -90,6 +90,7 @@ Keep:
 - `nanobot/channels/telegram.py`
 - `nanobot/channels/discord.py`
 - `nanobot/channels/email.py`
+- `nanobot/channels/websocket.py`
 - `nanobot/channels/base.py`, `manager.py`, `registry.py`, `__init__.py`
 
 Remove:
@@ -103,7 +104,6 @@ Remove:
 - `nanobot/channels/qq.py`
 - `nanobot/channels/signal.py`
 - `nanobot/channels/slack.py`
-- `nanobot/channels/websocket.py`
 - `nanobot/channels/wecom.py`
 - `nanobot/channels/weixin.py`
 - `nanobot/channels/whatsapp.py`
@@ -172,7 +172,7 @@ grep -RIn "get_webui_dir" nanobot/ tests/
 ## Future work (do not do in this pass)
 
 - Audit whether Email is actually used; if not, delete it in a later pass.
-- Consider whether a minimal WebSocket/dev channel is worth adding back later for local testing.
+- Keep WebSocket as the minimal programmatic/dev channel; revisit only if it creates real maintenance cost.
 - Audit providers: keep only OpenAI-compatible + Anthropic if that covers all models.
 - Audit tools: remove `image_generation`, `long_task`, `cron`, `mcp`, etc. if unused.
 - Audit skills: many `nanobot/skills/` directories may be WebUI or API-specific.
@@ -186,4 +186,5 @@ grep -RIn "get_webui_dir" nanobot/ tests/
 - Decided to keep `upstream` remote read-only, retire `personal-build`, and remove WebUI/API server as the first bounded deletion.
 - Wrote this plan.
 - Updated channel scope: keep Telegram, Discord, and Email; remove all other channels including WebSocket unless explicitly needed later.
+- Revised channel scope again: keep WebSocket for programmatic/dev use.
 - Reclassified `bridge/` as removable because it is WhatsApp-specific and WhatsApp is no longer in scope.
