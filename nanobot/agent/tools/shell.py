@@ -391,6 +391,7 @@ class ExecTool(Tool):
             command,
             cwd,
             restrict_to_workspace=access.restrict_to_workspace,
+            workspace_root=workspace_root,
         )
         if guard_error:
             return guard_error
@@ -585,6 +586,7 @@ class ExecTool(Tool):
         cwd: str,
         *,
         restrict_to_workspace: bool | None = None,
+        workspace_root: str | None = None,
     ) -> str | None:
         """Best-effort safety guard for potentially destructive commands."""
         cmd = command.strip()
@@ -621,6 +623,11 @@ class ExecTool(Tool):
                 )
 
             cwd_path = Path(cwd).resolve()
+            resolved_workspace = (
+                Path(workspace_root).expanduser().resolve()
+                if workspace_root
+                else None
+            )
 
             for raw in self._extract_absolute_paths(cmd):
                 try:
@@ -638,10 +645,13 @@ class ExecTool(Tool):
                     continue
 
                 media_path = get_media_dir().resolve()
-                if p.is_absolute() and not (
+                allowed = (
                     is_path_within(p, cwd_path)
                     or is_path_within(p, media_path)
-                ):
+                )
+                if not allowed and resolved_workspace is not None:
+                    allowed = is_path_within(p, resolved_workspace)
+                if p.is_absolute() and not allowed:
                     return (
                         "Error: Command blocked by safety guard (path outside working dir)"
                         + _WORKSPACE_BOUNDARY_NOTE
