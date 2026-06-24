@@ -9,6 +9,7 @@ import pytest
 
 from nanobot.config.schema import AgentDefaults
 from nanobot.providers.base import LLMResponse, ToolCallRequest
+from nanobot.session.manager import Session
 
 _MAX_TOOL_RESULT_CHARS = AgentDefaults().max_tool_result_chars
 
@@ -23,8 +24,8 @@ def _make_loop(tmp_path):
 
     with patch("nanobot.agent.loop.ContextBuilder"), \
          patch("nanobot.agent.loop.SessionManager"), \
-         patch("nanobot.agent.loop.SubagentManager") as MockSubMgr:
-        MockSubMgr.return_value.cancel_by_session = AsyncMock(return_value=0)
+         patch("nanobot.agent.loop.SubagentManager") as mock_sub_mgr:
+        mock_sub_mgr.return_value.cancel_by_session = AsyncMock(return_value=0)
         loop = AgentLoop(bus=bus, provider=provider, workspace=tmp_path)
     return loop
 
@@ -45,6 +46,29 @@ async def test_loop_max_iterations_message_stays_stable(tmp_path):
         "I reached the maximum number of tool call iterations (2) "
         "without completing the task. You can try breaking the task into smaller steps."
     )
+
+
+@pytest.mark.asyncio
+async def test_loop_records_session_usage_by_model(tmp_path):
+    loop = _make_loop(tmp_path)
+    loop.provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
+        content="done",
+        tool_calls=[],
+        usage={"prompt_tokens": 10, "completion_tokens": 3},
+    ))
+    loop.tools.get_definitions = MagicMock(return_value=[])
+    session = Session(key="cron:test")
+
+    await loop._run_agent_loop([], session=session)
+
+    usage = session.metadata["usage"]
+    assert usage["prompt_tokens"] == 10
+    assert usage["completion_tokens"] == 3
+    assert usage["total_tokens"] == 13
+    assert usage["requests"] == 1
+    row = next(iter(usage["by_model"].values()))
+    assert row["model"] == "test-model"
+    assert row["total_tokens"] == 13
 
 
 @pytest.mark.asyncio

@@ -415,6 +415,30 @@ class TestStructuredConversationHistory:
         assert entry["messages"][1]["tools_used"] == ["read_file"]
         assert entry["messages"][2]["name"] == "read_file"
 
+    def test_append_conversation_history_writes_usage(self, store):
+        store.append_conversation_history(
+            [{"role": "user", "content": "hello", "timestamp": "2026-06-24T12:00:00"}],
+            session_key="cron:test",
+            usage={
+                "prompt_tokens": 10,
+                "completion_tokens": 2,
+                "total_tokens": 12,
+                "requests": 1,
+                "by_model": {
+                    "opencode_go/deepseek": {
+                        "provider": "opencode_go",
+                        "model": "deepseek",
+                        "total_tokens": 12,
+                        "requests": 1,
+                    }
+                },
+            },
+        )
+
+        entry = store.read_unprocessed_history(since_cursor=0)[0]
+        assert entry["usage"]["total_tokens"] == 12
+        assert entry["usage"]["by_model"]["opencode_go/deepseek"]["requests"] == 1
+
     def test_append_conversation_history_strips_thinking_from_messages(self, store):
         store.append_conversation_history([
             {

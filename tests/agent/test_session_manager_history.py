@@ -31,6 +31,17 @@ def _tool_turn(prefix: str, idx: int) -> list[dict]:
     ]
 
 
+def test_clear_resets_usage_metadata():
+    session = Session(key="cli:test")
+    session.metadata["usage"] = {"total_tokens": 10, "requests": 1}
+    session.metadata["_usage_archived"] = {"total_tokens": 5, "requests": 1}
+
+    session.clear()
+
+    assert "usage" not in session.metadata
+    assert "_usage_archived" not in session.metadata
+
+
 def test_list_sessions_includes_metadata_title(tmp_path):
     manager = SessionManager(tmp_path)
     session = manager.get_or_create("websocket:chat-title")

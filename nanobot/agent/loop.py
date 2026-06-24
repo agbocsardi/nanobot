@@ -67,6 +67,7 @@ from nanobot.utils.runtime import (
     EMPTY_FINAL_RESPONSE_MESSAGE,
     SUSTAINED_GOAL_CONTINUE_PROMPT,
 )
+from nanobot.utils.usage import add_usage
 
 if TYPE_CHECKING:
     from nanobot.config.schema import (
@@ -685,6 +686,34 @@ class AgentLoop:
         budget = self.context_window_tokens - max(1, reserved_output) - 1024
         return budget if budget > 0 else max(128, self.context_window_tokens // 2)
 
+    @staticmethod
+    def _usage_provider_name(provider: LLMProvider) -> str:
+        primary = getattr(provider, "_primary", None)
+        if primary is not None:
+            provider = primary
+        spec = getattr(provider, "_spec", None)
+        name = getattr(spec, "name", None)
+        return str(name or provider.__class__.__name__)
+
+    def _record_session_usage(
+        self,
+        session: Session | None,
+        usage: dict[str, Any] | None,
+        *,
+        provider: LLMProvider,
+        model: str,
+    ) -> None:
+        if session is None:
+            return
+        total = session.metadata.setdefault("usage", {})
+        if add_usage(
+            total,
+            usage,
+            provider=self._usage_provider_name(provider),
+            model=model,
+        ):
+            session.metadata["usage"] = total
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
@@ -866,6 +895,12 @@ class AgentLoop:
             reset_request_context(request_token)
             reset_file_states(file_state_token)
         self._last_usage = result.usage
+        self._record_session_usage(
+            session,
+            result.usage,
+            provider=run_provider or self.provider,
+            model=effective_model,
+        )
         if result.stop_reason == "max_iterations":
             logger.warning("Max iterations ({}) reached", effective_max_iterations)
             should_stream = turn_continuation.should_stream_budget_response(

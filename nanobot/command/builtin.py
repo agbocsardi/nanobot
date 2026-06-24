@@ -14,6 +14,7 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.command.router import CommandContext, CommandRouter
 from nanobot.utils.helpers import build_status_content
 from nanobot.utils.restart import set_restart_notice_to_env
+from nanobot.utils.usage import usage_delta, usage_snapshot
 
 
 @dataclass(frozen=True)
@@ -208,11 +209,17 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
     await loop._cancel_active_tasks(ctx.key)
     session = ctx.session or loop.sessions.get_or_create(ctx.key)
     snapshot = session.messages[session.last_consolidated:]
+    snapshot_usage = usage_delta(
+        usage_snapshot(session.metadata.get("usage")),
+        usage_snapshot(session.metadata.get("_usage_archived")),
+    )
     session.clear()
     loop.sessions.save(session)
     loop.sessions.invalidate(session.key)
     if snapshot:
-        loop._schedule_background(loop.consolidator.archive(snapshot, session_key=ctx.key))
+        loop._schedule_background(
+            loop.consolidator.archive(snapshot, session_key=ctx.key, usage=snapshot_usage)
+        )
     return OutboundMessage(
         channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
         content="New session started.",

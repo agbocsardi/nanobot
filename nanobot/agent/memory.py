@@ -28,6 +28,7 @@ from nanobot.utils.helpers import (
     truncate_text,
 )
 from nanobot.utils.prompt_templates import render_template
+from nanobot.utils.usage import usage_delta, usage_snapshot
 
 if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
@@ -415,6 +416,7 @@ class MemoryStore:
         session_key: str | None = None,
         content: str | None = None,
         max_chars: int | None = None,
+        usage: dict[str, Any] | None = None,
     ) -> int:
         """Append a structured conversation archive entry to history.jsonl.
 
@@ -447,6 +449,8 @@ class MemoryStore:
             "messages": cleaned_messages,
             "content": strip_think(rendered),
         }
+        if usage:
+            record["usage"] = usage
         cursor = self._append_history_record(record)
         if rendered and not record["content"]:
             logger.debug(
@@ -772,6 +776,7 @@ class MemoryStore:
         *,
         session_key: str | None = None,
         max_chars: int | None = None,
+        usage: dict[str, Any] | None = None,
     ) -> None:
         """Fallback: dump raw messages to history.jsonl without LLM summarization."""
         limit = max_chars if max_chars is not None else _RAW_ARCHIVE_MAX_CHARS
@@ -782,6 +787,7 @@ class MemoryStore:
             session_key=session_key,
             content=f"[RAW] {len(messages)} messages\n{formatted}",
             max_chars=limit,
+            usage=usage,
         )
         logger.warning(
             "Memory consolidation degraded: raw-archived {} messages", len(messages)
@@ -886,6 +892,22 @@ class Consolidator:
     def get_lock(self, session_key: str) -> asyncio.Lock:
         """Return the shared consolidation lock for one session."""
         return self._locks.setdefault(session_key, asyncio.Lock())
+
+    def _usage_to_archive(self, session_key: str | None) -> dict[str, Any]:
+        if not session_key:
+            return {}
+        session = self.sessions.get_or_create(session_key)
+        return usage_delta(
+            session.metadata.get("usage"),
+            session.metadata.get("_usage_archived"),
+        )
+
+    def _mark_usage_archived(self, session_key: str | None) -> None:
+        if not session_key:
+            return
+        session = self.sessions.get_or_create(session_key)
+        session.metadata["_usage_archived"] = usage_snapshot(session.metadata.get("usage"))
+        self.sessions.save(session)
 
     def pick_consolidation_boundary(
         self,
@@ -1108,6 +1130,7 @@ class Consolidator:
         messages: list[dict],
         *,
         session_key: str | None = None,
+        usage: dict[str, Any] | None = None,
     ) -> str | None:
         """Mechanically prune tool noise and append to history.jsonl.
 
@@ -1116,6 +1139,7 @@ class Consolidator:
         """
         if not messages:
             return None
+        usage_to_write = usage if usage is not None else self._usage_to_archive(session_key)
         try:
             pruned = self._prune_messages(messages)
             if not pruned:
@@ -1127,11 +1151,16 @@ class Consolidator:
                 session_key=session_key,
                 content=f"[CONV] {len(pruned)} messages\n{formatted}",
                 max_chars=_ARCHIVE_SUMMARY_MAX_CHARS,
+                usage=usage_to_write,
             )
+            if usage is None:
+                self._mark_usage_archived(session_key)
             return formatted
         except Exception:
             logger.warning("Mechanical pruning failed, raw-dumping to history")
-            self.store.raw_archive(messages, session_key=session_key)
+            self.store.raw_archive(messages, session_key=session_key, usage=usage_to_write)
+            if usage is None:
+                self._mark_usage_archived(session_key)
             return None
 
     async def maybe_consolidate_by_tokens(
