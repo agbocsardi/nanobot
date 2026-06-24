@@ -1,116 +1,90 @@
-# Nanobot fork improvement — TODO
+# Nanobot Fork Improvement TODO
 
-Source: `projects/stack/nanobot-fork-improvement.md` (personal vault).
+Status after 2026-06-24 work: cron noise suppression, background observability,
+designated background model presets, and structured/summarized history archives
+are shipped on `origin/main`.
 
-## Checklist
+## Completed
 
-### Phase 1 — Stop noise
-- [x] Fix silent cron turns: suppress agent-generated "done"/fallback output for scheduled turns
-  - Added `CronPayload.silent` (new field, defaults False — no migration, no regression)
-  - Exposed `silent` in cron tool schema; threaded through `add_job` / `update_job`
-  - `bound_runner` tags cron turns with `CRON_SILENT_META`; `loop._dispatch` honors it
-  - `[SILENT]` exact-trimmed marker also suppresses (cron turns only)
-  - Helper `cron_suppress_success_delivery()` + tests in `tests/cron/test_session_turns_silent.py`
-- [x] Audit cron jobs for silent-intent leaks / suppression hacks
-  - No `[SILENT]` hacks in repo code (was prompt-level; now framework-honored)
-  - Heartbeat `set_suppress_delivery` + `evaluate_response` is a deliberate separate gate — left as-is
-  - Marked legacy `deliver`/`channel`/`to` fields DEAD in `types.py` (don't reuse for silent)
+- [x] Silent cron success suppression
+  - `payload.silent=true` suppresses successful chat delivery only
+  - exact `[SILENT]` response marker also suppresses cron success output
+  - errors still notify
+- [x] Background run observability
+  - shared run-record writer in `nanobot/utils/run_records.py`
+  - cron records under `runs/` include kind, provider/model, usage, silent flag, status/result
+  - subagent records under `subagents/` include kind, task, params, provider/model, usage, iterations, tool events, status/result
+- [x] Designated background model presets
+  - `agents.defaults.runPresets` maps `subagent`, `cron`, `dream`, `consolidator` to existing model presets
+  - resolver order: explicit override → runPresets[kind] → fallback kind where configured → active modelPreset → default
+  - cron/subagent/consolidator avoid ambient expensive chat model
+- [x] Conversation archive summaries
+  - consolidator restores upstream-style LLM summaries
+  - idle compact summarizes the full unconsolidated tail but archives only dropped messages
+  - one `history.jsonl` record per archived conversation/chunk; no extra summary cursor lines
+- [x] Contentless v3 conversation history
+  - new conversation records write `schema_version=3`, structured `messages`, optional `summary`
+  - no new top-level `content` for conversation records
+  - old v1/v2 `content` records still read via `history_entry_text()` fallback
 
-### Phase 2 — Isolate background models
-- [x] Add shared run-preset resolver for background run kinds
-  - `agents.defaults.runPresets`: `{subagent, cron, dream} -> model_preset name`
-  - Resolution order: explicit override → runPresets[kind] → active modelPreset → default
-- [x] Route cron jobs through designated preset without global model swaps
-  - Cron attaches an internal per-turn provider snapshot in metadata
-- [x] Route subagents through designated preset without global model swaps
-  - Subagents use a per-run local runner when configured
-- [x] Route Dream through designated preset via shared resolver
-  - Legacy `dream.model_override` still wins and still accepts raw model IDs
-- [ ] Add low-cost default background preset to personal config (deployment choice, not code)
+## Next focus: Letta-style memory architecture
 
-### Phase 3 — Make burn observable
-- [x] Re-score upstream "real usage forwarding" (commit 9814a3b9)
-  - Moot in this fork: `api/` / OpenAI-compatible server was removed in the decouple pass
-- [x] Persist background run records for cron + subagents
-  - Shared JSON writer in `nanobot/utils/run_records.py`
-  - Cron `runs/{run_id}.json`: kind, prompt/job metadata, model/provider, usage, silent flag, status/response
-  - Subagent `subagents/{task_id}.json`: kind, prompt/task, params, model/provider, usage, iterations, tool events, status/result
-- [x] Add LLM summary to conversation archives without adding extra cursor lines
-  - One JSONL record keeps structured `messages`, existing `content` preview, and new `summary`
-  - Context injection and Dream prefer `summary`, falling back to `messages`/`content`
-  - Consolidator model uses `runPresets.consolidator`, falling back to `runPresets.dream`
-- [x] Stop writing `content` for new v3 conversation records
-  - New conversation records are `schema_version=3` with `messages` + optional `summary`
-  - Old v1/v2 `content` records still read via fallback
-- [ ] Add run-preset name attribution to run records if needed
-- [ ] Backfill a few recent sessions to validate schema
+Goal: turn memory into explicit, inspectable, editable artifacts instead of relying on
+opaque prompt stuffing.
 
-### Phase 4 — Slim startup context
-- [ ] Compact unprocessed sessions with existing consolidation before startup injection
-- [ ] Preserve message content + tool results; collapse adjacent short turns where safe
-- [ ] Measure context token savings on a realistic startup batch
+### Phase A — Memory read/write tools
 
-### Phase 5 — Indexed history lookup
-- [ ] Add `memory_search` tool: literal/exact search over `history.jsonl` with citations
-- [ ] Return session key + excerpt + timestamp; agent decides whether to load full session
-- [ ] Defer semantic search to a later iteration
+- [ ] Add `memory_read` tool
+  - list/search topic memory files under `memory/`
+  - show summaries/descriptions before full file bodies
+  - support exact text search over topic files and `history.jsonl` summaries/messages
+- [ ] Add `memory_write` tool
+  - create/update topic memory files with frontmatter
+  - require explicit path/title/description
+  - write atomically and avoid touching `history.jsonl`
+- [ ] Add safety guardrails
+  - no direct write access to `.dream_cursor`, `history.jsonl`, session files
+  - path restricted to memory directory
+  - clear tool docs: topic memory is curated; history is append-only evidence
 
----
+### Phase B — Topic memory layout
+
+- [ ] Decide canonical topic-file schema
+  - frontmatter: `title`, `description`, `updated`, maybe `tags`
+  - body: concise durable facts, decisions, preferences, project state
+- [ ] Add/read memory index from frontmatter descriptions
+  - existing memory tree should become the primary discovery surface
+  - system memory remains always-loaded; topic memory is opt-in via tools
+- [ ] Add tests for memory file discovery, reads, writes, and path rejection
+
+### Phase C — History as evidence/index
+
+- [ ] Keep `history.jsonl` append-only and tool-read-only
+- [ ] Make `memory_read` search `summary` first, then `messages`, then old `content`
+- [ ] Consider a small `history_search` helper behind `memory_read`
+  - return cursor, timestamp, session_key, summary/snippet
+  - no semantic search yet; literal search first
+
+### Phase D — Dream / consolidation follow-up
+
+- [ ] Teach Dream to prefer v3 `summary` but inspect `messages` when needed
+- [ ] Consider Dream promoting durable `[permanent]` / `[durable]` summary facts into topic files
+- [ ] Keep `.dream_cursor` semantics unchanged: only Dream advances it
+
+## Deferred / maybe
+
+- [ ] Run-record preset-name attribution (`run_preset`) if debugging needs it
+- [ ] Backfill recent old history entries into v3 shape if worth it
+- [ ] Usage rollup command — skipped until explicitly wanted
+- [ ] Semantic/vector memory search — later, literal search first
 
 ## Log
 
 ### 2026-06-24
-- Phase 1 complete. Modeled silent cron as a new `CronPayload.silent` field rather than
-  repurposing the legacy `deliver` field. Reason: `_normalize_agent_turn_job` force-sets
-  `deliver=False` on every bound job, so reusing it would have silently muted every existing
-  reminder. Marked `deliver`/`channel`/`to`/`channel_meta` as DEAD in `types.py` for later
-  removal. Suppression is success-only (error path still publishes), cron turns only (normal
-  chat never suppressed), exact `[SILENT]` match only (no fuzzy). 117 cron/loop tests pass.
-- Note: decided `silent` over `deliver` despite planning to decouple from upstream — `deliver`
-  carries inverted historical meaning ("push to WhatsApp") that would need active un-teaching;
-  `silent` reads as intent. Dead fields kept (not ripped) because fork hasn't fully diverged and
-  ripping upstream-owned fields on heavily-edited files costs more than it saves.
-- Next: Phase 2 (background model isolation) or Phase 3 (usage observability).
 
-### 2026-06-24 (continued)
-- Added shared background run-record logging for cron + subagents. Cron records now include
-  `kind="cron"`, silent flag, provider/model, and usage for every run, including silent runs
-  (delivery suppression only skips chat publish, not usage capture). Subagents now write
-  `subagents/{task_id}.json` with prompt/task, params, provider/model, usage, iterations,
-  tool events, status, and result. Cron and subagent records share `nanobot/utils/run_records.py`.
-- Decision: no usage rollup command. Data is persisted for debugging and future preset attribution;
-  rollups stay YAGNI until explicitly wanted.
-- Checks: targeted lint + `147 passed in 2.05s` across new tests, cron suite, subagent suite,
-  and loop cron timezone test.
-
-### 2026-06-24 (run presets)
-- Added one designated-model abstraction for background work: `agents.defaults.runPresets` maps
-  run kinds (`subagent`, `cron`, `dream`) to existing model preset names. Resolution is explicit
-  override → runPresets[kind] → active modelPreset → default.
-- Wired subagents through a per-run local runner when a subagent preset is configured; cron turns
-  carry an internal per-turn provider snapshot in metadata; Dream uses the shared resolver while
-  preserving legacy `dream.model_override` (including raw model IDs).
-- Checks: targeted lint + `146 passed in 1.96s` across config run-preset tests, cron suite,
-  subagent suite, and run-preset wiring tests.
-
-### 2026-06-24 (archive summaries)
-- Restored upstream-style LLM consolidation summary behavior while keeping fork-native structured
-  conversation archives. `Consolidator.archive()` now prunes tool noise, summarizes via LLM,
-  and writes one `history.jsonl` conversation record with `messages`, legacy `content`, and
-  optional `summary`; summary failure still archives the structured transcript without summary.
-- Preserved upstream idle-compact contract: summarize the full unconsolidated tail (including
-  retained suffix/corrections), but archive only the dropped prefix.
-- Recent-history context injection and Dream now prefer `summary`, then structured `messages`,
-  then legacy `content`.
-- Consolidator uses `runPresets.consolidator` when configured, otherwise `runPresets.dream`.
-- Checks: targeted lint + `151 passed in 0.81s` across consolidator, memory store,
-  context builder, run-preset config, and run-preset wiring tests.
-
-### 2026-06-24 (contentless v3 history)
-- Changed new conversation archives to `schema_version=3` and stopped writing the legacy
-  top-level `content` projection. Records now persist structured `messages` plus optional
-  `summary`; old v1/v2 content-only entries still validate and read through `history_entry_text()`.
-- `raw_archive()` now stores a bounded `[RAW]` breadcrumb as a structured message rather than a
-  top-level content field. Added/updated tests for summary/message/content fallback behavior.
-- Checks: targeted lint + `151 passed in 0.84s` across consolidator, memory store,
-  context builder, run-preset config, and run-preset wiring tests.
+- Implemented silent cron jobs and exact `[SILENT]` marker suppression.
+- Added shared cron/subagent background run records with provider/model/usage.
+- Added designated run presets for cron, subagent, dream, and consolidator.
+- Restored LLM consolidation summaries while preserving structured conversation evidence.
+- Switched new conversation archives to contentless v3 (`messages` + optional `summary`).
+- Pushed all completed work to `origin/main` through `f7940c9d`.
