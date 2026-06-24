@@ -18,10 +18,18 @@ from nanobot.cron.session_turns import (
 )
 from nanobot.cron.types import CronJob
 from nanobot.utils.prompt_templates import render_template
+from nanobot.utils.run_records import build_usage_block
 
 
 class BoundCronAgent(Protocol):
     tools: Any
+    provider: Any
+    model: str
+
+    @property
+    def last_usage(self) -> dict[str, int]:
+        """Token usage from the most recently completed turn."""
+        ...
 
     async def submit_cron_turn(self, msg: InboundMessage) -> OutboundMessage | None:
         ...
@@ -38,6 +46,13 @@ def _cron_prompt_ref(prompt: str) -> dict[str, Any]:
         "version": 1,
         "sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
     }
+
+
+def _agent_provider_name(agent: BoundCronAgent) -> str:
+    provider = getattr(agent, "provider", None)
+    spec = getattr(provider, "_spec", None)
+    name = getattr(spec, "name", None)
+    return str(name or getattr(provider, "__class__", type("x", (), {"__name__": "unknown"})).__name__)
 
 
 def _bound_session_delivery_context(
@@ -89,12 +104,14 @@ async def run_bound_cron_job(
     if job.payload.silent:
         metadata[CRON_SILENT_META] = True
     run_record_base: dict[str, Any] = {
+        "kind": "cron",
         "job_id": job.id,
         "job_name": job.name,
         "session_key": session_key,
         "prompt_ref": prompt_ref,
         "prompt_vars": {"message": job.payload.message},
         "rendered_prompt": prompt,
+        "silent": bool(job.payload.silent),
     }
 
     cron.write_run_record(
@@ -136,12 +153,22 @@ async def run_bound_cron_job(
             cron_tool.reset_cron_context(cron_token)
 
     response = resp.content if resp else ""
+    # What actually ran + what it cost. provider/model come from the loop's
+    # active runtime for this turn (cron turns do not currently override the
+    # provider). usage is the delta captured by _last_usage for this turn.
+    provider_name = _agent_provider_name(agent)
+    usage_block = build_usage_block(
+        getattr(agent, "last_usage", None),
+        provider=provider_name,
+        model=getattr(agent, "model", None),
+    )
     cron.write_run_record(
         run_id,
         {
             **run_record_base,
             "status": "ok",
             "response": response,
+            "usage": usage_block,
         },
     )
     return response

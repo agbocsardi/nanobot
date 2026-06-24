@@ -23,6 +23,7 @@ from nanobot.cron.types import (
     CronSchedule,
     CronStore,
 )
+from nanobot.utils.run_records import write_run_record
 
 
 class CronJobSkippedError(Exception):
@@ -406,22 +407,15 @@ class CronService:
             tmp_path.unlink(missing_ok=True)
             raise
 
-    @staticmethod
-    def _safe_run_record_name(run_id: str) -> str:
-        return "".join(c if c.isalnum() or c in "._-" else "_" for c in run_id)
-
     def write_run_record(self, run_id: str, record: dict[str, Any]) -> None:
-        """Write an internal audit record for one cron execution."""
-        name = self._safe_run_record_name(run_id)
-        if not name:
-            name = str(uuid.uuid4())
-        path = self._run_records_dir / f"{name}.json"
-        payload = {
-            **record,
-            "run_id": run_id,
-            "updated_at_ms": _now_ms(),
-        }
-        self._atomic_write(path, json.dumps(payload, indent=2, ensure_ascii=False))
+        """Write an internal audit record for one cron execution.
+
+        Delegates to the shared background-run writer
+        (``nanobot.utils.run_records``) so cron and subagent records share one
+        schema and one writer. Records land under ``runs/``; subagents land
+        under ``subagents/``. The ``kind`` field distinguishes them.
+        """
+        write_run_record(self._run_records_dir, run_id, record)
 
     async def start(self) -> None:
         """Start the cron service."""

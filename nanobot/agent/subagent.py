@@ -27,6 +27,7 @@ from nanobot.security.workspace_access import (
     workspace_sandbox_status,
 )
 from nanobot.utils.prompt_templates import render_template
+from nanobot.utils.run_records import build_usage_block, write_run_record
 
 
 @dataclass(slots=True)
@@ -109,6 +110,10 @@ class SubagentManager:
         )
         self.runner = AgentRunner(provider)
         self._llm_wall_timeout_for_session = llm_wall_timeout_for_session
+        # Per-run observability records: prompt, params, model/provider, usage,
+        # status. Source of truth for "which model ran this subagent + what did
+        # it cost". Defaults to <workspace>/subagents/.
+        self.records_dir = workspace / "subagents"
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._task_statuses: dict[str, SubagentStatus] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
@@ -219,6 +224,7 @@ class SubagentManager:
             status.phase = payload.get("phase", status.phase)
             status.iteration = payload.get("iteration", status.iteration)
 
+        record_result = ""  # set in every terminal branch; pre-bound for cancel safety
         try:
             root = workspace_scope.project_path if workspace_scope is not None else self.workspace
             cfg = None
@@ -262,30 +268,45 @@ class SubagentManager:
                     reset_workspace_scope(token)
             status.phase = "done"
             status.stop_reason = result.stop_reason
+            # result.usage is the authoritative token count for the run; mirror
+            # it onto status so _write_run_record captures it even when the
+            # after_iteration hook never fired (e.g. single-pass completion).
+            if result.usage:
+                status.usage = dict(result.usage)
 
             if result.stop_reason == "tool_error":
                 status.tool_events = list(result.tool_events)
+                record_result = self._format_partial_progress(result)
                 await self._announce_result(
                     task_id, label, task,
-                    self._format_partial_progress(result),
+                    record_result,
                     origin, "error", origin_message_id,
                 )
             elif result.stop_reason == "error":
+                record_result = result.error or "Error: subagent execution failed."
                 await self._announce_result(
                     task_id, label, task,
-                    result.error or "Error: subagent execution failed.",
+                    record_result,
                     origin, "error", origin_message_id,
                 )
             else:
-                final_result = result.final_content or "Task completed but no final response was generated."
+                record_result = result.final_content or "Task completed but no final response was generated."
                 logger.info("Subagent [{}] completed successfully", task_id)
-                await self._announce_result(task_id, label, task, final_result, origin, "ok", origin_message_id)
+                await self._announce_result(task_id, label, task, record_result, origin, "ok", origin_message_id)
 
         except Exception as e:
             status.phase = "error"
             status.error = str(e)
+            record_result = f"Error: {e}"
             logger.exception("Subagent [{}] failed", task_id)
-            await self._announce_result(task_id, label, task, f"Error: {e}", origin, "error", origin_message_id)
+            await self._announce_result(task_id, label, task, record_result, origin, "error", origin_message_id)
+        finally:
+            # One record per run, all outcomes (success/tool_error/error/exception).
+            # Same writer + schema as cron run records; the kind field distinguishes.
+            self._write_run_record(
+                task_id, task, label, origin, temperature,
+                workspace_scope, record_result, status,
+            )
 
     async def _announce_result(
         self,
@@ -392,3 +413,61 @@ class SubagentManager:
             1 for tid in tids
             if tid in self._running_tasks and not self._running_tasks[tid].done()
         )
+
+    def _provider_name(self) -> str:
+        spec = getattr(self.provider, "_spec", None)
+        name = getattr(spec, "name", None)
+        return str(name or self.provider.__class__.__name__)
+
+    def _write_run_record(
+        self,
+        task_id: str,
+        task: str,
+        label: str,
+        origin: dict[str, str],
+        temperature: float | None,
+        workspace_scope: WorkspaceScope | None,
+        result_text: str,
+        status: SubagentStatus,
+    ) -> None:
+        """Write one observability record for this subagent run.
+
+        Same writer + schema as cron run records; ``kind`` distinguishes them.
+        Captures prompt, params, the model/provider that ran, token usage,
+        iteration count, tool events, and outcome — everything needed to debug
+        a looping/errored subagent after it finishes (previously lost).
+        """
+        record = {
+            "kind": "subagent",
+            "task_id": task_id,
+            "label": label,
+            "task": task,
+            "origin": dict(origin),
+            "workspace": str(workspace_scope.project_path) if workspace_scope else str(self.workspace),
+            "params": {
+                "temperature": temperature,
+                "max_iterations": self.max_iterations,
+                "restrict_to_workspace": bool(
+                    workspace_scope.restrict_to_workspace if workspace_scope else self.restrict_to_workspace
+                ),
+            },
+            "model": self.model,
+            "provider": self._provider_name(),
+            "iterations": int(status.iteration),
+            "stop_reason": status.stop_reason,
+            "phase": status.phase,
+            "error": status.error,
+            "usage": build_usage_block(
+                status.usage,
+                provider=self._provider_name(),
+                model=self.model,
+            ),
+            "tool_events": list(status.tool_events),
+            "result": result_text,
+        }
+        try:
+            write_run_record(self.records_dir, task_id, record)
+        except OSError:
+            # Records are observability-only; never let a write failure
+            # propagate into the subagent announce path.
+            logger.warning("Subagent [{}] could not write run record", task_id, exc_info=True)

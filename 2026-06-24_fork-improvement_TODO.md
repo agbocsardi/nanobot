@@ -22,8 +22,13 @@ Source: `projects/stack/nanobot-fork-improvement.md` (personal vault).
 - [ ] Default background preset: cheap model, low iteration cap (~50)
 
 ### Phase 3 — Make burn observable
-- [ ] Reimport upstream "real usage forwarding" (commit 9814a3b9) into `api/server.py`
-- [ ] Usage ledger: provider, model/preset, run type, in/out tokens, session key, ts → JSONL or SQLite
+- [x] Re-score upstream "real usage forwarding" (commit 9814a3b9)
+  - Moot in this fork: `api/` / OpenAI-compatible server was removed in the decouple pass
+- [x] Persist background run records for cron + subagents
+  - Shared JSON writer in `nanobot/utils/run_records.py`
+  - Cron `runs/{run_id}.json`: kind, prompt/job metadata, model/provider, usage, silent flag, status/response
+  - Subagent `subagents/{task_id}.json`: kind, prompt/task, params, model/provider, usage, iterations, tool events, status/result
+- [ ] Add run-type / preset attribution once Phase 2 `run_with_preset` exists
 - [ ] Backfill a few recent sessions to validate schema
 
 ### Phase 4 — Slim startup context
@@ -52,3 +57,14 @@ Source: `projects/stack/nanobot-fork-improvement.md` (personal vault).
   `silent` reads as intent. Dead fields kept (not ripped) because fork hasn't fully diverged and
   ripping upstream-owned fields on heavily-edited files costs more than it saves.
 - Next: Phase 2 (background model isolation) or Phase 3 (usage observability).
+
+### 2026-06-24 (continued)
+- Added shared background run-record logging for cron + subagents. Cron records now include
+  `kind="cron"`, silent flag, provider/model, and usage for every run, including silent runs
+  (delivery suppression only skips chat publish, not usage capture). Subagents now write
+  `subagents/{task_id}.json` with prompt/task, params, provider/model, usage, iterations,
+  tool events, status, and result. Cron and subagent records share `nanobot/utils/run_records.py`.
+- Decision: no usage rollup command. Data is persisted for debugging and future preset attribution;
+  rollups stay YAGNI until explicitly wanted.
+- Checks: targeted lint + `147 passed in 2.05s` across new tests, cron suite, subagent suite,
+  and loop cron timezone test.

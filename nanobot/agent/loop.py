@@ -696,6 +696,11 @@ class AgentLoop:
         name = getattr(spec, "name", None)
         return str(name or provider.__class__.__name__)
 
+    @property
+    def last_usage(self) -> dict[str, int]:
+        """Token usage from the most recently completed turn (read-only view)."""
+        return self._last_usage
+
     def _record_session_usage(
         self,
         session: Session | None,
