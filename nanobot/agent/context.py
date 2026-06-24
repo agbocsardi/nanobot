@@ -117,7 +117,7 @@ class ContextBuilder:
             if entries:
                 capped = entries[-self._MAX_RECENT_HISTORY:]
                 history_text = "\n".join(
-                    f"- [{e['timestamp']}] {e['content']}" for e in capped
+                    f"- [{e['timestamp']}] {self.memory.history_entry_text(e)}" for e in capped
                 )
                 history_text = truncate_text(history_text, self._MAX_HISTORY_CHARS)
                 parts.append("# Recent History\n\n" + history_text)

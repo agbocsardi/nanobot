@@ -223,6 +223,7 @@ class AgentLoop:
         preset_snapshot_loader: preset_helpers.PresetSnapshotLoader | None = None,
         cron_run_snapshot: ProviderSnapshot | None = None,
         subagent_run_snapshot: ProviderSnapshot | None = None,
+        consolidator_run_snapshot: ProviderSnapshot | None = None,
         runtime_events: RuntimeEventBus | None = None,
         runtime_model_publisher: Callable[[str, str | None], None] | None = None,
     ):
@@ -327,15 +328,22 @@ class AgentLoop:
         self._concurrency_gate: asyncio.Semaphore | None = (
             asyncio.Semaphore(_max) if _max > 0 else None
         )
+        consolidator_provider = consolidator_run_snapshot.provider if consolidator_run_snapshot else provider
+        consolidator_model = consolidator_run_snapshot.model if consolidator_run_snapshot else self.model
+        consolidator_context_window = (
+            consolidator_run_snapshot.context_window_tokens
+            if consolidator_run_snapshot
+            else self.context_window_tokens
+        )
         self.consolidator = Consolidator(
             store=self.context.memory,
-            provider=provider,
-            model=self.model,
+            provider=consolidator_provider,
+            model=consolidator_model,
             sessions=self.sessions,
-            context_window_tokens=self.context_window_tokens,
+            context_window_tokens=consolidator_context_window,
             build_messages=self.context.build_messages,
             get_tool_definitions=self.tools.get_definitions,
-            max_completion_tokens=provider.generation.max_tokens,
+            max_completion_tokens=consolidator_provider.generation.max_tokens,
             consolidation_ratio=consolidation_ratio,
             unified_session=unified_session,
         )
@@ -392,6 +400,15 @@ class AgentLoop:
             if "subagent" in run_presets
             else None
         )
+        consolidator_run_snapshot = (
+            preset_helpers.build_run_provider_snapshot(
+                config,
+                "consolidator",
+                fallback_kind="dream",
+            )
+            if "consolidator" in run_presets or "dream" in run_presets
+            else None
+        )
         return cls(
             bus=bus,
             provider=provider,
@@ -420,6 +437,7 @@ class AgentLoop:
             preset_snapshot_loader=preset_snapshot_loader,
             cron_run_snapshot=cron_run_snapshot,
             subagent_run_snapshot=subagent_run_snapshot,
+            consolidator_run_snapshot=consolidator_run_snapshot,
             **extra,
         )
 

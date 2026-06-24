@@ -48,6 +48,16 @@ def test_resolve_run_preset_uses_kind_specific_mapping() -> None:
     assert resolve_run_preset_name(cfg, "dream") == "memory"
 
 
+def test_consolidator_run_preset_falls_back_to_dream() -> None:
+    cfg = _config(modelPreset="cheap", runPresets={"dream": "memory"})
+    assert resolve_run_preset_name(cfg, "consolidator", fallback_kind="dream") == "memory"
+
+
+def test_consolidator_run_preset_can_override_dream() -> None:
+    cfg = _config(modelPreset="cheap", runPresets={"dream": "memory", "consolidator": "cheap"})
+    assert resolve_run_preset_name(cfg, "consolidator", fallback_kind="dream") == "cheap"
+
+
 def test_resolve_run_preset_falls_back_to_active_preset() -> None:
     cfg = _config(modelPreset="cheap")
     assert resolve_run_preset_name(cfg, "subagent") == "cheap"

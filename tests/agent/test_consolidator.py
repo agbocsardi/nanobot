@@ -1,4 +1,4 @@
-"""Tests for the lightweight Consolidator — append-only to HISTORY.md."""
+"""Tests for the Consolidator — append-only conversation records."""
 
 from unittest.mock import AsyncMock, MagicMock
 
@@ -63,7 +63,7 @@ def _tool_round(call_id: str) -> list[dict]:
 
 class TestConsolidatorSummarize:
     async def test_summarize_appends_to_history(self, consolidator, mock_provider, store):
-        """Consolidator should call LLM to summarize, then append to HISTORY.md."""
+        """Consolidator should call LLM and store summary on the same record."""
         mock_provider.chat_with_retry.return_value = MagicMock(
             content="User fixed a bug in the auth module."
         )
@@ -75,6 +75,8 @@ class TestConsolidatorSummarize:
         assert result == "User fixed a bug in the auth module."
         entries = store.read_unprocessed_history(since_cursor=0)
         assert len(entries) == 1
+        assert entries[0]["kind"] == "conversation"
+        assert entries[0]["summary"] == "User fixed a bug in the auth module."
 
     async def test_summarize_appends_session_key_to_history(
         self,
@@ -93,15 +95,18 @@ class TestConsolidatorSummarize:
         entries = store.read_unprocessed_history(since_cursor=0)
         assert entries[0]["session_key"] == "telegram:chat-1"
 
-    async def test_summarize_raw_dumps_on_llm_failure(self, consolidator, mock_provider, store):
-        """On LLM failure, raw-dump messages to HISTORY.md."""
+    async def test_summarize_archives_without_summary_on_llm_failure(self, consolidator, mock_provider, store):
+        """On LLM failure, keep the one structured conversation record."""
         mock_provider.chat_with_retry.side_effect = Exception("API error")
         messages = [{"role": "user", "content": "hello"}]
         result = await consolidator.archive(messages)
-        assert result is None  # no summary on raw dump fallback
+        assert result is None
         entries = store.read_unprocessed_history(since_cursor=0)
         assert len(entries) == 1
-        assert "[RAW]" in entries[0]["content"]
+        assert entries[0]["kind"] == "conversation"
+        assert entries[0]["messages"][0]["content"] == "hello"
+        assert "summary" not in entries[0]
+        assert "[RAW]" not in entries[0]["content"]
 
     async def test_raw_dump_fallback_appends_session_key(
         self,
@@ -134,13 +139,10 @@ class TestConsolidatorPromptContract:
 
 
 class TestConsolidatorArchiveErrorHandling:
-    """archive() must fall back to raw_archive when the LLM returns an error
-    response (finish_reason == 'error'), e.g. overloaded / quota exceeded.
-    See https://github.com/HKUDS/nanobot/issues/3244
-    """
+    """archive() must not write LLM error text as a summary."""
 
-    async def test_archive_falls_back_on_error_finish_reason(self, consolidator, mock_provider, store):
-        """LLM returning finish_reason='error' should trigger raw_archive, not write error text."""
+    async def test_archive_omits_summary_on_error_finish_reason(self, consolidator, mock_provider, store):
+        """finish_reason='error' still archives the pruned transcript."""
         mock_provider.chat_with_retry.return_value = MagicMock(
             content="Error: {'type': 'error', 'error': {'type': 'overloaded_error', 'message': 'overloaded_error (529)'}}",
             finish_reason="error",
@@ -153,7 +155,9 @@ class TestConsolidatorArchiveErrorHandling:
         assert result is None
         entries = store.read_unprocessed_history(since_cursor=0)
         assert len(entries) == 1
-        assert "[RAW]" in entries[0]["content"]
+        assert entries[0]["kind"] == "conversation"
+        assert "summary" not in entries[0]
+        assert "[RAW]" not in entries[0]["content"]
         assert "Error:" not in entries[0]["content"]
 
     async def test_archive_preserves_summary_on_success(self, consolidator, mock_provider, store):
@@ -171,6 +175,7 @@ class TestConsolidatorArchiveErrorHandling:
         entries = store.read_unprocessed_history(since_cursor=0)
         assert len(entries) == 1
         assert "[RAW]" not in entries[0]["content"]
+        assert entries[0]["summary"] == "User fixed a bug in the auth module."
 
 
 class TestConsolidatorTokenBudget:
@@ -473,12 +478,12 @@ class TestCompactIdleSession:
         assert "CORRECTED_FINAL_RESULT_alpha" in summarized
 
     @pytest.mark.asyncio
-    async def test_raw_dumps_only_dropped_messages_on_llm_failure(
+    async def test_summary_failure_archives_only_dropped_messages(
         self, real_consolidator, mock_provider, store
     ):
-        """Summarizing over the full tail must not widen what gets raw-dumped on
-        LLM failure: the breadcrumb should contain only the removed prefix, not
-        the retained suffix that stays live in the session. Regression for #4264."""
+        """Summarizing over the full tail must not widen what gets archived
+        when the summary fails: the record contains only the removed prefix,
+        not the retained suffix that stays live in the session. Regression for #4264."""
         mock_provider.chat_with_retry.side_effect = RuntimeError("LLM unavailable")
         sessions = real_consolidator.sessions
         session = sessions.get_or_create("cli:rawdrop")
@@ -491,10 +496,13 @@ class TestCompactIdleSession:
 
         await real_consolidator.compact_idle_session("cli:rawdrop", max_suffix=8)
 
-        raw = "\n".join(e["content"] for e in store.read_unprocessed_history(since_cursor=0))
-        assert "[RAW]" in raw
-        assert "user msg 0" in raw  # removed prefix is the breadcrumb
-        assert "RETAINED_SUFFIX_marker" not in raw  # retained suffix not dumped
+        entries = store.read_unprocessed_history(since_cursor=0)
+        assert len(entries) == 1
+        assert entries[0]["kind"] == "conversation"
+        assert "summary" not in entries[0]
+        archived = "\n".join(m["content"] for m in entries[0]["messages"])
+        assert "user msg 0" in archived  # removed prefix is the breadcrumb
+        assert "RETAINED_SUFFIX_marker" not in archived  # retained suffix not dumped
 
     @pytest.mark.asyncio
     async def test_idle_compact_writes_session_key_to_history(
@@ -555,7 +563,7 @@ class TestCompactIdleSession:
 
     @pytest.mark.asyncio
     async def test_llm_failure_still_truncates(self, real_consolidator, mock_provider, store):
-        """LLM raises RuntimeError → raw_archive fires, session still truncated, returns None."""
+        """LLM raises RuntimeError → transcript archives, session still truncates, returns None."""
         mock_provider.chat_with_retry.side_effect = RuntimeError("LLM unavailable")
         sessions = real_consolidator.sessions
         session = sessions.get_or_create("cli:fail")
@@ -567,9 +575,11 @@ class TestCompactIdleSession:
         result = await real_consolidator.compact_idle_session("cli:fail", max_suffix=4)
         assert result is None
 
-        # raw_archive should have been called (history.jsonl gets an entry)
+        # history.jsonl gets the structured transcript even without a summary
         entries = store.read_unprocessed_history(since_cursor=0)
-        assert any("[RAW]" in e["content"] for e in entries)
+        assert len(entries) == 1
+        assert entries[0]["kind"] == "conversation"
+        assert "summary" not in entries[0]
 
         # Session should still be truncated
         reloaded = sessions.get_or_create("cli:fail")

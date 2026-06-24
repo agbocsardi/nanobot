@@ -35,6 +35,11 @@ Source: `projects/stack/nanobot-fork-improvement.md` (personal vault).
   - Shared JSON writer in `nanobot/utils/run_records.py`
   - Cron `runs/{run_id}.json`: kind, prompt/job metadata, model/provider, usage, silent flag, status/response
   - Subagent `subagents/{task_id}.json`: kind, prompt/task, params, model/provider, usage, iterations, tool events, status/result
+- [x] Add LLM summary to conversation archives without adding extra cursor lines
+  - One JSONL record keeps structured `messages`, existing `content` preview, and new `summary`
+  - Context injection and Dream prefer `summary`, falling back to `messages`/`content`
+  - Consolidator model uses `runPresets.consolidator`, falling back to `runPresets.dream`
+- [ ] Stop writing `content` for new v3 conversation records once readers are fully summary/messages-based
 - [ ] Add run-preset name attribution to run records if needed
 - [ ] Backfill a few recent sessions to validate schema
 
@@ -85,3 +90,16 @@ Source: `projects/stack/nanobot-fork-improvement.md` (personal vault).
   preserving legacy `dream.model_override` (including raw model IDs).
 - Checks: targeted lint + `146 passed in 1.96s` across config run-preset tests, cron suite,
   subagent suite, and run-preset wiring tests.
+
+### 2026-06-24 (archive summaries)
+- Restored upstream-style LLM consolidation summary behavior while keeping fork-native structured
+  conversation archives. `Consolidator.archive()` now prunes tool noise, summarizes via LLM,
+  and writes one `history.jsonl` conversation record with `messages`, legacy `content`, and
+  optional `summary`; summary failure still archives the structured transcript without summary.
+- Preserved upstream idle-compact contract: summarize the full unconsolidated tail (including
+  retained suffix/corrections), but archive only the dropped prefix.
+- Recent-history context injection and Dream now prefer `summary`, then structured `messages`,
+  then legacy `content`.
+- Consolidator uses `runPresets.consolidator` when configured, otherwise `runPresets.dream`.
+- Checks: targeted lint + `151 passed in 0.81s` across consolidator, memory store,
+  context builder, run-preset config, and run-preset wiring tests.

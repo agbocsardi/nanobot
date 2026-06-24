@@ -64,7 +64,13 @@ def normalize_preset_name(name: str | None, presets: dict[str, ModelPresetConfig
     return name
 
 
-def resolve_run_preset_name(config: Any, kind: str, override: str | None = None) -> str:
+def resolve_run_preset_name(
+    config: Any,
+    kind: str,
+    override: str | None = None,
+    *,
+    fallback_kind: str | None = None,
+) -> str:
     """Resolve model preset name for a run kind.
 
     Order: explicit override → agents.defaults.run_presets[kind] → active
@@ -75,6 +81,8 @@ def resolve_run_preset_name(config: Any, kind: str, override: str | None = None)
     presets = getattr(config.agents.defaults, "run_presets", {}) or {}
     if kind in presets and str(presets[kind]).strip():
         return str(presets[kind]).strip()
+    if fallback_kind and fallback_kind in presets and str(presets[fallback_kind]).strip():
+        return str(presets[fallback_kind]).strip()
     active = getattr(config.agents.defaults, "model_preset", None)
     if active and active.strip():
         return active.strip()
@@ -87,13 +95,14 @@ def build_run_provider_snapshot(
     *,
     override: str | None = None,
     allow_raw_model: bool = False,
+    fallback_kind: str | None = None,
 ) -> ProviderSnapshot:
     """Build the provider/model snapshot for a named run kind.
 
     `allow_raw_model` exists only for legacy Dream `model_override`, which used
     to accept either a preset name or a raw model id.
     """
-    name = resolve_run_preset_name(config, kind, override=override)
+    name = resolve_run_preset_name(config, kind, override=override, fallback_kind=fallback_kind)
     if name == "default" or name in config.model_presets:
         return build_provider_snapshot(config, preset_name=name)
     if not allow_raw_model:

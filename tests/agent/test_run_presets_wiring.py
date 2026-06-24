@@ -20,7 +20,7 @@ def _config() -> Config:
         agents={
             "defaults": {
                 "workspace": "/tmp/nanobot-test",
-                "runPresets": {"subagent": "cheap", "cron": "cheap"},
+                "runPresets": {"subagent": "cheap", "cron": "cheap", "dream": "cheap"},
             }
         },
         modelPresets={"cheap": {"model": "cheap-model", "provider": "custom"}},
@@ -32,6 +32,7 @@ def test_agent_loop_from_config_wires_subagent_and_cron_snapshots() -> None:
     main_provider = MagicMock()
     main_provider.get_default_model.return_value = "main-model"
     bg_provider = MagicMock()
+    bg_provider.generation.max_tokens = 100
     bg_snapshot = ProviderSnapshot(
         provider=bg_provider,
         model="cheap-model",
@@ -45,10 +46,12 @@ def test_agent_loop_from_config_wires_subagent_and_cron_snapshots() -> None:
     ) as build:
         loop = AgentLoop.from_config(cfg, bus=MessageBus())
 
-    assert build.call_count == 2
+    assert build.call_count == 3
     assert loop.cron_run_snapshot()["model"] == "cheap-model"
     assert loop.subagents.run_provider is bg_provider
     assert loop.subagents.run_model == "cheap-model"
+    assert loop.consolidator.provider is bg_provider
+    assert loop.consolidator.model == "cheap-model"
 
 
 class _FakeTools:

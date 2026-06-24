@@ -415,6 +415,34 @@ class TestStructuredConversationHistory:
         assert entry["messages"][1]["tools_used"] == ["read_file"]
         assert entry["messages"][2]["name"] == "read_file"
 
+    def test_append_conversation_history_writes_summary(self, store):
+        store.append_conversation_history(
+            [{"role": "user", "content": "hello", "timestamp": "2026-06-24T12:00:00"}],
+            summary="User greeted the bot.",
+        )
+
+        entry = store.read_unprocessed_history(since_cursor=0)[0]
+        assert entry["summary"] == "User greeted the bot."
+        assert store.history_entry_text(entry) == "User greeted the bot."
+
+    def test_history_entry_text_falls_back_to_messages_then_content(self, store):
+        assert store.history_entry_text({
+            "messages": [{"role": "user", "content": "hello", "timestamp": "2026-06-24T12:00"}]
+        }) == "[2026-06-24T12:00] USER: hello"
+        assert store.history_entry_text({"content": "legacy blob"}) == "legacy blob"
+
+    def test_build_dream_prompt_prefers_summary(self, store):
+        store.append_conversation_history(
+            [{"role": "user", "content": "raw detail", "timestamp": "2026-06-24T12:00:00"}],
+            content="legacy preview",
+            summary="compact summary",
+        )
+
+        prompt, cursor = store.build_dream_prompt()
+        assert cursor == 1
+        assert "compact summary" in prompt
+        assert "legacy preview" not in prompt
+
     def test_append_conversation_history_writes_usage(self, store):
         store.append_conversation_history(
             [{"role": "user", "content": "hello", "timestamp": "2026-06-24T12:00:00"}],

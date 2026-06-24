@@ -417,6 +417,7 @@ class MemoryStore:
         content: str | None = None,
         max_chars: int | None = None,
         usage: dict[str, Any] | None = None,
+        summary: str | None = None,
     ) -> int:
         """Append a structured conversation archive entry to history.jsonl.
 
@@ -449,6 +450,8 @@ class MemoryStore:
             "messages": cleaned_messages,
             "content": strip_think(rendered),
         }
+        if summary and summary.strip():
+            record["summary"] = strip_think(summary.strip())
         if usage:
             record["usage"] = usage
         cursor = self._append_history_record(record)
@@ -549,6 +552,23 @@ class MemoryStore:
     def read_unprocessed_history(self, since_cursor: int) -> list[dict[str, Any]]:
         """Return history entries with a valid cursor > *since_cursor*."""
         return [e for e, c in self._iter_valid_entries() if c > since_cursor]
+
+    @classmethod
+    def history_entry_text(cls, entry: dict[str, Any]) -> str:
+        """Text projection for prompt injection.
+
+        Prefer LLM summaries, then structured messages, then legacy content.
+        This lets new archives inject compact summaries without breaking old
+        history.jsonl records that only have content.
+        """
+        summary = entry.get("summary")
+        if isinstance(summary, str) and summary.strip():
+            return summary.strip()
+        messages = entry.get("messages")
+        if isinstance(messages, list) and messages:
+            return cls._format_messages(messages)
+        content = entry.get("content")
+        return content if isinstance(content, str) else ""
 
     @classmethod
     def _is_internal_history_session(cls, session_key: str | None) -> bool:
@@ -675,7 +695,7 @@ class MemoryStore:
 
         batch = entries[:max_entries]
         history_text = "\n".join(
-            f"[{e['timestamp']}] {truncate_text(e['content'], 500)}"
+            f"[{e['timestamp']}] {truncate_text(self.history_entry_text(e), 500)}"
             for e in batch
         )
         skill_creator_path = str(BUILTIN_SKILLS_DIR / "skill-creator" / "SKILL.md")
@@ -1131,11 +1151,14 @@ class Consolidator:
         *,
         session_key: str | None = None,
         usage: dict[str, Any] | None = None,
+        summary_messages: list[dict] | None = None,
     ) -> str | None:
-        """Mechanically prune tool noise and append to history.jsonl.
+        """Prune tool noise, LLM-summarize, append one conversation record.
 
-        No LLM call — keeps actual conversation context for Dream.
-        Returns formatted text on success, None if nothing to archive.
+        The durable record keeps structured ``messages`` plus the mechanical
+        ``content`` preview. When the LLM summary succeeds, it is stored in the
+        same JSONL line as ``summary``. Summary failure does not lose data: the
+        pruned conversation record is still appended without ``summary``.
         """
         if not messages:
             return None
@@ -1144,18 +1167,46 @@ class Consolidator:
             pruned = self._prune_messages(messages)
             if not pruned:
                 return None
-            formatted = MemoryStore._format_messages(pruned)
+            messages_to_summarize = summary_messages if summary_messages is not None else messages
+            pruned_for_summary = self._prune_messages(messages_to_summarize)
+            formatted = MemoryStore._format_messages(pruned_for_summary)
             formatted = self._truncate_to_token_budget(formatted)
+            summary: str | None = None
+            try:
+                response = await self.provider.chat_with_retry(
+                    model=self.model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": render_template(
+                                "agent/consolidator_archive.md",
+                                strip=True,
+                            ),
+                        },
+                        {"role": "user", "content": formatted},
+                    ],
+                    tools=None,
+                    tool_choice=None,
+                )
+                if response.finish_reason == "error":
+                    raise RuntimeError(f"LLM returned error: {response.content}")
+                summary = response.content or "[no summary]"
+            except Exception:
+                logger.warning("Consolidation summary failed; archiving transcript without summary")
+
+            archive_formatted = MemoryStore._format_messages(pruned)
+            archive_formatted = self._truncate_to_token_budget(archive_formatted)
             self.store.append_conversation_history(
                 pruned,
                 session_key=session_key,
-                content=f"[CONV] {len(pruned)} messages\n{formatted}",
+                content=f"[CONV] {len(pruned)} messages\n{archive_formatted}",
                 max_chars=_ARCHIVE_SUMMARY_MAX_CHARS,
                 usage=usage_to_write,
+                summary=summary,
             )
             if usage is None:
                 self._mark_usage_archived(session_key)
-            return formatted
+            return summary
         except Exception:
             logger.warning("Mechanical pruning failed, raw-dumping to history")
             self.store.raw_archive(messages, session_key=session_key, usage=usage_to_write)
@@ -1348,7 +1399,14 @@ class Consolidator:
             last_active = session.updated_at
             summary: str | None = ""
             if messages_to_remove:
-                summary = await self.archive(messages_to_remove, session_key=session.key)
+                # Summarize the retained suffix too, but only archive messages
+                # removed from the live session. Upstream contract; prevents
+                # stale summaries when a correction lands in the kept tail.
+                summary = await self.archive(
+                    messages_to_remove,
+                    session_key=session.key,
+                    summary_messages=messages_to_summarize,
+                )
 
             if summary and summary != "(nothing)":
                 session.metadata["_last_summary"] = {
