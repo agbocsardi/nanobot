@@ -21,3 +21,8 @@ Use this file for project-specific preferences, recurring workflow conventions, 
 - Use `write_file` for first creation or intentional full-file rewrites.
 
 When the user asks for a recurring/periodic heartbeat task, update `HEARTBEAT.md` instead of creating a one-time reminder. Use the built-in `cron` tool for separate reminders or custom schedules that should not be part of the heartbeat task list.
+
+## Fork Development
+
+- Use red-green TDD: reproduce the bug first, then make the smallest change that turns it green.
+- One issue per improvement. Keep the issue template minimal — no checkboxes, no ceremony.
