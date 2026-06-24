@@ -9,6 +9,7 @@ from typing import Any
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.context import ContextAware, RequestContext
 from nanobot.agent.tools.schema import (
+    BooleanSchema,
     IntegerSchema,
     StringSchema,
     tool_parameters_schema,
@@ -39,6 +40,14 @@ _CRON_PARAMETERS = tool_parameters_schema(
         "Naive values use the tool's default timezone."
     ),
     job_id=StringSchema("REQUIRED when action='remove'. Job ID to remove (obtain via action='list')."),
+    silent=BooleanSchema(
+        description=
+        "true = this job runs but its success reply is never sent to chat "
+        "(it still writes files, logs, and records the run). Use for background "
+        "checks that should notify only via their own message tool calls, or that "
+        "should stay quiet unless they find something. Default false so reminders "
+        "keep pinging."
+    ),
     required=["action"],
     description=(
         "Action-specific parameters: add requires a non-empty message plus one schedule "
@@ -143,13 +152,13 @@ class CronTool(Tool, ContextAware):
         tz: str | None = None,
         at: str | None = None,
         job_id: str | None = None,
-        deliver: bool = True,
+        silent: bool = False,
         **kwargs: Any,
     ) -> str:
         if action == "add":
             if self._in_cron_context.get():
                 return "Error: cannot schedule new jobs from within a cron job execution"
-            return self._add_job(name, message, every_seconds, cron_expr, tz, at)
+            return self._add_job(name, message, every_seconds, cron_expr, tz, at, silent)
         elif action == "list":
             return self._list_jobs()
         elif action == "remove":
@@ -164,6 +173,7 @@ class CronTool(Tool, ContextAware):
         cron_expr: str | None,
         tz: str | None,
         at: str | None,
+        silent: bool = False,
     ) -> str:
         if not message:
             return (
@@ -219,6 +229,7 @@ class CronTool(Tool, ContextAware):
             origin_channel=origin_channel,
             origin_chat_id=origin_chat_id,
             origin_metadata=dict(self._origin_metadata.get() or {}),
+            silent=silent,
         )
         return f"Created job '{job.name}' (id: {job.id})"
 

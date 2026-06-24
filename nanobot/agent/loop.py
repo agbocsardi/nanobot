@@ -42,6 +42,7 @@ from nanobot.command import CommandContext, CommandRouter, register_builtin_comm
 from nanobot.config.schema import AgentDefaults, ModelPresetConfig
 from nanobot.cron.session_turns import (
     cron_history_overrides,
+    cron_suppress_success_delivery,
 )
 from nanobot.providers.base import LLMProvider
 from nanobot.providers.factory import ProviderSnapshot
@@ -1060,9 +1061,19 @@ class AgentLoop:
                     completed_channel = msg.channel
                     completed_chat_id = msg.chat_id
                     if response is not None:
-                        await self.bus.publish_outbound(response)
-                        completed_channel = response.channel
-                        completed_chat_id = response.chat_id
+                        if cron_suppress_success_delivery(msg.metadata, response.content):
+                            # Cron/background turn configured silent (or returned
+                            # [SILENT]): record success internally but deliver
+                            # nothing to chat. Run record + cron completion
+                            # still happen below.
+                            logger.debug(
+                                "Suppressing silent cron turn output for session {}",
+                                session_key,
+                            )
+                        else:
+                            await self.bus.publish_outbound(response)
+                            completed_channel = response.channel
+                            completed_chat_id = response.chat_id
                     elif msg.channel == "cli":
                         await self.bus.publish_outbound(OutboundMessage(
                             channel=msg.channel, chat_id=msg.chat_id,

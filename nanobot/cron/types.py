@@ -23,15 +23,33 @@ class CronPayload:
     """What to do when the job runs."""
     kind: Literal["system_event", "agent_turn"] = "agent_turn"
     message: str = ""
-    # Legacy delivery fields used by pre-session-bound cron jobs.
+    # ── DEAD / LEGACY — pre-session-bound cron delivery fields. ─────────────
+    # These controlled the old "push result to an external channel" path.
+    # Session-bound cron (run_bound_cron_job) ignores them entirely, and
+    # _normalize_agent_turn_job force-clears them on every bound job.
+    #
+    # DO NOT reuse `deliver` to mean "silence the chat reply" — its history
+    # is the opposite (deliver=True once meant "push to WhatsApp"), and
+    # every existing bound job already has deliver=False, so repurposing it
+    # would silently mute every reminder. Use `silent` instead.
+    #
+    # ponytail: kept only to deserialize old job stores + match upstream,
+    # which still ships these. Safe to delete once legacy migration is done.
     deliver: bool = False
     channel: str | None = None  # e.g. "whatsapp"
     to: str | None = None  # e.g. phone number
     channel_meta: dict[str, Any] = field(default_factory=dict)
+    # ── end dead/legacy fields. ─────────────────────────────────────────────
     session_key: str | None = None  # original session key for correct session recording
     origin_channel: str | None = None
     origin_chat_id: str | None = None
     origin_metadata: dict[str, Any] = field(default_factory=dict)
+    # Session-bound delivery control.
+    # silent=True: the job runs normally (tools, file writes, logging, run
+    # record) but its success reply is never published to chat. Defaults
+    # False so existing reminders keep notifying. Honored only for cron/
+    # background turns; see cron_suppress_success_delivery().
+    silent: bool = False
 
 
 @dataclass
