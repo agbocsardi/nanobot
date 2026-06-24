@@ -106,7 +106,7 @@ class TestConsolidatorSummarize:
         assert entries[0]["kind"] == "conversation"
         assert entries[0]["messages"][0]["content"] == "hello"
         assert "summary" not in entries[0]
-        assert "[RAW]" not in entries[0]["content"]
+        assert "content" not in entries[0]
 
     async def test_raw_dump_fallback_appends_session_key(
         self,
@@ -157,8 +157,8 @@ class TestConsolidatorArchiveErrorHandling:
         assert len(entries) == 1
         assert entries[0]["kind"] == "conversation"
         assert "summary" not in entries[0]
-        assert "[RAW]" not in entries[0]["content"]
-        assert "Error:" not in entries[0]["content"]
+        assert "content" not in entries[0]
+        assert "Error:" not in store.history_entry_text(entries[0])
 
     async def test_archive_preserves_summary_on_success(self, consolidator, mock_provider, store):
         """Normal LLM response should still produce a proper summary entry."""
@@ -174,7 +174,7 @@ class TestConsolidatorArchiveErrorHandling:
         assert result == "User fixed a bug in the auth module."
         entries = store.read_unprocessed_history(since_cursor=0)
         assert len(entries) == 1
-        assert "[RAW]" not in entries[0]["content"]
+        assert "content" not in entries[0]
         assert entries[0]["summary"] == "User fixed a bug in the auth module."
 
 
@@ -794,8 +794,9 @@ class TestRawArchiveTruncation:
         store.raw_archive(messages)
         entries = store.read_unprocessed_history(since_cursor=0)
         assert len(entries) == 1
-        assert len(entries[0]["content"]) < 50_000
-        assert "[RAW]" in entries[0]["content"]
+        text = store.history_entry_text(entries[0])
+        assert len(text) < 50_000
+        assert "[RAW]" in text
 
     def test_raw_archive_preserves_small_content(self, store):
         """Small messages should not be truncated."""
@@ -803,7 +804,7 @@ class TestRawArchiveTruncation:
         store.raw_archive(messages)
         entries = store.read_unprocessed_history(since_cursor=0)
         assert len(entries) == 1
-        assert "hello" in entries[0]["content"]
+        assert "hello" in store.history_entry_text(entries[0])
 
     def test_raw_archive_preserves_session_key(self, store):
         messages = [{"role": "user", "content": "hello"}]
@@ -816,7 +817,7 @@ class TestRawArchiveTruncation:
         messages = [{"role": "user", "content": "a" * 200}]
         store.raw_archive(messages, max_chars=100)
         entries = store.read_unprocessed_history(since_cursor=0)
-        assert len(entries[0]["content"]) < 200
+        assert len(store.history_entry_text(entries[0])) < 200
 
 
 class TestArchiveTruncation:
@@ -863,7 +864,7 @@ class TestArchiveTruncation:
         await consolidator.archive([{"role": "user", "content": "hi"}])
 
         entry = store.read_unprocessed_history(since_cursor=0)[0]
-        assert len(entry["content"]) <= _ARCHIVE_SUMMARY_MAX_CHARS + 50
+        assert len(entry["summary"]) <= _ARCHIVE_SUMMARY_MAX_CHARS + 50
 
     async def test_archive_truncates_via_tiktoken_with_positive_budget(self, consolidator, mock_provider, store):
         """Positive token budget should use tiktoken for precise truncation."""

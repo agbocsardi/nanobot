@@ -376,7 +376,7 @@ class TestAppendHistoryHardCap:
 
 
 class TestStructuredConversationHistory:
-    def test_append_conversation_history_writes_v2_record_with_preview(self, store):
+    def test_append_conversation_history_writes_v3_record_without_content(self, store):
         messages = [
             {
                 "timestamp": "2026-06-01T10:00:00+02:00",
@@ -405,17 +405,17 @@ class TestStructuredConversationHistory:
 
         entry = store.read_unprocessed_history(since_cursor=0)[0]
         assert cursor == 1
-        assert entry["schema_version"] == 2
+        assert entry["schema_version"] == 3
         assert entry["kind"] == "conversation"
         assert entry["session_key"] == "telegram:123"
         assert entry["message_count"] == 3
         assert entry["start_time"] == "2026-06-01T10:00:00+02:00"
         assert entry["end_time"] == "2026-06-01T10:02:00+02:00"
-        assert entry["content"] == "[CONV] 3 messages\npreview"
+        assert "content" not in entry
         assert entry["messages"][1]["tools_used"] == ["read_file"]
         assert entry["messages"][2]["name"] == "read_file"
 
-    def test_append_conversation_history_writes_summary(self, store):
+    def test_append_conversation_history_writes_summary_without_content(self, store):
         store.append_conversation_history(
             [{"role": "user", "content": "hello", "timestamp": "2026-06-24T12:00:00"}],
             summary="User greeted the bot.",
@@ -423,6 +423,7 @@ class TestStructuredConversationHistory:
 
         entry = store.read_unprocessed_history(since_cursor=0)[0]
         assert entry["summary"] == "User greeted the bot."
+        assert "content" not in entry
         assert store.history_entry_text(entry) == "User greeted the bot."
 
     def test_history_entry_text_falls_back_to_messages_then_content(self, store):

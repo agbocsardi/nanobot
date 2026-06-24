@@ -421,26 +421,17 @@ class MemoryStore:
     ) -> int:
         """Append a structured conversation archive entry to history.jsonl.
 
-        The legacy ``content`` preview remains for grep/backward compatibility,
-        but downstream readers should prefer the structured ``messages`` field.
+        New conversation records are schema v3: structured messages plus an
+        optional LLM summary. The old ``content`` text projection is no longer
+        written for conversations; readers use history_entry_text() to support
+        old v1/v2 records.
         """
-        limit = max_chars if max_chars is not None else _HISTORY_ENTRY_HARD_CAP
+        _ = (content, max_chars)  # accepted for old call sites; v3 does not persist content
         now = datetime.now().astimezone().isoformat(timespec="minutes")
         cleaned_messages = self._clean_history_messages(messages)
-        rendered = content if content is not None else self._format_messages(cleaned_messages)
-        rendered = rendered.rstrip()
-        if len(rendered) > limit:
-            if not self._oversize_logged:
-                self._oversize_logged = True
-                logger.warning(
-                    "history conversation preview exceeds {} chars ({}); truncating. "
-                    "Structured messages are kept intact; further occurrences suppressed.",
-                    limit, len(rendered),
-                )
-            rendered = truncate_text(rendered, limit)
         timestamps = [m.get("timestamp") for m in cleaned_messages if m.get("timestamp")]
         record: dict[str, Any] = {
-            "schema_version": 2,
+            "schema_version": 3,
             "kind": "conversation",
             "timestamp": now,
             "start_time": min(timestamps) if timestamps else None,
@@ -448,20 +439,12 @@ class MemoryStore:
             "session_key": session_key or "unknown",
             "message_count": len(cleaned_messages),
             "messages": cleaned_messages,
-            "content": strip_think(rendered),
         }
         if summary and summary.strip():
-            record["summary"] = strip_think(summary.strip())
+            record["summary"] = truncate_text(strip_think(summary.strip()), _ARCHIVE_SUMMARY_MAX_CHARS)
         if usage:
             record["usage"] = usage
-        cursor = self._append_history_record(record)
-        if rendered and not record["content"]:
-            logger.debug(
-                "history conversation entry {} preview stripped to empty; "
-                "persisting structured messages only",
-                cursor,
-            )
-        return cursor
+        return self._append_history_record(record)
 
     def _append_history_record(self, record: dict[str, Any]) -> int:
         # Cursor allocation and the append must be atomic: concurrent writers
@@ -516,7 +499,10 @@ class MemoryStore:
     def _valid_history_payload(entry: dict[str, Any]) -> bool:
         if not isinstance(entry.get("timestamp"), str):
             return False
-        if not isinstance(entry.get("content"), str):
+        has_content = isinstance(entry.get("content"), str)
+        has_summary = isinstance(entry.get("summary"), str)
+        has_messages = isinstance(entry.get("messages"), list)
+        if not (has_content or has_summary or has_messages):
             return False
         session_key = entry.get("session_key")
         return session_key is None or isinstance(session_key, str)
@@ -762,8 +748,9 @@ class MemoryStore:
             if not message.get("content"):
                 continue
             tools = f" [tools: {', '.join(message['tools_used'])}]" if message.get("tools_used") else ""
+            ts = str(message.get("timestamp") or "?")[:16]
             lines.append(
-                f"[{message.get('timestamp', '?')[:16]}] {message['role'].upper()}{tools}: {message['content']}"
+                f"[{ts}] {message['role'].upper()}{tools}: {message['content']}"
             )
         return "\n".join(lines)
 
@@ -803,10 +790,12 @@ class MemoryStore:
         cleaned_messages = [sanitize_message_for_persistence(m) for m in messages]
         formatted = truncate_text(self._format_messages(cleaned_messages), limit)
         self.append_conversation_history(
-            cleaned_messages,
+            [{
+                "timestamp": datetime.now().astimezone().isoformat(timespec="minutes"),
+                "role": "user",
+                "content": f"[RAW] {len(messages)} messages\n{formatted}",
+            }],
             session_key=session_key,
-            content=f"[RAW] {len(messages)} messages\n{formatted}",
-            max_chars=limit,
             usage=usage,
         )
         logger.warning(

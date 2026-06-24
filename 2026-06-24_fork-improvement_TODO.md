@@ -39,7 +39,9 @@ Source: `projects/stack/nanobot-fork-improvement.md` (personal vault).
   - One JSONL record keeps structured `messages`, existing `content` preview, and new `summary`
   - Context injection and Dream prefer `summary`, falling back to `messages`/`content`
   - Consolidator model uses `runPresets.consolidator`, falling back to `runPresets.dream`
-- [ ] Stop writing `content` for new v3 conversation records once readers are fully summary/messages-based
+- [x] Stop writing `content` for new v3 conversation records
+  - New conversation records are `schema_version=3` with `messages` + optional `summary`
+  - Old v1/v2 `content` records still read via fallback
 - [ ] Add run-preset name attribution to run records if needed
 - [ ] Backfill a few recent sessions to validate schema
 
@@ -102,4 +104,13 @@ Source: `projects/stack/nanobot-fork-improvement.md` (personal vault).
   then legacy `content`.
 - Consolidator uses `runPresets.consolidator` when configured, otherwise `runPresets.dream`.
 - Checks: targeted lint + `151 passed in 0.81s` across consolidator, memory store,
+  context builder, run-preset config, and run-preset wiring tests.
+
+### 2026-06-24 (contentless v3 history)
+- Changed new conversation archives to `schema_version=3` and stopped writing the legacy
+  top-level `content` projection. Records now persist structured `messages` plus optional
+  `summary`; old v1/v2 content-only entries still validate and read through `history_entry_text()`.
+- `raw_archive()` now stores a bounded `[RAW]` breadcrumb as a structured message rather than a
+  top-level content field. Added/updated tests for summary/message/content fallback behavior.
+- Checks: targeted lint + `151 passed in 0.84s` across consolidator, memory store,
   context builder, run-preset config, and run-preset wiring tests.
