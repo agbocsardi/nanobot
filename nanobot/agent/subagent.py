@@ -88,6 +88,8 @@ class SubagentManager:
         max_iterations: int | None = None,
         max_concurrent_subagents: int | None = None,
         llm_wall_timeout_for_session: Callable[[str | None], float | None] | None = None,
+        run_provider: LLMProvider | None = None,
+        run_model: str | None = None,
     ):
         defaults = AgentDefaults()
         self.provider = provider
@@ -109,6 +111,8 @@ class SubagentManager:
             else defaults.max_concurrent_subagents
         )
         self.runner = AgentRunner(provider)
+        self.run_provider = run_provider
+        self.run_model = run_model
         self._llm_wall_timeout_for_session = llm_wall_timeout_for_session
         # Per-run observability records: prompt, params, model/provider, usage,
         # status. Source of truth for "which model ran this subagent + what did
@@ -246,10 +250,13 @@ class SubagentManager:
             )
             token = bind_workspace_scope(workspace_scope) if workspace_scope is not None else None
             try:
-                result = await self.runner.run(AgentRunSpec(
+                run_provider = self.run_provider or self.provider
+                run_model = self.run_model or self.model
+                runner = AgentRunner(run_provider) if self.run_provider else self.runner
+                result = await runner.run(AgentRunSpec(
                     initial_messages=messages,
                     tools=tools,
-                    model=self.model,
+                    model=run_model,
                     temperature=temperature,
                     max_iterations=self.max_iterations,
                     max_tool_result_chars=self.max_tool_result_chars,
@@ -306,6 +313,8 @@ class SubagentManager:
             self._write_run_record(
                 task_id, task, label, origin, temperature,
                 workspace_scope, record_result, status,
+                provider=run_provider,
+                model=run_model,
             )
 
     async def _announce_result(
@@ -414,10 +423,11 @@ class SubagentManager:
             if tid in self._running_tasks and not self._running_tasks[tid].done()
         )
 
-    def _provider_name(self) -> str:
-        spec = getattr(self.provider, "_spec", None)
+    def _provider_name(self, provider: LLMProvider | None = None) -> str:
+        provider = provider or self.provider
+        spec = getattr(provider, "_spec", None)
         name = getattr(spec, "name", None)
-        return str(name or self.provider.__class__.__name__)
+        return str(name or provider.__class__.__name__)
 
     def _write_run_record(
         self,
@@ -429,6 +439,8 @@ class SubagentManager:
         workspace_scope: WorkspaceScope | None,
         result_text: str,
         status: SubagentStatus,
+        provider: LLMProvider | None = None,
+        model: str | None = None,
     ) -> None:
         """Write one observability record for this subagent run.
 
@@ -451,16 +463,16 @@ class SubagentManager:
                     workspace_scope.restrict_to_workspace if workspace_scope else self.restrict_to_workspace
                 ),
             },
-            "model": self.model,
-            "provider": self._provider_name(),
+            "model": model or self.model,
+            "provider": self._provider_name(provider),
             "iterations": int(status.iteration),
             "stop_reason": status.stop_reason,
             "phase": status.phase,
             "error": status.error,
             "usage": build_usage_block(
                 status.usage,
-                provider=self._provider_name(),
-                model=self.model,
+                provider=self._provider_name(provider),
+                model=model or self.model,
             ),
             "tool_events": list(status.tool_events),
             "result": result_text,

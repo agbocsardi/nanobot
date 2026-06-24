@@ -41,6 +41,7 @@ from nanobot.bus.runtime_events import (
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.config.schema import AgentDefaults, ModelPresetConfig
 from nanobot.cron.session_turns import (
+    CRON_RUN_SNAPSHOT_META,
     cron_history_overrides,
     cron_suppress_success_delivery,
 )
@@ -220,6 +221,8 @@ class AgentLoop:
         model_presets: dict[str, ModelPresetConfig] | None = None,
         model_preset: str | None = None,
         preset_snapshot_loader: preset_helpers.PresetSnapshotLoader | None = None,
+        cron_run_snapshot: ProviderSnapshot | None = None,
+        subagent_run_snapshot: ProviderSnapshot | None = None,
         runtime_events: RuntimeEventBus | None = None,
         runtime_model_publisher: Callable[[str, str | None], None] | None = None,
     ):
@@ -236,6 +239,7 @@ class AgentLoop:
         self._preset_snapshot_loader = preset_snapshot_loader
         self._runtime_model_publisher = runtime_model_publisher
         self._provider_signature = provider_signature
+        self._cron_run_snapshot = cron_run_snapshot
         self._default_selection_signature = preset_helpers.default_selection_signature(provider_signature)
         self.workspace = workspace
         self.model = model or provider.get_default_model()
@@ -296,6 +300,8 @@ class AgentLoop:
             max_iterations=self.max_iterations,
             max_concurrent_subagents=max_concurrent_subagents,
             llm_wall_timeout_for_session=lambda sk: runner_wall_llm_timeout_s(self.sessions, sk),
+            run_provider=(subagent_run_snapshot.provider if subagent_run_snapshot else None),
+            run_model=(subagent_run_snapshot.model if subagent_run_snapshot else None),
         )
         self._unified_session = unified_session
         self._max_messages = max_messages if max_messages > 0 else 120
@@ -375,6 +381,17 @@ class AgentLoop:
             config,
             provider_snapshot_loader,
         )
+        run_presets = defaults.run_presets or {}
+        cron_run_snapshot = (
+            preset_helpers.build_run_provider_snapshot(config, "cron")
+            if "cron" in run_presets
+            else None
+        )
+        subagent_run_snapshot = (
+            preset_helpers.build_run_provider_snapshot(config, "subagent")
+            if "subagent" in run_presets
+            else None
+        )
         return cls(
             bus=bus,
             provider=provider,
@@ -401,6 +418,8 @@ class AgentLoop:
             model_preset=defaults.model_preset,
             provider_snapshot_loader=provider_snapshot_loader,
             preset_snapshot_loader=preset_snapshot_loader,
+            cron_run_snapshot=cron_run_snapshot,
+            subagent_run_snapshot=subagent_run_snapshot,
             **extra,
         )
 
@@ -578,6 +597,15 @@ class AgentLoop:
 
     def _runtime_events(self) -> RuntimeEventPublisher:
         return ensure_runtime_event_publisher(self)
+
+    def cron_run_snapshot(self) -> dict[str, Any] | None:
+        if self._cron_run_snapshot is None:
+            return None
+        return {
+            "provider": self._cron_run_snapshot.provider,
+            "model": self._cron_run_snapshot.model,
+            "context_window_tokens": self._cron_run_snapshot.context_window_tokens,
+        }
 
     async def submit_cron_turn(self, msg: InboundMessage) -> OutboundMessage | None:
         return await self._cron_turns.submit(msg)
@@ -1328,6 +1356,12 @@ class AgentLoop:
                 on_stream_end=on_stream_end,
                 pending_queue=pending_queue,
             )
+
+        snapshot = (msg.metadata or {}).get(CRON_RUN_SNAPSHOT_META)
+        if isinstance(snapshot, dict):
+            run_provider = run_provider or snapshot.get("provider")
+            run_model = run_model or snapshot.get("model")
+            run_context_window_tokens = run_context_window_tokens or snapshot.get("context_window_tokens")
 
         key = session_key or msg.session_key
         t0 = time.time()

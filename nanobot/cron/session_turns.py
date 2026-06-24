@@ -16,6 +16,10 @@ CRON_SILENT_META = "_cron_silent"
 # e.g. a periodic check that found nothing worth reporting. Trimmed, exact
 # match only — never substring/fuzzy, never honored on non-cron turns.
 CRON_SILENT_MARKER = "[SILENT]"
+# Internal-only per-turn provider snapshot for designated cron models. Contains
+# live provider objects, so it must not be persisted; cron_history_overrides()
+# intentionally excludes it.
+CRON_RUN_SNAPSHOT_META = "_cron_run_snapshot"
 
 
 def cron_trigger(metadata: Mapping[str, Any] | None) -> dict[str, Any] | None:

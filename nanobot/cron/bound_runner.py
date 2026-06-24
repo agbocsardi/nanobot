@@ -13,6 +13,7 @@ from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.cron.session_delivery import origin_delivery_context
 from nanobot.cron.session_turns import (
     CRON_DEFER_UNTIL_IDLE_META,
+    CRON_RUN_SNAPSHOT_META,
     CRON_SILENT_META,
     CRON_TRIGGER_META,
 )
@@ -29,6 +30,9 @@ class BoundCronAgent(Protocol):
     @property
     def last_usage(self) -> dict[str, int]:
         """Token usage from the most recently completed turn."""
+        ...
+
+    def cron_run_snapshot(self) -> dict[str, Any] | None:
         ...
 
     async def submit_cron_turn(self, msg: InboundMessage) -> OutboundMessage | None:
@@ -99,6 +103,10 @@ async def run_bound_cron_job(
         ),
     }
     metadata[CRON_DEFER_UNTIL_IDLE_META] = True
+    snapshot_getter = getattr(agent, "cron_run_snapshot", None)
+    snapshot = snapshot_getter() if callable(snapshot_getter) else None
+    if snapshot:
+        metadata[CRON_RUN_SNAPSHOT_META] = snapshot
     # Tag success-output suppression policy: a silent job runs but its reply
     # is never published to chat. Honored by AgentLoop._dispatch.
     if job.payload.silent:

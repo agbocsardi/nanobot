@@ -17,9 +17,16 @@ Source: `projects/stack/nanobot-fork-improvement.md` (personal vault).
   - Marked legacy `deliver`/`channel`/`to` fields DEAD in `types.py` (don't reuse for silent)
 
 ### Phase 2 — Isolate background models
-- [ ] Extract `run_with_preset(model, max_tokens, max_iterations)` primitive from Dream
-- [ ] Wire cron, subagent, heartbeat through it (never inherit ambient chat model)
-- [ ] Default background preset: cheap model, low iteration cap (~50)
+- [x] Add shared run-preset resolver for background run kinds
+  - `agents.defaults.runPresets`: `{subagent, cron, dream} -> model_preset name`
+  - Resolution order: explicit override → runPresets[kind] → active modelPreset → default
+- [x] Route cron jobs through designated preset without global model swaps
+  - Cron attaches an internal per-turn provider snapshot in metadata
+- [x] Route subagents through designated preset without global model swaps
+  - Subagents use a per-run local runner when configured
+- [x] Route Dream through designated preset via shared resolver
+  - Legacy `dream.model_override` still wins and still accepts raw model IDs
+- [ ] Add low-cost default background preset to personal config (deployment choice, not code)
 
 ### Phase 3 — Make burn observable
 - [x] Re-score upstream "real usage forwarding" (commit 9814a3b9)
@@ -28,7 +35,7 @@ Source: `projects/stack/nanobot-fork-improvement.md` (personal vault).
   - Shared JSON writer in `nanobot/utils/run_records.py`
   - Cron `runs/{run_id}.json`: kind, prompt/job metadata, model/provider, usage, silent flag, status/response
   - Subagent `subagents/{task_id}.json`: kind, prompt/task, params, model/provider, usage, iterations, tool events, status/result
-- [ ] Add run-type / preset attribution once Phase 2 `run_with_preset` exists
+- [ ] Add run-preset name attribution to run records if needed
 - [ ] Backfill a few recent sessions to validate schema
 
 ### Phase 4 — Slim startup context
@@ -68,3 +75,13 @@ Source: `projects/stack/nanobot-fork-improvement.md` (personal vault).
   rollups stay YAGNI until explicitly wanted.
 - Checks: targeted lint + `147 passed in 2.05s` across new tests, cron suite, subagent suite,
   and loop cron timezone test.
+
+### 2026-06-24 (run presets)
+- Added one designated-model abstraction for background work: `agents.defaults.runPresets` maps
+  run kinds (`subagent`, `cron`, `dream`) to existing model preset names. Resolution is explicit
+  override → runPresets[kind] → active modelPreset → default.
+- Wired subagents through a per-run local runner when a subagent preset is configured; cron turns
+  carry an internal per-turn provider snapshot in metadata; Dream uses the shared resolver while
+  preserving legacy `dream.model_override` (including raw model IDs).
+- Checks: targeted lint + `146 passed in 1.96s` across config run-preset tests, cron suite,
+  subagent suite, and run-preset wiring tests.

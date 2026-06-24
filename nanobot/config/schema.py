@@ -119,6 +119,10 @@ class AgentDefaults(Base):
 
     workspace: str = "~/.nanobot/workspace"
     model_preset: str | None = None  # Active preset name — takes precedence over fields below
+    run_presets: dict[str, str] = Field(
+        default_factory=dict,
+        validation_alias=AliasChoices("runPresets", "run_presets"),
+    )  # Optional model presets for background run kinds: subagent, cron, dream
     model: str = "anthropic/claude-opus-4-5"
     provider: str = (
         "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
@@ -324,6 +328,13 @@ class Config(BaseSettings):
         for fallback in self.agents.defaults.fallback_models:
             if isinstance(fallback, str) and fallback not in self.model_presets:
                 raise ValueError(f"fallback_models entry {fallback!r} not found in model_presets")
+        for kind, preset_name in self.agents.defaults.run_presets.items():
+            if not str(kind).strip():
+                raise ValueError("run_presets keys must be non-empty")
+            if preset_name != "default" and preset_name not in self.model_presets:
+                raise ValueError(
+                    f"run_presets entry {kind!r} references unknown model_preset {preset_name!r}"
+                )
         return self
 
     def resolve_default_preset(self) -> ModelPresetConfig:

@@ -669,6 +669,7 @@ def _run_gateway(
     health_server_enabled: bool = True,
 ) -> None:
     """Shared gateway runtime for enabled channels."""
+    from nanobot.agent import model_presets as preset_helpers
     from nanobot.agent.tools.message import MessageTool
     from nanobot.bus.queue import MessageBus
     from nanobot.bus.runtime_events import RuntimeEventBus
@@ -678,10 +679,8 @@ def _run_gateway(
     from nanobot.cron.session_turns import is_bound_cron_job
     from nanobot.cron.types import CronJob
     from nanobot.providers.factory import (
-        ProviderSnapshot,
         build_provider_snapshot,
         load_provider_snapshot,
-        make_provider,
     )
     from nanobot.providers.image_generation import image_gen_provider_configs
     from nanobot.session.manager import SessionManager
@@ -767,26 +766,16 @@ def _run_gateway(
     if isinstance(message_tool, MessageTool):
         message_tool.set_send_callback(_deliver_to_channel)
 
-    def _dream_snapshot() -> ProviderSnapshot | None:
-        dream_model = config.agents.defaults.dream.model_override
-        if not dream_model:
-            return None
-        name = dream_model.strip()
-        if not name:
-            return None
+    def _dream_snapshot():
         try:
-            if name == "default" or name in config.model_presets:
-                return build_provider_snapshot(config, preset_name=name)
-            preset = config.resolve_default_preset()
-            provider = make_provider(config, preset=preset, model=name)
-            return ProviderSnapshot(
-                provider=provider,
-                model=name,
-                context_window_tokens=preset.context_window_tokens,
-                signature=("dream_model_override", name),
+            return preset_helpers.build_run_provider_snapshot(
+                config,
+                "dream",
+                override=config.agents.defaults.dream.model_override,
+                allow_raw_model=True,
             )
         except Exception:
-            logger.exception("Failed to resolve Dream model override {!r}; using main model", name)
+            logger.exception("Failed to resolve Dream run preset; using main model")
             return None
 
     # Set cron callback (needs agent)
