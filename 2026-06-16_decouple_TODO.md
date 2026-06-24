@@ -17,7 +17,7 @@
 
 ## Top-level checklist
 
-- [ ] 1. Update remotes and branch model
+- [x] 1. Update remotes and branch model
 - [ ] 2. Update documentation (AGENTS.md, CONTRIBUTING.md, README)
 - [x] 3. Remove API server (`nanobot/api/`)
 - [x] 4. Remove WebUI runtime (`nanobot/webui/`)
@@ -31,7 +31,7 @@
 - [x] 12. Update `pyproject.toml` build config and dependencies
 - [x] 13. Delete or update affected tests
 - [x] 14. Run targeted test/lint checks
-- [ ] 15. Merge `2026-06-16_decouple` into `main` and push to `origin`
+- [x] 15. Merge `2026-06-16_decouple` into `main` and push to `origin`
 - [ ] 16. (Later) audit tools and skills for removal
 
 ## Detailed plan
@@ -422,3 +422,10 @@ Minimal restoration plan:
 - Investigated upstream PR #3990 (`d1a94dae`, final PR branch fetched as `upstream/pr-3990`). Found that old Dream safeguards were mostly config fields and runner limits removed from the execution path, not storage architecture. Plan is to restore those guardrails around current single-phase `process_direct` Dream instead of restoring the old two-phase Dream class.
 - Implemented M1a: Dream now honors `dream.max_batch_size`, `dream.model_override`, `dream.max_iterations`, and `dream.timeout_s` (default 300s). Incomplete/timed-out Dream runs no longer auto-commit. Targeted tests passed: `tests/config/test_dream_config.py`, `tests/agent/test_dream.py`, `tests/command/test_builtin_dream.py`, `tests/agent/test_dream_tools.py`.
 - Documented remaining Dream hardening work: changed-file limits, diff-size limits, rollback-on-incomplete, and observability.
+
+### 2026-06-24
+
+- Scar-raided selected upstream v0.2.2 hardening onto `feat/upstream-port-2026-06`, then fast-forwarded fork `main` through `decouple + ports`: reasoning wrapper leak normalization, Anthropic tool-ID sanitization/deduplication, builtin-parameter strictness, memory cursor guards, replay-window durability, git-in-workspace-subdir shell support, and first-class `opencode_zen` / `opencode_go` providers.
+- Verification before merge: import sanity passed, `uv run nanobot --help` no longer showed API/WebUI commands, and 306 targeted tests passed. Known pre-existing stale failure remains: `tests/agent/test_auto_compact.py::TestAutoCompactEdgeCases::test_auto_compact_with_nothing_summary`.
+- Completed branch-model switch locally: `main` now tracks `origin/main` as the independent fork line. `upstream/main` remains fetch-only reference for future manual scar-raiding; no upstream tracking/merging on fork `main`.
+- Deferred the workspace exact-file allowlist arc as not load-bearing for current needs; Dream M1a limits and planned rollback/diff guards cover the realistic runaway-Dream failure mode.
