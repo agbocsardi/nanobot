@@ -302,6 +302,7 @@ class ToolsConfig(Base):
 class Config(BaseSettings):
     """Root configuration for nanobot."""
 
+    api: dict[str, Any] = Field(default_factory=dict, exclude=True)  # Deprecated: ignored after API server removal
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     transcription: TranscriptionConfig = Field(default_factory=TranscriptionConfig)
