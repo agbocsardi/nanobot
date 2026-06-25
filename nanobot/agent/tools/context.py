@@ -54,6 +54,7 @@ class ToolContext:
     sessions: Any | None = None
     file_state_store: Any = field(default=None)
     provider_snapshot_loader: Callable[[], Any] | None = None
+    model_presets: dict[str, Any] | None = None
     image_generation_provider_configs: dict[str, Any] | None = None
     timezone: str = "UTC"
     workspace_sandbox: Any | None = None

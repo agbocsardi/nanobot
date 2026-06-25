@@ -102,3 +102,61 @@ async def test_bound_cron_turn_carries_designated_run_snapshot() -> None:
     await run_bound_cron_job(job, agent=agent, cron=_FakeCron())
 
     assert agent.seen_metadata[CRON_RUN_SNAPSHOT_META]["model"] == "cheap-model"
+
+
+@pytest.mark.asyncio
+async def test_bound_cron_turn_uses_per_job_model_preset_snapshot() -> None:
+    """A job with payload.model_preset should resolve its own snapshot, ignoring the global one."""
+
+    class _PresetAgent(_FakeAgent):
+        def cron_run_snapshot_for_preset(self, name):
+            return {
+                "provider": "preset-provider",
+                "model": f"preset:{name}",
+                "context_window_tokens": 9999,
+            }
+
+    agent = _PresetAgent()
+    job = CronJob(
+        id="j2",
+        name="cheap-check",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        payload=CronPayload(
+            kind="agent_turn",
+            message="check things",
+            session_key="cli:direct",
+            origin_channel="cli",
+            origin_chat_id="direct",
+            model_preset="deepseek",
+        ),
+    )
+
+    await run_bound_cron_job(job, agent=agent, cron=_FakeCron())
+
+    snap = agent.seen_metadata[CRON_RUN_SNAPSHOT_META]
+    assert snap["model"] == "preset:deepseek"
+    assert snap["context_window_tokens"] == 9999
+
+
+@pytest.mark.asyncio
+async def test_bound_cron_turn_falls_back_to_global_when_resolver_missing() -> None:
+    """An agent without cron_run_snapshot_for_preset (e.g. legacy) falls back to the global snapshot."""
+    agent = _FakeAgent()  # has no cron_run_snapshot_for_preset
+    job = CronJob(
+        id="j3",
+        name="check",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        payload=CronPayload(
+            kind="agent_turn",
+            message="check things",
+            session_key="cli:direct",
+            origin_channel="cli",
+            origin_chat_id="direct",
+            model_preset="deepseek",
+        ),
+    )
+
+    await run_bound_cron_job(job, agent=agent, cron=_FakeCron())
+
+    # Fallback: global snapshot model, not None.
+    assert agent.seen_metadata[CRON_RUN_SNAPSHOT_META]["model"] == "cheap-model"

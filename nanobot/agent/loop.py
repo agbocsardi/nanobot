@@ -538,6 +538,7 @@ class AgentLoop:
             cron_service=self.cron_service,
             sessions=self.sessions,
             provider_snapshot_loader=self._provider_snapshot_loader,
+            model_presets=self.model_presets,
             image_generation_provider_configs=self._image_generation_provider_configs,
             timezone=self.context.timezone or "UTC",
             workspace_sandbox=self.workspace_scopes.sandbox_status,
@@ -625,6 +626,22 @@ class AgentLoop:
             "provider": self._cron_run_snapshot.provider,
             "model": self._cron_run_snapshot.model,
             "context_window_tokens": self._cron_run_snapshot.context_window_tokens,
+        }
+
+    def cron_run_snapshot_for_preset(self, name: str) -> dict[str, Any] | None:
+        """Resolve a named model_preset to the snapshot used for a cron turn.
+
+        Returns None if no preset loader is configured; callers fall back to
+        the global cron snapshot / main model. The preset name is expected to
+        have been validated at job-creation time.
+        """
+        if self._preset_snapshot_loader is None:
+            return None
+        snap = self._preset_snapshot_loader(name)
+        return {
+            "provider": snap.provider,
+            "model": snap.model,
+            "context_window_tokens": snap.context_window_tokens,
         }
 
     async def submit_cron_turn(self, msg: InboundMessage) -> OutboundMessage | None:

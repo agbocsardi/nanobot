@@ -605,6 +605,7 @@ class CronService:
         origin_chat_id: str | None = None,
         origin_metadata: dict | None = None,
         silent: bool = False,
+        model_preset: str | None = None,
     ) -> CronJob:
         """Add a new job."""
         _validate_schedule_for_add(schedule)
@@ -627,6 +628,7 @@ class CronService:
                 origin_chat_id=origin_chat_id,
                 origin_metadata=origin_metadata or {},
                 silent=silent,
+                model_preset=model_preset,
             ),
             state=CronJobState(next_run_at_ms=_compute_next_run(schedule, now)),
             created_at_ms=now,

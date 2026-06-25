@@ -35,6 +35,9 @@ class BoundCronAgent(Protocol):
     def cron_run_snapshot(self) -> dict[str, Any] | None:
         ...
 
+    def cron_run_snapshot_for_preset(self, name: str) -> dict[str, Any] | None:
+        ...
+
     async def submit_cron_turn(self, msg: InboundMessage) -> OutboundMessage | None:
         ...
 
@@ -103,8 +106,15 @@ async def run_bound_cron_job(
         ),
     }
     metadata[CRON_DEFER_UNTIL_IDLE_META] = True
-    snapshot_getter = getattr(agent, "cron_run_snapshot", None)
-    snapshot = snapshot_getter() if callable(snapshot_getter) else None
+    # Per-job model preset wins over the global cron snapshot; fall back to
+    # the global snapshot (then the main model) if resolution fails.
+    snapshot = None
+    if job.payload.model_preset:
+        resolver = getattr(agent, "cron_run_snapshot_for_preset", None)
+        snapshot = resolver(job.payload.model_preset) if callable(resolver) else None
+    if snapshot is None:
+        snapshot_getter = getattr(agent, "cron_run_snapshot", None)
+        snapshot = snapshot_getter() if callable(snapshot_getter) else None
     if snapshot:
         metadata[CRON_RUN_SNAPSHOT_META] = snapshot
     # Tag success-output suppression policy: a silent job runs but its reply

@@ -6,6 +6,7 @@ from contextvars import ContextVar
 from datetime import datetime
 from typing import Any
 
+from nanobot.agent import model_presets as preset_helpers
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.context import ContextAware, RequestContext
 from nanobot.agent.tools.schema import (
@@ -39,6 +40,13 @@ _CRON_PARAMETERS = tool_parameters_schema(
         "ISO datetime for one-time execution (e.g. '2026-02-12T10:30:00'). "
         "Naive values use the tool's default timezone."
     ),
+    model_preset=StringSchema(
+        description=(
+            "Optional model preset name to run this job's turn on, e.g. a cheap "
+            "model for a recurring check or a smart model for synthesis. Must "
+            "match a configured model_preset. Defaults to the global cron preset."
+        )
+    ),
     job_id=StringSchema("REQUIRED when action='remove'. Job ID to remove (obtain via action='list')."),
     silent=BooleanSchema(
         description=
@@ -63,9 +71,15 @@ _CRON_PARAMETERS = tool_parameters_schema(
 class CronTool(Tool, ContextAware):
     """Tool to schedule reminders and recurring tasks."""
 
-    def __init__(self, cron_service: CronService, default_timezone: str = "UTC"):
+    def __init__(
+        self,
+        cron_service: CronService,
+        default_timezone: str = "UTC",
+        model_presets: dict[str, Any] | None = None,
+    ):
         self._cron = cron_service
         self._default_timezone = default_timezone
+        self._model_presets = model_presets
         self._session_key: ContextVar[str] = ContextVar("cron_session_key", default="")
         self._origin_channel: ContextVar[str] = ContextVar("cron_origin_channel", default="")
         self._origin_chat_id: ContextVar[str] = ContextVar("cron_origin_chat_id", default="")
@@ -81,7 +95,11 @@ class CronTool(Tool, ContextAware):
 
     @classmethod
     def create(cls, ctx: Any) -> Tool:
-        return cls(cron_service=ctx.cron_service, default_timezone=ctx.timezone)
+        return cls(
+            cron_service=ctx.cron_service,
+            default_timezone=ctx.timezone,
+            model_presets=getattr(ctx, "model_presets", None),
+        )
 
     def set_context(self, ctx: RequestContext) -> None:
         """Set the current session context for scheduled cron job ownership."""
@@ -153,12 +171,15 @@ class CronTool(Tool, ContextAware):
         at: str | None = None,
         job_id: str | None = None,
         silent: bool = False,
+        model_preset: str | None = None,
         **kwargs: Any,
     ) -> str:
         if action == "add":
             if self._in_cron_context.get():
                 return "Error: cannot schedule new jobs from within a cron job execution"
-            return self._add_job(name, message, every_seconds, cron_expr, tz, at, silent)
+            return self._add_job(
+                name, message, every_seconds, cron_expr, tz, at, silent, model_preset
+            )
         elif action == "list":
             return self._list_jobs()
         elif action == "remove":
@@ -174,6 +195,7 @@ class CronTool(Tool, ContextAware):
         tz: str | None,
         at: str | None,
         silent: bool = False,
+        model_preset: str | None = None,
     ) -> str:
         if not message:
             return (
@@ -220,6 +242,20 @@ class CronTool(Tool, ContextAware):
         else:
             return "Error: either every_seconds, cron_expr, or at is required"
 
+        preset_name: str | None = None
+        if model_preset:
+            if self._model_presets is None:
+                return (
+                    "Error: model_preset cannot be validated — preset registry "
+                    "unavailable. Omit model_preset or retry without it."
+                )
+            try:
+                preset_name = preset_helpers.normalize_preset_name(
+                    model_preset, self._model_presets
+                )
+            except (ValueError, KeyError) as e:
+                return f"Error: {e}"
+
         job = self._cron.add_job(
             name=name or message[:30],
             schedule=schedule,
@@ -230,6 +266,7 @@ class CronTool(Tool, ContextAware):
             origin_chat_id=origin_chat_id,
             origin_metadata=dict(self._origin_metadata.get() or {}),
             silent=silent,
+            model_preset=preset_name,
         )
         return f"Created job '{job.name}' (id: {job.id})"
 

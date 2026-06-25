@@ -100,3 +100,58 @@ class TestSchemaSelfDescribesRequirements:
         # accidentally introduced).
         tool = CronTool(_SvcStub())
         assert tool.parameters["required"] == ["action"]
+
+
+class TestModelPresetValidation:
+    """Per-job model_preset: validated at add time, stored on the payload."""
+
+    @staticmethod
+    def _tool(model_presets=None) -> CronTool:
+        tool = CronTool(_SvcStub(), default_timezone="UTC", model_presets=model_presets)
+        tool.set_context(
+            RequestContext(channel="c", chat_id="d", session_key="c:d")
+        )
+        return tool
+
+    def test_add_accepts_known_preset_and_stores_it(self) -> None:
+        import asyncio
+
+        captured = {}
+
+        class _CapturingSvc(_SvcStub):
+            def add_job(self, **kwargs):
+                captured.update(kwargs)
+                class _J:
+                    pass
+                j = _J()
+                j.id = "id1"
+                j.name = kwargs.get("name", "x")
+                return j
+
+        tool = CronTool(_CapturingSvc(), model_presets={"default": object(), "deepseek": object()})
+        tool.set_context(RequestContext(channel="c", chat_id="d", session_key="c:d"))
+        out = asyncio.run(tool.execute(
+            action="add", message="m", every_seconds=60, model_preset="deepseek"
+        ))
+        assert "Created job" in out
+        # Stored normalized name on the payload-bound kwarg.
+        assert captured.get("model_preset") == "deepseek"
+
+    def test_add_rejects_unknown_preset_with_clear_error(self) -> None:
+        import asyncio
+
+        tool = self._tool(model_presets={"default": object()})
+        out = asyncio.run(tool.execute(
+            action="add", message="m", every_seconds=60, model_preset="nope"
+        ))
+        assert "Error" in out
+        assert "nope" in out
+
+    def test_add_without_model_preset_is_unaffected(self) -> None:
+        import asyncio
+
+        tool = self._tool(model_presets={"default": object()})
+        out = asyncio.run(tool.execute(
+            action="add", message="m", every_seconds=60
+        ))
+        assert "Created job" in out

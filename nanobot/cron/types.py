@@ -50,6 +50,10 @@ class CronPayload:
     # False so existing reminders keep notifying. Honored only for cron/
     # background turns; see cron_suppress_success_delivery().
     silent: bool = False
+    # Optional model_preset name to run this job's turn on (e.g. a cheap model
+    # for a recurring web check). Validated at add time; resolved to a provider
+    # snapshot at trigger time. None = use the global cron run preset/main model.
+    model_preset: str | None = None
 
 
 @dataclass
