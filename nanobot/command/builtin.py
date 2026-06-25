@@ -216,6 +216,7 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
     session.clear()
     loop.sessions.save(session)
     loop.sessions.invalidate(session.key)
+    loop._last_usage = {}
     if snapshot:
         loop._schedule_background(
             loop.consolidator.archive(snapshot, session_key=ctx.key, usage=snapshot_usage)
