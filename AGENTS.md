@@ -145,7 +145,15 @@ upstream/main ─ fetch-only, scar-raid source
 
 ### Normal flow
 
-Work on topic branches off `main`, merge back into `main`:
+**Branch by size.** Match the git flow to the size of the change:
+
+- **Trivial fixes → commit straight to `main`.** One-liners, typos, small bug
+  fixes, doc tweaks, and other isolated single-purpose changes can be committed
+  and pushed directly on `main`. This is the default for narrow, well-understood
+  fixes (e.g. closing a one-line-issue).
+- **Substantial work → topic branch off `main`.** Anything multi-file, behavioral,
+  speculative, or that benefits from review/separation should go on a
+  `feat/*` branch, merged back into `main` when ready:
 
 ```bash
 git checkout main
@@ -155,6 +163,9 @@ git checkout main
 git merge feat/my-feature
 git push origin main
 ```
+
+When unsure which bucket a change falls into, default to a branch — branches are
+cheap, a messy `main` history is not.
 
 Before making substantial edits, check `git status`. If there are uncommitted
 changes, ask whether to commit first so nothing gets lost in the diff.
