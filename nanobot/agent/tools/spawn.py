@@ -7,7 +7,12 @@ from typing import TYPE_CHECKING, Any
 
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.context import ContextAware, RequestContext
-from nanobot.agent.tools.schema import NumberSchema, StringSchema, tool_parameters_schema
+from nanobot.agent.tools.schema import (
+    IntegerSchema,
+    NumberSchema,
+    StringSchema,
+    tool_parameters_schema,
+)
 from nanobot.security.workspace_access import current_workspace_scope
 
 if TYPE_CHECKING:
@@ -26,6 +31,24 @@ if TYPE_CHECKING:
             ),
             minimum=0.0,
             maximum=2.0,
+        ),
+        model_preset=StringSchema(
+            description=(
+                "Optional model preset name for the subagent, e.g. a cheap model "
+                "for web research or a smart model for synthesis. Must match a "
+                "configured model_preset. Defaults to the backend subagent preset."
+            ),
+        ),
+        max_iterations=IntegerSchema(
+            description="Optional cap on tool iterations for this subagent.",
+            minimum=1,
+        ),
+        context_window_tokens=IntegerSchema(
+            description=(
+                "Optional context window size (tokens) for the subagent's model. "
+                "Derived from the preset when model_preset is given."
+            ),
+            minimum=1,
         ),
         required=["task"],
     )
@@ -73,6 +96,9 @@ class SpawnTool(Tool, ContextAware):
         task: str,
         label: str | None = None,
         temperature: float | None = None,
+        model_preset: str | None = None,
+        max_iterations: int | None = None,
+        context_window_tokens: int | None = None,
         **kwargs: Any,
     ) -> str:
         """Spawn a subagent to execute the given task."""
@@ -84,13 +110,19 @@ class SpawnTool(Tool, ContextAware):
                 f"({running}/{limit} running). Wait for a running subagent "
                 f"to complete before spawning a new one."
             )
-        return await self._manager.spawn(
-            task=task,
-            label=label,
-            origin_channel=self._origin_channel.get(),
-            origin_chat_id=self._origin_chat_id.get(),
-            session_key=self._session_key.get(),
-            origin_message_id=self._origin_message_id.get(),
-            temperature=temperature,
-            workspace_scope=current_workspace_scope(),
-        )
+        try:
+            return await self._manager.spawn(
+                task=task,
+                label=label,
+                origin_channel=self._origin_channel.get(),
+                origin_chat_id=self._origin_chat_id.get(),
+                session_key=self._session_key.get(),
+                origin_message_id=self._origin_message_id.get(),
+                temperature=temperature,
+                model_preset=model_preset,
+                max_iterations=max_iterations,
+                context_window_tokens=context_window_tokens,
+                workspace_scope=current_workspace_scope(),
+            )
+        except (ValueError, KeyError, RuntimeError) as e:
+            return f"Cannot spawn subagent: {e}"

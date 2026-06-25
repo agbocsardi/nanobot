@@ -128,6 +128,126 @@ async def test_spawn_forwards_temperature_to_run_spec(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_spawn_model_preset_overrides_provider_and_model(tmp_path):
+    """model_preset should resolve to a (provider, model) snapshot used by the run."""
+    from nanobot.agent import subagent as subagent_mod
+    from nanobot.agent.subagent import SubagentManager
+    from nanobot.agent.tools.context import RequestContext
+    from nanobot.agent.tools.spawn import SpawnTool
+    from nanobot.bus.queue import MessageBus
+
+    bus = MessageBus()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "default-model"
+    preset_provider = MagicMock()
+    preset_provider.get_default_model.return_value = "deepseek-chat"
+    snapshot = SimpleNamespace(
+        provider=preset_provider, model="deepseek-chat", context_window_tokens=64000
+    )
+    presets = {"default": object(), "deepseek": object()}
+    mgr = SubagentManager(
+        provider=provider,
+        workspace=tmp_path,
+        bus=bus,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        preset_snapshot_loader=lambda name: snapshot,
+        presets=presets,
+    )
+    mgr._announce_result = AsyncMock()
+
+    captured = {}
+
+    class FakeRunner:
+        def __init__(self, prov):
+            captured["provider"] = prov
+
+        async def run(self, spec):
+            captured["model"] = spec.model
+            captured["ctx"] = spec.context_window_tokens
+            return SimpleNamespace(
+                stop_reason="done", final_content="done", error=None, tool_events=[],
+            )
+
+    tool = SpawnTool(mgr)
+    tool.set_context(RequestContext(channel="test", chat_id="c1", session_key="test:c1"))
+    with patch.object(subagent_mod, "AgentRunner", FakeRunner):
+        result = await tool.execute(task="do task", model_preset="deepseek")
+        assert "started" in result
+        await asyncio.gather(*mgr._running_tasks.values(), return_exceptions=True)
+
+    assert captured["provider"] is preset_provider
+    assert captured["model"] == "deepseek-chat"
+    assert captured["ctx"] == 64000
+
+
+@pytest.mark.asyncio
+async def test_spawn_invalid_model_preset_returns_clear_error(tmp_path):
+    """An unknown model_preset must fail clearly at call time, not crash the turn."""
+    from nanobot.agent.subagent import SubagentManager
+    from nanobot.agent.tools.context import RequestContext
+    from nanobot.agent.tools.spawn import SpawnTool
+    from nanobot.bus.queue import MessageBus
+
+    bus = MessageBus()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "default-model"
+    mgr = SubagentManager(
+        provider=provider,
+        workspace=tmp_path,
+        bus=bus,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        preset_snapshot_loader=lambda name: SimpleNamespace(
+            provider=provider, model="x", context_window_tokens=1
+        ),
+        presets={"default": object()},
+    )
+    mgr._announce_result = AsyncMock()
+
+    tool = SpawnTool(mgr)
+    tool.set_context(RequestContext(channel="test", chat_id="c1", session_key="test:c1"))
+    result = await tool.execute(task="do task", model_preset="nope")
+
+    assert "Cannot spawn subagent" in result
+    assert "nope" in result
+    # No task scheduled: validation raised before create_task.
+    assert mgr.get_running_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_spawn_max_iterations_override_threads_to_spec(tmp_path):
+    """max_iterations passed to spawn should reach the AgentRunSpec."""
+    from nanobot.agent.subagent import SubagentManager
+    from nanobot.bus.queue import MessageBus
+
+    bus = MessageBus()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "default-model"
+    mgr = SubagentManager(
+        provider=provider,
+        workspace=tmp_path,
+        bus=bus,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        max_iterations=10,
+    )
+    mgr._announce_result = AsyncMock()
+
+    seen = {}
+
+    async def fake_run(spec):
+        seen["max_iterations"] = spec.max_iterations
+        return SimpleNamespace(
+            stop_reason="done", final_content="done", error=None, tool_events=[],
+        )
+
+    mgr.runner.run = AsyncMock(side_effect=fake_run)
+
+    await mgr.spawn(task="do task", max_iterations=4)
+    await asyncio.gather(*mgr._running_tasks.values(), return_exceptions=True)
+
+    assert seen["max_iterations"] == 4
+
+
+@pytest.mark.asyncio
 async def test_spawn_tool_rejects_when_at_concurrency_limit(tmp_path):
     """SpawnTool should return an error string when the concurrency limit is reached."""
     from nanobot.agent.subagent import SubagentManager

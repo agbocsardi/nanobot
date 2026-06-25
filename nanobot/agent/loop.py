@@ -303,6 +303,8 @@ class AgentLoop:
             llm_wall_timeout_for_session=lambda sk: runner_wall_llm_timeout_s(self.sessions, sk),
             run_provider=(subagent_run_snapshot.provider if subagent_run_snapshot else None),
             run_model=(subagent_run_snapshot.model if subagent_run_snapshot else None),
+            preset_snapshot_loader=self._preset_snapshot_loader,
+            presets=model_presets,
         )
         self._unified_session = unified_session
         self._max_messages = max_messages if max_messages > 0 else 120

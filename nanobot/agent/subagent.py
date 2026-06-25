@@ -10,6 +10,7 @@ from typing import Any, Callable
 
 from loguru import logger
 
+from nanobot.agent import model_presets as preset_helpers
 from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.agent.tools.context import ToolContext
@@ -90,6 +91,8 @@ class SubagentManager:
         llm_wall_timeout_for_session: Callable[[str | None], float | None] | None = None,
         run_provider: LLMProvider | None = None,
         run_model: str | None = None,
+        preset_snapshot_loader: Callable[[str], Any] | None = None,
+        presets: dict[str, Any] | None = None,
     ):
         defaults = AgentDefaults()
         self.provider = provider
@@ -113,6 +116,8 @@ class SubagentManager:
         self.runner = AgentRunner(provider)
         self.run_provider = run_provider
         self.run_model = run_model
+        self._preset_snapshot_loader = preset_snapshot_loader
+        self._presets = presets
         self._llm_wall_timeout_for_session = llm_wall_timeout_for_session
         # Per-run observability records: prompt, params, model/provider, usage,
         # status. Source of truth for "which model ran this subagent + what did
@@ -166,6 +171,9 @@ class SubagentManager:
         session_key: str | None = None,
         origin_message_id: str | None = None,
         temperature: float | None = None,
+        model_preset: str | None = None,
+        max_iterations: int | None = None,
+        context_window_tokens: int | None = None,
         workspace_scope: WorkspaceScope | None = None,
     ) -> str:
         """Spawn a subagent to execute a task in the background."""
@@ -181,6 +189,13 @@ class SubagentManager:
         )
         self._task_statuses[task_id] = status
 
+        provider_override: LLMProvider | None = None
+        model_override: str | None = None
+        preset_ctx: int | None = None
+        if model_preset:
+            provider_override, model_override, preset_ctx = self._resolve_preset_override(model_preset)
+        effective_ctx = context_window_tokens or preset_ctx
+
         bg_task = asyncio.create_task(
             self._run_subagent(
                 task_id,
@@ -191,6 +206,10 @@ class SubagentManager:
                 origin_message_id,
                 temperature,
                 workspace_scope,
+                provider_override=provider_override,
+                model_override=model_override,
+                context_window_tokens=effective_ctx,
+                max_iterations=max_iterations,
             )
         )
         self._running_tasks[task_id] = bg_task
@@ -210,6 +229,22 @@ class SubagentManager:
         logger.info("Spawned subagent [{}]: {}", task_id, display_label)
         return f"Subagent [{display_label}] started (id: {task_id}). I'll notify you when it completes."
 
+    def _resolve_preset_override(
+        self, model_preset: str
+    ) -> tuple[LLMProvider, str, int | None]:
+        """Resolve a named model_preset to (provider, model, context_window).
+
+        Raises ValueError/KeyError for an unknown preset (clear message listing
+        available presets) and RuntimeError if no preset loader is configured.
+        """
+        if self._preset_snapshot_loader is None or self._presets is None:
+            raise RuntimeError(
+                "model_preset override is unavailable: SubagentManager has no preset loader"
+            )
+        name = preset_helpers.normalize_preset_name(model_preset, self._presets)
+        snap = self._preset_snapshot_loader(name)
+        return snap.provider, snap.model, snap.context_window_tokens
+
     async def _run_subagent(
         self,
         task_id: str,
@@ -220,6 +255,10 @@ class SubagentManager:
         origin_message_id: str | None = None,
         temperature: float | None = None,
         workspace_scope: WorkspaceScope | None = None,
+        provider_override: LLMProvider | None = None,
+        model_override: str | None = None,
+        context_window_tokens: int | None = None,
+        max_iterations: int | None = None,
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
@@ -250,16 +289,21 @@ class SubagentManager:
             )
             token = bind_workspace_scope(workspace_scope) if workspace_scope is not None else None
             try:
-                run_provider = self.run_provider or self.provider
-                run_model = self.run_model or self.model
-                runner = AgentRunner(run_provider) if self.run_provider else self.runner
+                run_provider = provider_override or self.run_provider or self.provider
+                run_model = model_override or self.run_model or self.model
+                eff_max_iterations = (
+                    max_iterations if max_iterations is not None else self.max_iterations
+                )
+                dedicated = provider_override is not None or self.run_provider is not None
+                runner = AgentRunner(run_provider) if dedicated else self.runner
                 result = await runner.run(AgentRunSpec(
                     initial_messages=messages,
                     tools=tools,
                     model=run_model,
                     temperature=temperature,
-                    max_iterations=self.max_iterations,
+                    max_iterations=eff_max_iterations,
                     max_tool_result_chars=self.max_tool_result_chars,
+                    context_window_tokens=context_window_tokens,
                     hook=_SubagentHook(task_id, status),
                     max_iterations_message="Task completed but no final response was generated.",
                     finalize_on_max_iterations=False,
