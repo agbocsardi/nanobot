@@ -80,6 +80,23 @@ class DreamConfig(Base):
         return f"every {hours}h"
 
 
+class VisionHandoffConfig(Base):
+    """Vision handoff: describe images with a vision model for text-only models.
+
+    When enabled, outgoing messages for any model preset flagged
+    ``needs_vision_handoff`` have their ``image_url`` blocks replaced with
+    text descriptions produced by ``describer_preset`` (a vision-capable
+    model, e.g. umans-flash) before the request leaves. The simplest form of
+    the pi-vision-handoff pattern: one describer call per image, cached by
+    image hash for the process lifetime.
+    """
+
+    enabled: bool = False
+    describer_preset: str = "umans-flash"  # model preset that describes the images
+    max_description_tokens: int = 1024
+    prompt: str | None = None  # override the describer system prompt
+
+
 class InlineFallbackConfig(Base):
     """One inline fallback model configuration."""
 
@@ -104,6 +121,7 @@ class ModelPresetConfig(Base):
     context_window_tokens: int = 65_536
     temperature: float = 0.1
     reasoning_effort: str | None = None
+    needs_vision_handoff: bool = False  # text-only model: describe images via the vision handoff before sending
 
     def to_generation_settings(self) -> Any:
         from nanobot.providers.base import GenerationSettings
@@ -167,6 +185,7 @@ class AgentDefaults(Base):
         serialization_alias="consolidationRatio",
     )  # Consolidation target ratio (0.5 = 50% of budget retained after compression)
     dream: DreamConfig = Field(default_factory=DreamConfig)
+    vision_handoff: VisionHandoffConfig = Field(default_factory=VisionHandoffConfig)
 
 
 class AgentsConfig(Base):

@@ -112,6 +112,7 @@ class AgentRunSpec:
     goal_active_predicate: Callable[[], bool] | None = None
     goal_continue_message: str | None = None
     finalize_on_max_iterations: bool = True
+    vision_handoff: Any = None  # nanobot.agent.vision_handoff.VisionHandoff | None
 
 
 @dataclass(slots=True)
@@ -725,6 +726,7 @@ class AgentRunner:
         if timeout_s is not None and timeout_s <= 0:
             timeout_s = None
 
+        messages = await self._maybe_vision_handoff(spec, messages)
         kwargs = self._build_request_kwargs(
             spec,
             messages,
@@ -915,8 +917,20 @@ class AgentRunner:
         spec: AgentRunSpec,
         messages: list[dict[str, Any]],
     ) -> LLMResponse:
+        messages = await self._maybe_vision_handoff(spec, messages)
         kwargs = self._build_request_kwargs(spec, messages, tools=None)
         return await self.provider.chat_with_retry(**kwargs)
+
+    async def _maybe_vision_handoff(
+        self,
+        spec: AgentRunSpec,
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Swap image blocks for text descriptions when the target model can't see."""
+        vh = spec.vision_handoff
+        if vh is None:
+            return messages
+        return await vh.transform(messages, spec.model)
 
     @staticmethod
     def _budget_exhausted_finalization_messages(

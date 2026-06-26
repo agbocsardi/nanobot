@@ -226,6 +226,7 @@ class AgentLoop:
         consolidator_run_snapshot: ProviderSnapshot | None = None,
         runtime_events: RuntimeEventBus | None = None,
         runtime_model_publisher: Callable[[str, str | None], None] | None = None,
+        vision_handoff: Any = None,
     ):
         from nanobot.config.schema import ToolsConfig
 
@@ -236,6 +237,7 @@ class AgentLoop:
         self.runtime_event_publisher = RuntimeEventPublisher(self.runtime_events)
         self.channels_config = channels_config
         self.provider = provider
+        self.vision_handoff = vision_handoff
         self._provider_snapshot_loader = provider_snapshot_loader
         self._preset_snapshot_loader = preset_snapshot_loader
         self._runtime_model_publisher = runtime_model_publisher
@@ -411,6 +413,9 @@ class AgentLoop:
             if "consolidator" in run_presets or "dream" in run_presets
             else None
         )
+        from nanobot.agent.vision_handoff import build_from_config
+
+        vision_handoff = extra.pop("vision_handoff", None) or build_from_config(config)
         return cls(
             bus=bus,
             provider=provider,
@@ -440,6 +445,7 @@ class AgentLoop:
             cron_run_snapshot=cron_run_snapshot,
             subagent_run_snapshot=subagent_run_snapshot,
             consolidator_run_snapshot=consolidator_run_snapshot,
+            vision_handoff=vision_handoff,
             **extra,
         )
 
@@ -960,6 +966,7 @@ class AgentLoop:
                     session_metadata=session_metadata,
                     message_metadata=metadata,
                 ),
+                vision_handoff=self.vision_handoff,
             ))
         finally:
             reset_workspace_scope(workspace_token)
