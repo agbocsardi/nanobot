@@ -240,6 +240,18 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         is_gateway=True,
         default_api_base="https://opencode.ai/zen/go/v1",
     ),
+    # Umans Code: open-weight coding models (umans-coder routes to Kimi K2.7-Code)
+    # OpenAI route uses max_completion_tokens and reasoning counts toward it
+    # (docs: /v1/chat/completions), and primary models reason by default.
+    ProviderSpec(
+        name="umans",
+        keywords=("umans",),
+        env_key="UMANS_API_KEY",
+        display_name="Umans",
+        backend="openai_compat",
+        default_api_base="https://api.code.umans.ai/v1",
+        supports_max_completion_tokens=True,
+    ),
 )
 
 # ---------------------------------------------------------------------------

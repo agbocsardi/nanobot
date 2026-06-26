@@ -210,6 +210,7 @@ class ProvidersConfig(Base):
     openai_codex: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # OpenAI Codex (OAuth)
     opencode_zen: ProviderConfig = Field(default_factory=ProviderConfig)  # OpenCode Zen (curated coding models)
     opencode_go: ProviderConfig = Field(default_factory=ProviderConfig)  # OpenCode Go (low-cost coding models)
+    umans: ProviderConfig = Field(default_factory=ProviderConfig)  # Umans Code (open-weight coding models)
 
     @model_validator(mode="after")
     def convert_extra_providers(self):
