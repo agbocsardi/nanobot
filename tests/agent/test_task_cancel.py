@@ -429,7 +429,7 @@ class TestSubagentCancellation:
 class TestSubagentAnnounceSessionKey:
     """Verify _announce_result uses the effective session key for mid-turn routing."""
 
-    def _make_mgr(self):
+    def _make_mgr(self, workspace=None):
         """Create a SubagentManager with mocked deps and its bus."""
         from nanobot.agent.subagent import SubagentManager
         from nanobot.bus.queue import MessageBus
@@ -439,7 +439,7 @@ class TestSubagentAnnounceSessionKey:
         provider.get_default_model.return_value = "test-model"
         mgr = SubagentManager(
             provider=provider,
-            workspace=MagicMock(),
+            workspace=workspace if workspace is not None else MagicMock(),
             bus=bus,
             max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
         )
@@ -484,11 +484,11 @@ class TestSubagentAnnounceSessionKey:
         assert msg.chat_id == "discord:333"
 
     @pytest.mark.asyncio
-    async def test_session_key_flows_through_run_subagent(self):
+    async def test_session_key_flows_through_run_subagent(self, tmp_path):
         """Verify session_key in origin propagates from _run_subagent to _announce_result."""
         from nanobot.agent.subagent import SubagentStatus
 
-        mgr, bus = self._make_mgr()
+        mgr, bus = self._make_mgr(tmp_path)
 
         async def fake_run(spec):
             return SimpleNamespace(
