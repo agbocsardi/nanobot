@@ -56,3 +56,56 @@ def test_allow_patterns_is_whitelist_only():
     result = tool._guard_command("ls /tmp", "/tmp")
     assert result is not None
     assert "allowlist" in result.lower()
+
+
+def test_guard_allow_patterns_block_non_matching_chained_segment():
+    """Every top-level shell segment must match an allow pattern."""
+    tool = ExecTool(allow_patterns=[r"\becho\s+allowlisted\b"])
+
+    result = tool._guard_command("echo allowlisted && touch /tmp/evil", "/tmp")
+    assert result is not None
+    assert "allowlist" in result.lower()
+
+
+def test_deny_patterns_search_original_command_with_quoted_hash():
+    """Deny checks must still inspect text after a quoted hash."""
+    tool = ExecTool(deny_patterns=[r"\brm\s+-rf\s+/"])
+    result = tool._guard_command('echo "#"; rm -rf /', "/tmp")
+    assert result is not None
+    assert "deny pattern filter" in result.lower()
+
+
+def test_allow_patterns_fullmatch_allows_exact_command():
+    """A full-command allow pattern can still exempt an exact denied command."""
+    tool = ExecTool(allow_patterns=[r"rm\s+-rf\s+/tmp/build"])
+    result = tool._guard_command("rm -rf /tmp/build", "/tmp")
+    assert result is None
+
+
+def test_guard_allow_patterns_allow_single_matching_segment():
+    tool = ExecTool(allow_patterns=[r"\becho\s+allowlisted\b"])
+
+    result = tool._guard_command("echo allowlisted", "/tmp")
+
+    assert result is None
+
+
+def test_guard_allow_patterns_allow_multiple_matching_segments():
+    tool = ExecTool(
+        allow_patterns=[
+            r"\becho\s+allowlisted\b",
+            r"\becho\s+also_allowed\b",
+        ]
+    )
+
+    result = tool._guard_command("echo allowlisted && echo also_allowed", "/tmp")
+
+    assert result is None
+
+
+def test_guard_allow_patterns_keep_fullmatch_style_compatibility():
+    tool = ExecTool(allow_patterns=[r"^echo\s+allowlisted$"])
+
+    result = tool._guard_command("echo allowlisted", "/tmp")
+
+    assert result is None
