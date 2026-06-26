@@ -268,6 +268,11 @@ class SubagentManager:
             status.iteration = payload.get("iteration", status.iteration)
 
         record_result = ""  # set in every terminal branch; pre-bound for cancel safety
+        # Pre-bound so the outer finally's _write_run_record can't UnboundLocalError
+        # if setup (build_tools / build_subagent_prompt / bind_workspace_scope)
+        # raises before the inner try resolves them.
+        run_provider = provider_override or self.run_provider or self.provider
+        run_model = model_override or self.run_model or self.model
         try:
             root = workspace_scope.project_path if workspace_scope is not None else self.workspace
             cfg = None
@@ -289,8 +294,6 @@ class SubagentManager:
             )
             token = bind_workspace_scope(workspace_scope) if workspace_scope is not None else None
             try:
-                run_provider = provider_override or self.run_provider or self.provider
-                run_model = model_override or self.run_model or self.model
                 eff_max_iterations = (
                     max_iterations if max_iterations is not None else self.max_iterations
                 )

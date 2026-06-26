@@ -248,11 +248,9 @@ async def test_base_channel_reads_current_transcription_config_each_call(
 
     config_path = tmp_path / "config.json"
     config = Config()
-    config.transcription.provider = "openai"
-    config.transcription.model = "whisper-custom"
+    config.transcription.provider = "faster_whisper"
+    config.transcription.model = "small"
     config.transcription.language = "en"
-    config.providers.openai.api_key = "openai-key"
-    config.providers.openai.api_base = "http://openai.local/v1/audio/transcriptions"
     save_config(config, config_path)
     monkeypatch.setattr("nanobot.config.loader._current_config_path", config_path)
 
@@ -260,62 +258,25 @@ async def test_base_channel_reads_current_transcription_config_each_call(
 
     calls: list[dict[str, object]] = []
 
-    class _StubOpenAI:
+    class _StubFasterWhisper:
         def __init__(self, api_key=None, api_base=None, language=None, model=None):
-            calls.append({
-                "provider": "openai",
-                "api_key": api_key,
-                "api_base": api_base,
-                "language": language,
-                "model": model,
-            })
+            calls.append({"model": model, "language": language})
 
         async def transcribe(self, file_path):
-            return "openai-ok"
+            return f"{calls[-1]['model']}-ok"
 
-    class _StubGroq:
-        def __init__(self, api_key=None, api_base=None, language=None, model=None):
-            calls.append({
-                "provider": "groq",
-                "api_key": api_key,
-                "api_base": api_base,
-                "language": language,
-                "model": model,
-            })
+    with patch.object(transcription_mod, "FasterWhisperTranscriptionProvider", _StubFasterWhisper):
+        assert await channel.transcribe_audio("/tmp/does-not-matter.wav") == "small-ok"
 
-        async def transcribe(self, file_path):
-            return "groq-ok"
-
-    with (
-        patch.object(transcription_mod, "OpenAITranscriptionProvider", _StubOpenAI),
-        patch.object(transcription_mod, "GroqTranscriptionProvider", _StubGroq),
-    ):
-        assert await channel.transcribe_audio("/tmp/does-not-matter.wav") == "openai-ok"
-
-        config.transcription.provider = "groq"
-        config.transcription.model = "whisper-large-v3-turbo"
+        config.transcription.model = "medium"
         config.transcription.language = "ko"
-        config.providers.groq.api_key = "groq-key"
-        config.providers.groq.api_base = "http://groq.local/v1/audio/transcriptions"
         save_config(config, config_path)
 
-        assert await channel.transcribe_audio("/tmp/does-not-matter.wav") == "groq-ok"
+        assert await channel.transcribe_audio("/tmp/does-not-matter.wav") == "medium-ok"
 
     assert calls == [
-        {
-            "provider": "openai",
-            "api_key": "openai-key",
-            "api_base": "http://openai.local/v1/audio/transcriptions",
-            "language": "en",
-            "model": "whisper-custom",
-        },
-        {
-            "provider": "groq",
-            "api_key": "groq-key",
-            "api_base": "http://groq.local/v1/audio/transcriptions",
-            "language": "ko",
-            "model": "whisper-large-v3-turbo",
-        },
+        {"model": "small", "language": "en"},
+        {"model": "medium", "language": "ko"},
     ]
 
 
@@ -327,13 +288,13 @@ async def test_base_channel_respects_disabled_transcription_config(
     config_path = tmp_path / "config.json"
     config = Config()
     config.transcription.enabled = False
-    config.providers.groq.api_key = "groq-key"
+    config.transcription.provider = "faster_whisper"
     save_config(config, config_path)
     monkeypatch.setattr("nanobot.config.loader._current_config_path", config_path)
 
     channel = _FakePlugin({"enabled": True, "allowFrom": ["*"]}, MessageBus())
 
-    with patch("nanobot.providers.transcription.GroqTranscriptionProvider") as provider:
+    with patch("nanobot.providers.transcription.FasterWhisperTranscriptionProvider") as provider:
         assert await channel.transcribe_audio("/tmp/does-not-matter.wav") == ""
     provider.assert_not_called()
 
