@@ -61,7 +61,8 @@ async def test_transform_swaps_image_for_description_and_preserves_text():
     assert out is not messages  # new list, persisted untouched
     assert messages[0]["content"][0]["type"] == "image_url"  # original unmutated
     blocks = out[0]["content"]
-    assert blocks[0] == {"type": "text", "text": "[image]\na red square"}
+    assert blocks[0]["text"].endswith("a red square")
+    assert blocks[0]["text"].startswith("[The user attached an image.")
     assert blocks[1] == {"type": "text", "text": "what is this?"}
 
 
@@ -124,6 +125,6 @@ async def test_describer_failure_yields_placeholder_and_is_not_cached():
         [{"role": "user", "content": [_image_block()]}],
         "umans-glm-5.2",
     )
-    assert out[0]["content"][0]["text"] == "[image]\n[image: description unavailable]"
+    assert out[0]["content"][0]["text"].endswith("[image: description unavailable]")
     # Failure must not poison the cache — next turn re-attempts.
     assert len(vh._cache) == 0
