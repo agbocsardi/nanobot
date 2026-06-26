@@ -213,6 +213,8 @@ class CronService:
                                 or {}
                             ),
                             isolated=j["payload"].get("isolated", True),
+                            silent=j["payload"].get("silent", False),
+                            model_preset=j["payload"].get("model_preset"),
                         ),
                         state=CronJobState(
                             next_run_at_ms=j.get("state", {}).get("nextRunAtMs"),
@@ -350,6 +352,8 @@ class CronService:
                         "originChatId": j.payload.origin_chat_id,
                         "originMetadata": j.payload.origin_metadata,
                         "isolated": j.payload.isolated,
+                        "silent": j.payload.silent,
+                        "model_preset": j.payload.model_preset,
                     },
                     "state": {
                         "nextRunAtMs": j.state.next_run_at_ms,
