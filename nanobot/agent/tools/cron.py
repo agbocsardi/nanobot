@@ -56,6 +56,14 @@ _CRON_PARAMETERS = tool_parameters_schema(
         "should stay quiet unless they find something. Default false so reminders "
         "keep pinging."
     ),
+    isolated=BooleanSchema(
+        description=
+        "true (default) = run in a dedicated background session, isolated from "
+        "the live chat: no shared context, no progress chatter, can't be "
+        "redirected by foreground replies, and only the final reply (when not "
+        "silent) is delivered to chat. false = run in-band in the chat session "
+        "(conversational/interactive jobs only)."
+    ),
     required=["action"],
     description=(
         "Action-specific parameters: add requires a non-empty message plus one schedule "
@@ -172,13 +180,14 @@ class CronTool(Tool, ContextAware):
         job_id: str | None = None,
         silent: bool = False,
         model_preset: str | None = None,
+        isolated: bool = True,
         **kwargs: Any,
     ) -> str:
         if action == "add":
             if self._in_cron_context.get():
                 return "Error: cannot schedule new jobs from within a cron job execution"
             return self._add_job(
-                name, message, every_seconds, cron_expr, tz, at, silent, model_preset
+                name, message, every_seconds, cron_expr, tz, at, silent, model_preset, isolated
             )
         elif action == "list":
             return self._list_jobs()
@@ -196,6 +205,7 @@ class CronTool(Tool, ContextAware):
         at: str | None,
         silent: bool = False,
         model_preset: str | None = None,
+        isolated: bool = True,
     ) -> str:
         if not message:
             return (
@@ -267,6 +277,7 @@ class CronTool(Tool, ContextAware):
             origin_metadata=dict(self._origin_metadata.get() or {}),
             silent=silent,
             model_preset=preset_name,
+            isolated=isolated,
         )
         return f"Created job '{job.name}' (id: {job.id})"
 

@@ -6,9 +6,11 @@ import asyncio
 import hashlib
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
 
 from nanobot.agent.tools.cron import CronTool
+from nanobot.agent.tools.message import MessageTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.cron.session_delivery import origin_delivery_context
 from nanobot.cron.session_turns import (
@@ -36,6 +38,21 @@ class BoundCronAgent(Protocol):
         ...
 
     def cron_run_snapshot_for_preset(self, name: str) -> dict[str, Any] | None:
+        ...
+
+    async def process_direct(
+        self,
+        content: str,
+        *,
+        session_key: str = "cli:direct",
+        channel: str = "cli",
+        chat_id: str = "direct",
+        on_progress: Callable[..., Awaitable[None]] | None = None,
+        ephemeral: bool = False,
+        run_provider: Any = None,
+        run_model: str | None = None,
+        run_context_window_tokens: int | None = None,
+    ) -> OutboundMessage | None:
         ...
 
     async def submit_cron_turn(self, msg: InboundMessage) -> OutboundMessage | None:
@@ -188,5 +205,121 @@ async def run_bound_cron_job(
             "response": response,
             "usage": usage_block,
         },
+    )
+    return response
+
+
+async def _async_noop(*_args: Any, **_kwargs: Any) -> None:
+    """No-op async callback for progress/stream hooks in isolated runs."""
+    return None
+
+
+async def run_isolated_cron_job(
+    job: CronJob,
+    *,
+    agent: BoundCronAgent,
+    cron: CronRunRecorder,
+    deliver: Callable[..., Awaitable[None]],
+) -> str | None:
+    """Execute a session-bound cron job in an isolated background session.
+
+    Unlike ``run_bound_cron_job`` (in-band in the chat session), this runs the
+    turn via ``process_direct`` in a per-run ephemeral session: no shared chat
+    context, no progress chatter, no mid-turn message-tool delivery, and
+    foreground replies cannot redirect it. Only the final reply is delivered
+    to the origin chat — and only when the job is not ``silent``.
+    """
+    if not job.payload.session_key:
+        raise ValueError(f"cron job {job.id} is missing payload.session_key")
+
+    prompt = render_template(
+        "agent/cron_reminder.md",
+        strip=True,
+        message=job.payload.message,
+    )
+    prompt_ref = _cron_prompt_ref(prompt)
+    run_id = f"{job.id}:{int(time.time() * 1000)}:{uuid.uuid4().hex[:8]}"
+    channel, chat_id, _ = origin_delivery_context(job)
+
+    # Per-job model preset wins over the global cron snapshot; fall back to
+    # the global snapshot (then the main model) if resolution fails.
+    snapshot = None
+    if job.payload.model_preset:
+        resolver = getattr(agent, "cron_run_snapshot_for_preset", None)
+        snapshot = resolver(job.payload.model_preset) if callable(resolver) else None
+    if snapshot is None:
+        snapshot_getter = getattr(agent, "cron_run_snapshot", None)
+        snapshot = snapshot_getter() if callable(snapshot_getter) else None
+
+    run_record_base: dict[str, Any] = {
+        "kind": "cron",
+        "job_id": job.id,
+        "job_name": job.name,
+        "session_key": job.payload.session_key,
+        "isolated": True,
+        "prompt_ref": prompt_ref,
+        "prompt_vars": {"message": job.payload.message},
+        "rendered_prompt": prompt,
+        "silent": bool(job.payload.silent),
+    }
+    cron.write_run_record(run_id, {**run_record_base, "status": "queued"})
+
+    # Fresh per-run session: no carryover between runs, nothing to persist or
+    # retain. ephemeral=True means the working history is never saved.
+    session_key = f"cron:{job.id}:{run_id}"
+
+    cron_tool = agent.tools.get("cron")
+    cron_token = None
+    if isinstance(cron_tool, CronTool):
+        cron_token = cron_tool.set_cron_context(True)
+    # Block any mid-turn message-tool delivery to the origin chat; the turn
+    # publishes nothing on its own. Final delivery is explicit below.
+    message_tool = agent.tools.get("message")
+    suppress_token = None
+    if isinstance(message_tool, MessageTool):
+        suppress_token = message_tool.set_suppress_delivery(True)
+    try:
+        resp = await agent.process_direct(
+            prompt,
+            session_key=session_key,
+            channel=channel,
+            chat_id=chat_id,
+            on_progress=_async_noop,
+            ephemeral=True,
+            run_provider=(snapshot.get("provider") if snapshot else None),
+            run_model=(snapshot.get("model") if snapshot else None),
+            run_context_window_tokens=(
+                snapshot.get("context_window_tokens") if snapshot else None
+            ),
+        )
+    except (Exception, asyncio.CancelledError) as exc:
+        error_text = str(exc) or exc.__class__.__name__
+        cron.write_run_record(
+            run_id,
+            {**run_record_base, "status": "error", "error": error_text},
+        )
+        raise
+    finally:
+        if isinstance(message_tool, MessageTool) and suppress_token is not None:
+            message_tool.reset_suppress_delivery(suppress_token)
+        if isinstance(cron_tool, CronTool) and cron_token is not None:
+            cron_tool.reset_cron_context(cron_token)
+
+    response = resp.content if resp else ""
+    if response and not job.payload.silent:
+        await deliver(
+            OutboundMessage(channel=channel, chat_id=chat_id, content=response),
+            record=True,
+        )
+
+    provider_name = _agent_provider_name(agent)
+    usage_block = build_usage_block(
+        getattr(agent, "last_usage", None),
+        provider=provider_name,
+        model=getattr(agent, "model", None),
+    )
+    cron.write_run_record(
+        run_id,
+        {**run_record_base, "status": "ok", "response": response, "usage": usage_block},
     )
     return response

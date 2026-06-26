@@ -54,6 +54,12 @@ class CronPayload:
     # for a recurring web check). Validated at add time; resolved to a provider
     # snapshot at trigger time. None = use the global cron run preset/main model.
     model_preset: str | None = None
+    # Run in a dedicated background session instead of the user's live chat
+    # session. Isolated jobs share no chat context, emit no progress chatter,
+    # can't be redirected by foreground replies, and deliver only their final
+    # reply (when not silent) to the origin chat. Default True; legacy jobs
+    # loaded without the field become isolated too.
+    isolated: bool = True
 
 
 @dataclass

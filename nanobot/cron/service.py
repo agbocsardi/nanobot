@@ -212,6 +212,7 @@ class CronService:
                                 or j["payload"].get("origin_metadata")
                                 or {}
                             ),
+                            isolated=j["payload"].get("isolated", True),
                         ),
                         state=CronJobState(
                             next_run_at_ms=j.get("state", {}).get("nextRunAtMs"),
@@ -348,6 +349,7 @@ class CronService:
                         "originChannel": j.payload.origin_channel,
                         "originChatId": j.payload.origin_chat_id,
                         "originMetadata": j.payload.origin_metadata,
+                        "isolated": j.payload.isolated,
                     },
                     "state": {
                         "nextRunAtMs": j.state.next_run_at_ms,
@@ -606,6 +608,7 @@ class CronService:
         origin_metadata: dict | None = None,
         silent: bool = False,
         model_preset: str | None = None,
+        isolated: bool = True,
     ) -> CronJob:
         """Add a new job."""
         _validate_schedule_for_add(schedule)
@@ -629,6 +632,7 @@ class CronService:
                 origin_metadata=origin_metadata or {},
                 silent=silent,
                 model_preset=model_preset,
+                isolated=isolated,
             ),
             state=CronJobState(next_run_at_ms=_compute_next_run(schedule, now)),
             created_at_ms=now,
@@ -717,6 +721,7 @@ class CronService:
         to: str | None = ...,
         delete_after_run: bool | None = None,
         silent: bool | None = None,
+        isolated: bool | None = None,
     ) -> CronJob | Literal["not_found", "protected"]:
         """Update mutable fields of an existing job. System jobs cannot be updated.
 
@@ -747,6 +752,8 @@ class CronService:
             job.delete_after_run = delete_after_run
         if silent is not None:
             job.payload.silent = silent
+        if isolated is not None:
+            job.payload.isolated = isolated
         _normalize_agent_turn_job(job)
 
         job.updated_at_ms = _now_ms()
