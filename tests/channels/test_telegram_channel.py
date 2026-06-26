@@ -736,6 +736,73 @@ async def test_send_delta_stream_end_splits_oversized_reply() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stream_end_edits_preview_to_rich_when_rich_streaming() -> None:
+    """With rich_streaming on, the streamed preview is edited into a rich message."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    channel._app.bot.do_api_request = AsyncMock()
+    channel._app.bot.edit_message_text = AsyncMock()
+    channel._stream_bufs["123"] = _StreamBuf(text="**hi**", message_id=7, last_edit=0.0)
+
+    await channel.send_delta("123", "", {"_stream_end": True})
+
+    channel._app.bot.do_api_request.assert_awaited_once()
+    assert channel._app.bot.do_api_request.call_args.args[0] == "editMessageText"
+    payload = channel._app.bot.do_api_request.call_args.kwargs["api_kwargs"]
+    assert payload["message_id"] == 7
+    assert payload["rich_message"] == {"markdown": "**hi**"}
+    channel._app.bot.edit_message_text.assert_not_called()
+    assert "123" not in channel._stream_bufs
+
+
+@pytest.mark.asyncio
+async def test_stream_end_skips_rich_edit_when_rich_streaming_disabled() -> None:
+    """With rich_streaming off, the legacy HTML edit is used (no do_api_request call)."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], rich_streaming=False),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    channel._app.bot.do_api_request = AsyncMock()
+    channel._app.bot.edit_message_text = AsyncMock()
+    channel._stream_bufs["123"] = _StreamBuf(text="**hi**", message_id=7, last_edit=0.0)
+
+    await channel.send_delta("123", "", {"_stream_end": True})
+
+    channel._app.bot.do_api_request.assert_not_called()
+    channel._app.bot.edit_message_text.assert_awaited_once()
+    assert channel._app.bot.edit_message_text.call_args.kwargs.get("parse_mode") == "HTML"
+    assert "123" not in channel._stream_bufs
+
+
+@pytest.mark.asyncio
+async def test_stream_end_rich_edit_falls_back_to_legacy_on_bad_request() -> None:
+    """When the rich edit is rejected (non-capability), fall back to the legacy HTML edit."""
+    from telegram.error import BadRequest
+
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    channel._app.bot.do_api_request = AsyncMock(
+        side_effect=BadRequest("Bad Request: message can't be edited")
+    )
+    channel._app.bot.edit_message_text = AsyncMock()
+    channel._stream_bufs["123"] = _StreamBuf(text="**hi**", message_id=7, last_edit=0.0)
+
+    await channel.send_delta("123", "", {"_stream_end": True})
+
+    channel._app.bot.do_api_request.assert_awaited_once()
+    channel._app.bot.edit_message_text.assert_awaited_once()
+    assert channel._rich_send_disabled is False
+    assert "123" not in channel._stream_bufs
+
+
+@pytest.mark.asyncio
 async def test_send_delta_stream_end_html_expansion_does_not_overflow() -> None:
     """Markdown that expands when converted to HTML is still split correctly.
 
