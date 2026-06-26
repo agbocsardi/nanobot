@@ -240,6 +240,14 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         is_gateway=True,
         default_api_base="https://opencode.ai/zen/go/v1",
     ),
+    ProviderSpec(
+        name="umans",
+        keywords=("umans",),
+        env_key="UMANS_API_KEY",
+        display_name="Umans",
+        backend="openai_compat",
+        default_api_base="https://api.code.umans.ai/v1",
+    ),
 )
 
 # ---------------------------------------------------------------------------
