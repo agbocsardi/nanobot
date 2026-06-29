@@ -586,6 +586,34 @@ class MemoryStore:
             or not self._is_internal_history_session(entry_session)
         ]
 
+    def unprocessed_session_summaries(
+        self,
+        since_cursor: int,
+        *,
+        session_key: str | None,
+        unified_session: bool = False,
+    ) -> list[str]:
+        """Return LLM summaries of unprocessed history entries for a session.
+
+        Seeds a fresh session's [Archived Context Summary] with the recent
+        sessions Dream has not yet distilled. Reuses the same session/dream
+        filtering as ``read_recent_history_for_prompt``. Entries without a
+        ``summary`` (raw-archive fallback or legacy text entries) are skipped
+        — they would bloat the block with raw transcripts. Returned in cursor
+        order (oldest first); callers reverse to prioritize recency under the
+        char cap.
+        """
+        entries = self.read_recent_history_for_prompt(
+            since_cursor=since_cursor,
+            session_key=session_key,
+            unified_session=unified_session,
+        )
+        return [
+            f'[{entry.get("timestamp") or "?"}] {summary.strip()}'
+            for entry in entries
+            if isinstance(summary := entry.get("summary"), str) and summary.strip()
+        ]
+
     def compact_history(self) -> None:
         """Drop oldest entries if the file exceeds *max_history_entries*."""
         if self.max_history_entries <= 0:
@@ -1030,16 +1058,14 @@ class Consolidator:
         """Estimate prompt size from the full unconsolidated session tail."""
         history = self._full_unconsolidated_history(session, include_timestamps=True)
         channel, chat_id = (session.key.split(":", 1) if ":" in session.key else (None, None))
-        # Include archived summary in estimation so the budget accounts for it.
-        meta = session.metadata.get("_last_summary")
-        summary = meta.get("text") if isinstance(meta, dict) else (meta if isinstance(meta, str) else None)
+        # The archived summary is read from history.jsonl inside
+        # build_system_prompt via session_key, so the probe accounts for it.
         probe_messages = self._build_messages(
             history=history,
             current_message="[token-probe]",
             channel=channel,
             chat_id=chat_id,
             sender_id=None,
-            session_summary=summary,
             session_metadata=session.metadata,
             session_key=session.key,
             unified_session=self.unified_session,
@@ -1056,15 +1082,12 @@ class Consolidator:
         """Estimate fixed/replay prompt components for consolidation logs."""
         history = self._full_unconsolidated_history(session, include_timestamps=True)
         channel, chat_id = (session.key.split(":", 1) if ":" in session.key else (None, None))
-        meta = session.metadata.get("_last_summary")
-        summary = meta.get("text") if isinstance(meta, dict) else (meta if isinstance(meta, str) else "")
         system_messages = self._build_messages(
             history=[],
             current_message="[token-probe]",
             channel=channel,
             chat_id=chat_id,
             sender_id=None,
-            session_summary=summary or None,
             session_metadata=session.metadata,
             session_key=session.key,
             unified_session=self.unified_session,
@@ -1079,12 +1102,20 @@ class Consolidator:
 
         system_tokens = sum(_safe_estimate(m) for m in system_messages)
         replay_tokens = sum(_safe_estimate(m) for m in history)
+        # Archived summaries are now folded into the system prompt (read from
+        # history.jsonl by session_key); report their standalone size for logs.
+        summaries = self.store.unprocessed_session_summaries(
+            since_cursor=self.store.get_last_dream_cursor(),
+            session_key=session.key,
+            unified_session=self.unified_session,
+        )
+        summary_text = "\n\n".join(reversed(summaries))
         summary_tokens = _safe_estimate(
-            {"role": "system", "content": f"[Archived Context Summary]\n\n{summary}"}
-        ) if summary else 0
+            {"role": "system", "content": f"[Archived Context Summary]\n\n{summary_text}"}
+        ) if summary_text else 0
         return {
             "system_tokens": system_tokens,
-            "summary_chars": len(summary or ""),
+            "summary_chars": len(summary_text),
             "summary_tokens": summary_tokens,
             "replay_tokens": replay_tokens,
             "message_count": len(history),

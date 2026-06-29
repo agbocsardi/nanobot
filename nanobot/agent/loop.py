@@ -129,7 +129,6 @@ class TurnContext:
     on_retry_wait: Callable[[str], Awaitable[None]] | None = None
 
     pending_queue: asyncio.Queue | None = None
-    pending_summary: str | None = None
 
     ephemeral: bool = False
     tools: ToolRegistry | None = None
@@ -689,7 +688,6 @@ class AgentLoop:
         msg: InboundMessage,
         session: Session,
         history: list[dict[str, Any]],
-        pending_summary: str | None,
         include_memory_recent_history: bool = True,
     ) -> list[dict[str, Any]]:
         """Build the initial message list for the LLM turn."""
@@ -701,7 +699,6 @@ class AgentLoop:
             channel=msg.channel,
             chat_id=self._runtime_chat_id(msg),
             sender_id=msg.sender_id,
-            session_summary=pending_summary,
             session_metadata=session.metadata,
             workspace=scope.project_path,
             runtime_state=self,
@@ -1325,7 +1322,6 @@ class AgentLoop:
             chat_id=chat_id,
             current_role=current_role,
             sender_id=msg.sender_id,
-            session_summary=pending,
             session_metadata=session.metadata,
             workspace=workspace_scope.project_path,
             runtime_state=self,
@@ -1557,8 +1553,7 @@ class AgentLoop:
         return self.channels_config.extract_document_text
 
     async def _state_compact(self, ctx: TurnContext) -> str:
-        ctx.session, pending = self.auto_compact.prepare_session(ctx.session, ctx.session_key)
-        ctx.pending_summary = pending
+        ctx.session, _ = self.auto_compact.prepare_session(ctx.session, ctx.session_key)
         return "ok"
 
     async def _state_command(self, ctx: TurnContext) -> str:
@@ -1619,7 +1614,6 @@ class AgentLoop:
             ctx.msg,
             ctx.session,
             ctx.history,
-            ctx.pending_summary,
             include_memory_recent_history=not ctx.ephemeral,
         )
         ctx.user_persisted_early = self._persist_user_message_early(

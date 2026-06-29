@@ -7,6 +7,8 @@ import pytest
 from nanobot.agent.context import ContextBuilder
 from nanobot.session.goal_state import GOAL_STATE_KEY
 
+from .conftest import archive_summary
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -281,16 +283,17 @@ class TestBuildSystemPrompt:
         result = builder.build_system_prompt()
         assert "Be helpful and concise." in result
 
-    def test_includes_session_summary(self, tmp_path):
+    def test_includes_archived_summaries(self, tmp_path):
         builder = _builder(tmp_path)
-        result = builder.build_system_prompt(session_summary="Previous chat about Python.")
+        archive_summary(builder, "Previous chat about Python.")
+        result = builder.build_system_prompt()
         assert "Previous chat about Python." in result
         assert "[Archived Context Summary]" in result
 
     def test_sections_separated_by_separator(self, tmp_path):
         (tmp_path / "AGENTS.md").write_text("Rules.", encoding="utf-8")
         builder = _builder(tmp_path)
-        result = builder.build_system_prompt(session_summary="Summary.")
+        result = builder.build_system_prompt()
         assert "\n\n---\n\n" in result
 
     def test_no_bootstrap_no_summary(self, tmp_path):
@@ -404,12 +407,9 @@ class TestBuildMessages:
 
 def test_archived_summary_is_capped_against_current_budget(tmp_path):
     builder = _builder(tmp_path)
-    huge = "s" * 20_000
+    archive_summary(builder, "s" * 8_000)
 
-    prompt = builder.build_system_prompt(
-        session_summary=huge,
-        input_token_budget=2_000,
-    )
+    prompt = builder.build_system_prompt(input_token_budget=2_000)
 
     summary = prompt.split("[Archived Context Summary]\n\n", 1)[1]
     assert len(summary) < 3_000
@@ -418,9 +418,12 @@ def test_archived_summary_is_capped_against_current_budget(tmp_path):
 
 def test_archived_summary_default_cap(tmp_path):
     builder = _builder(tmp_path)
-    huge = "s" * 40_000
+    # Each summary is capped at _ARCHIVE_SUMMARY_MAX_CHARS on write; stack enough
+    # to exceed the prompt-side _MAX_ARCHIVED_SUMMARY_CHARS cap.
+    for _ in range(6):
+        archive_summary(builder, "s" * 8_000)
 
-    prompt = builder.build_system_prompt(session_summary=huge)
+    prompt = builder.build_system_prompt()
 
     summary = prompt.split("[Archived Context Summary]\n\n", 1)[1]
     assert len(summary) < 33_000

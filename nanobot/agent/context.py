@@ -53,8 +53,6 @@ class ContextBuilder:
 
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
-    _MAX_RECENT_HISTORY = 20
-    _MAX_HISTORY_CHARS = 32_000  # hard cap on recent history section size
     _MAX_ARCHIVED_SUMMARY_CHARS = 32_000
     _ARCHIVED_SUMMARY_BUDGET_FRACTION = 0.25
     _RUNTIME_CONTEXT_END = "[/Runtime Context]"
@@ -69,7 +67,6 @@ class ContextBuilder:
         self,
         skill_names: list[str] | None = None,
         channel: str | None = None,
-        session_summary: str | None = None,
         workspace: Path | None = None,
         include_memory_recent_history: bool = True,
         session_key: str | None = None,
@@ -109,25 +106,22 @@ class ContextBuilder:
             parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary))
 
         if include_memory_recent_history:
-            entries = self.memory.read_recent_history_for_prompt(
+            summaries = self.memory.unprocessed_session_summaries(
                 since_cursor=self.memory.get_last_dream_cursor(),
                 session_key=session_key,
                 unified_session=unified_session,
             )
-            if entries:
-                capped = entries[-self._MAX_RECENT_HISTORY:]
-                history_text = "\n".join(
-                    f"- [{e['timestamp']}] {self.memory.history_entry_text(e)}" for e in capped
+            if summaries:
+                # Most-recent first: the just-ended session's summary is what a
+                # fresh turn most needs to recall, so it must survive the cap.
+                # ponytail: a /new background archive may not have landed for the
+                # very first post-/new turn; it appears on the turn after.
+                # Acceptable — strictly better than the prior never-injected state.
+                text = self._cap_archived_summary(
+                    "\n\n".join(reversed(summaries)),
+                    input_token_budget=input_token_budget,
                 )
-                history_text = truncate_text(history_text, self._MAX_HISTORY_CHARS)
-                parts.append("# Recent History\n\n" + history_text)
-
-        if session_summary:
-            session_summary = self._cap_archived_summary(
-                session_summary,
-                input_token_budget=input_token_budget,
-            )
-            parts.append(f"[Archived Context Summary]\n\n{session_summary}")
+                parts.append(f"[Archived Context Summary]\n\n{text}")
 
         return "\n\n---\n\n".join(parts)
 
@@ -223,7 +217,6 @@ class ContextBuilder:
         chat_id: str | None = None,
         current_role: str = "user",
         sender_id: str | None = None,
-        session_summary: str | None = None,
         session_metadata: Mapping[str, Any] | None = None,
         current_runtime_lines: Sequence[str] | None = None,
         workspace: Path | None = None,
@@ -267,7 +260,6 @@ class ContextBuilder:
                 "content": self.build_system_prompt(
                     skill_names,
                     channel=channel,
-                    session_summary=session_summary,
                     workspace=root,
                     include_memory_recent_history=include_memory_recent_history,
                     session_key=session_key,

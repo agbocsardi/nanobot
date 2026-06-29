@@ -336,7 +336,7 @@ class TestEphemeralDirect:
         messages = captured["messages"]
         system_prompt = messages[0]["content"]
         request_text = "\n".join(str(message.get("content", "")) for message in messages)
-        assert "# Recent History" not in system_prompt
+        assert "[Archived Context Summary]" not in system_prompt
         assert "entry-01" in request_text
         assert "entry-20" in request_text
         assert "entry-21" not in request_text

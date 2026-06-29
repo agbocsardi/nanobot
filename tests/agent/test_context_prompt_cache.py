@@ -10,6 +10,8 @@ from pathlib import Path
 
 from nanobot.agent.context import ContextBuilder
 
+from .conftest import archive_summary
+
 
 class _FakeDatetime(real_datetime):
     current = real_datetime(2026, 2, 24, 13, 59)
@@ -141,111 +143,97 @@ def test_runtime_context_excludes_sender_id_when_not_provided(tmp_path) -> None:
     assert "Sender ID:" not in user_content
 
 
-def test_unprocessed_history_injected_into_system_prompt(tmp_path) -> None:
-    """Entries in history.jsonl not yet consumed by Dream appear with timestamps."""
+def test_unprocessed_summaries_injected_into_system_prompt(tmp_path) -> None:
+    """Unprocessed conversation summaries appear as the Archived Context Summary."""
     workspace = _make_workspace(tmp_path)
     builder = ContextBuilder(workspace)
 
-    builder.memory.append_history("User asked about weather in Tokyo")
-    builder.memory.append_history("Agent fetched forecast via web_search")
+    archive_summary(builder, "User asked about weather in Tokyo")
+    archive_summary(builder, "Agent fetched forecast via web_search")
 
     prompt = builder.build_system_prompt()
-    assert "# Recent History" in prompt
+    assert "[Archived Context Summary]" in prompt
     assert "User asked about weather in Tokyo" in prompt
     assert "Agent fetched forecast via web_search" in prompt
-    assert re.search(r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}\]", prompt)
+    assert re.search(r"\[\d{4}-\d{2}-\d{2}", prompt)
 
 
-def test_recent_history_injection_is_session_scoped(tmp_path) -> None:
+def test_archived_summary_injection_is_session_scoped(tmp_path) -> None:
     workspace = _make_workspace(tmp_path)
     builder = ContextBuilder(workspace)
 
-    builder.memory.append_history("legacy entry without session")
-    builder.memory.append_history("telegram history", session_key="telegram:chat-1")
-    builder.memory.append_history("slack history", session_key="slack:chat-2")
+    archive_summary(builder, "telegram summary", session_key="telegram:chat-1")
+    archive_summary(builder, "slack summary", session_key="slack:chat-2")
 
     prompt = builder.build_system_prompt(session_key="telegram:chat-1")
 
-    assert "# Recent History" in prompt
-    assert "telegram history" in prompt
-    assert "slack history" not in prompt
-    assert "legacy entry without session" not in prompt
+    assert "[Archived Context Summary]" in prompt
+    assert "telegram summary" in prompt
+    assert "slack summary" not in prompt
 
 
-def test_recent_history_injection_unified_excludes_cron_internals(tmp_path) -> None:
+def test_archived_summary_unified_excludes_cron_internals(tmp_path) -> None:
     workspace = _make_workspace(tmp_path)
     builder = ContextBuilder(workspace)
 
-    builder.memory.append_history("unified user history", session_key="unified:default")
-    builder.memory.append_history("channel user history", session_key="telegram:chat-1")
-    builder.memory.append_history("cron internal history", session_key="cron:job-1")
+    archive_summary(builder, "unified user summary", session_key="unified:default")
+    archive_summary(builder, "channel user summary", session_key="telegram:chat-1")
+    archive_summary(builder, "cron internal summary", session_key="cron:job-1")
 
     prompt = builder.build_system_prompt(
         session_key="unified:default",
         unified_session=True,
     )
 
-    assert "unified user history" in prompt
-    assert "channel user history" in prompt
-    assert "cron internal history" not in prompt
+    assert "unified user summary" in prompt
+    assert "channel user summary" in prompt
+    assert "cron internal summary" not in prompt
 
 
-def test_cron_recent_history_can_see_own_history_and_unified_context(tmp_path) -> None:
+def test_cron_archived_summary_can_see_own_and_unified(tmp_path) -> None:
     workspace = _make_workspace(tmp_path)
     builder = ContextBuilder(workspace)
 
-    builder.memory.append_history("unified user history", session_key="unified:default")
-    builder.memory.append_history("own cron history", session_key="cron:job-1")
-    builder.memory.append_history("other cron history", session_key="cron:job-2")
+    archive_summary(builder, "unified user summary", session_key="unified:default")
+    archive_summary(builder, "own cron summary", session_key="cron:job-1")
+    archive_summary(builder, "other cron summary", session_key="cron:job-2")
 
     prompt = builder.build_system_prompt(
         session_key="cron:job-1",
         unified_session=True,
     )
 
-    assert "unified user history" in prompt
-    assert "own cron history" in prompt
-    assert "other cron history" not in prompt
+    assert "unified user summary" in prompt
+    assert "own cron summary" in prompt
+    assert "other cron summary" not in prompt
 
 
-def test_recent_history_capped_at_max(tmp_path) -> None:
-    """Only the most recent _MAX_RECENT_HISTORY entries are injected."""
+def test_archived_summary_truncated_at_max_chars(tmp_path) -> None:
+    """Archived Context Summary must be truncated at _MAX_ARCHIVED_SUMMARY_CHARS."""
     workspace = _make_workspace(tmp_path)
     builder = ContextBuilder(workspace)
 
-    for i in range(builder._MAX_RECENT_HISTORY + 20):
-        builder.memory.append_history(f"entry-{i}")
+    # Each summary is capped at _ARCHIVE_SUMMARY_MAX_CHARS on write; stack enough
+    # to exceed the prompt-side _MAX_ARCHIVED_SUMMARY_CHARS cap.
+    for _ in range(8):
+        archive_summary(builder, "z" * 8_000)
 
     prompt = builder.build_system_prompt()
-    assert "entry-0" not in prompt
-    assert "entry-19" not in prompt
-    assert f"entry-{builder._MAX_RECENT_HISTORY + 19}" in prompt
+    section = prompt.split("[Archived Context Summary]\n\n", 1)
+    assert len(section) == 2
+    assert len(section[1]) < builder._MAX_ARCHIVED_SUMMARY_CHARS + 200
 
 
-def test_recent_history_truncated_at_max_chars(tmp_path) -> None:
-    """Recent History section must be truncated at _MAX_HISTORY_CHARS."""
+def test_no_archived_summary_when_dream_has_processed_all(tmp_path) -> None:
+    """If Dream has consumed everything, no Archived Context Summary appears."""
     workspace = _make_workspace(tmp_path)
     builder = ContextBuilder(workspace)
 
-    big_entry = "x" * (builder._MAX_HISTORY_CHARS + 5_000)
-    builder.memory.append_history(big_entry)
-
-    prompt = builder.build_system_prompt()
-    history_section = prompt.split("# Recent History\n\n", 1)
-    assert len(history_section) == 2
-    assert len(history_section[1]) < builder._MAX_HISTORY_CHARS + 200
-
-
-def test_no_recent_history_when_dream_has_processed_all(tmp_path) -> None:
-    """If Dream has consumed everything, no Recent History section should appear."""
-    workspace = _make_workspace(tmp_path)
-    builder = ContextBuilder(workspace)
-
-    cursor = builder.memory.append_history("already processed entry")
+    cursor = archive_summary(builder, "already processed summary")
     builder.memory.set_last_dream_cursor(cursor)
 
     prompt = builder.build_system_prompt()
-    assert "# Recent History" not in prompt
+    assert "[Archived Context Summary]" not in prompt
 
 
 def test_partial_dream_processing_shows_only_remainder(tmp_path) -> None:
@@ -253,15 +241,15 @@ def test_partial_dream_processing_shows_only_remainder(tmp_path) -> None:
     workspace = _make_workspace(tmp_path)
     builder = ContextBuilder(workspace)
 
-    builder.memory.append_history("old conversation about Python")
-    c2 = builder.memory.append_history("old conversation about Rust")
-    builder.memory.append_history("recent question about Docker")
-    builder.memory.append_history("recent question about K8s")
+    archive_summary(builder, "old conversation about Python")
+    c2 = archive_summary(builder, "old conversation about Rust")
+    archive_summary(builder, "recent question about Docker")
+    archive_summary(builder, "recent question about K8s")
 
     builder.memory.set_last_dream_cursor(c2)
 
     prompt = builder.build_system_prompt()
-    assert "# Recent History" in prompt
+    assert "[Archived Context Summary]" in prompt
     assert "old conversation about Python" not in prompt
     assert "old conversation about Rust" not in prompt
     assert "recent question about Docker" in prompt

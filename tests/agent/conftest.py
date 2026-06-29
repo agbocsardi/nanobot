@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from nanobot.agent.context import ContextBuilder
 from nanobot.agent.loop import AgentLoop
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
@@ -79,10 +80,21 @@ def make_loop(
     if patch_deps:
         with patch("nanobot.agent.loop.ContextBuilder"), \
              patch("nanobot.agent.loop.SessionManager"), \
-             patch("nanobot.agent.loop.SubagentManager") as MockSubMgr:
-            MockSubMgr.return_value.cancel_by_session = AsyncMock(return_value=0)
+             patch("nanobot.agent.loop.SubagentManager") as mock_sub_mgr:
+            mock_sub_mgr.return_value.cancel_by_session = AsyncMock(return_value=0)
             return AgentLoop(**kwargs)
     return AgentLoop(**kwargs)
+
+
+def archive_summary(
+    builder: ContextBuilder, summary: str, *, session_key: str | None = None
+) -> int:
+    """Write a conversation record with a summary, mirroring Consolidator.archive()."""
+    return builder.memory.append_conversation_history(
+        [{"role": "user", "content": "x", "timestamp": "2026-01-01T00:00:00"}],
+        session_key=session_key,
+        summary=summary,
+    )
 
 
 @pytest.fixture
