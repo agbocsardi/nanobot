@@ -289,6 +289,9 @@ class MCPServerConfig(Base):
     headers: dict[str, str] = Field(default_factory=dict)  # HTTP/SSE: custom headers
     tool_timeout: int = 30  # seconds before a tool call is cancelled
     enabled_tools: list[str] = Field(default_factory=lambda: ["*"])  # Only register these tools; accepts raw MCP names or wrapped mcp_<server>_<tool> names; ["*"] = all tools; [] = no tools
+    oauth: bool = False  # HTTP/SSE: use MCP-spec OAuth 2.1 (discovery + DCR + auto-refresh) instead of a static Bearer in `headers`
+    oauth_redirect_port: int = 8765  # loopback port in the registered redirect_uri (http://localhost:<port>/callback); no server listens — you relay the callback URL manually on first auth
+    oauth_scopes: str = "openid mcp.tools offline_access"  # OAuth scopes; `offline_access` yields a refresh token so the gateway can auto-refresh
 
 
 def _lazy_default(module_path: str, class_name: str) -> Any:
