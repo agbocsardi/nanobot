@@ -547,7 +547,7 @@ async def test_connect_mcp_servers_http_clients_reject_unsafe_redirect_targets(
             return False, "loopback blocked"
         return True, ""
 
-    async def _reachable(_url: str) -> bool:
+    async def _reachable(_url: str, **_kw) -> bool:
         return True
 
     def _handler(request: httpx.Request) -> httpx.Response:

@@ -4,7 +4,6 @@ import asyncio
 import os
 import re
 import shutil
-import urllib.parse
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack, suppress
 from typing import Any, Mapping
@@ -69,30 +68,49 @@ def _is_session_terminated(exc: BaseException) -> bool:
     )
 
 
-async def _probe_http_url(url: str, timeout: float = 3.0) -> bool:
-    """Quick TCP probe to check if an HTTP MCP server is reachable.
+async def _probe_http_url(
+    url: str,
+    headers: dict[str, str] | None = None,
+    *,
+    name: str | None = None,
+    timeout: float = 3.0,
+) -> bool:
+    """Authenticated HTTP probe screening an MCP server *before* the anyio transports.
 
-    Avoids entering ``streamable_http_client`` / ``sse_client`` when the port is
-    closed — those transports use anyio task groups whose cleanup can raise
-    ``RuntimeError`` / ``ExceptionGroup`` that escape the caller's try/except
-    and crash the event loop.
+    ``streamable_http_client`` / ``sse_client`` run JSON-RPC over an anyio
+    ``TaskGroup`` whose teardown can raise ``RuntimeError`` / ``ExceptionGroup``
+    from a background task — exceptions that escape the caller's ``try/except``
+    and crash the event loop (GH #10: an expired Bearer returned 401 here and
+    took the whole gateway down). This probe runs a plain ``httpx`` POST (no
+    anyio) so a failing server is skipped cleanly via the existing
+    ``return name, None`` path, before the leaky transport is ever entered.
+
+    Returns ``False`` (and logs) when the server is unreachable or rejects the
+    request with 401/403 (auth failed). Anything else — 200/400/405/5xx — means
+    the server is alive and authed; ``initialize()`` is then allowed to proceed
+    and either succeed or fail normally.
     """
-    parsed = urllib.parse.urlparse(url)
-    host = parsed.hostname or "127.0.0.1"
-    port = parsed.port
-    if not port:
-        port = 443 if parsed.scheme == "https" else 80
+    whom = f"MCP server '{name}'" if name else "MCP server"
     try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port),
+        async with httpx.AsyncClient(
+            headers=headers,
             timeout=timeout,
-        )
-        writer.close()
-        with suppress(OSError, asyncio.TimeoutError):
-            await asyncio.wait_for(writer.wait_closed(), timeout=0.2)
-        return True
-    except (OSError, asyncio.TimeoutError):
+            follow_redirects=False,
+        ) as client:
+            resp = await client.post(
+                url,
+                content=b"{}",
+                headers={"Content-Type": "application/json"},
+            )
+    except httpx.HTTPError as e:
+        logger.warning("{}: {} unreachable ({}), skipping", whom, url, type(e).__name__)
         return False
+    if resp.status_code in (401, 403):
+        logger.warning(
+            "{}: {} returned {} — auth failed, skipping", whom, url, resp.status_code
+        )
+        return False
+    return True
 
 
 async def _validate_mcp_request_url(request: httpx.Request) -> None:
@@ -633,8 +651,7 @@ async def connect_mcp_servers(
                 )
                 read, write = await server_stack.enter_async_context(stdio_client(params))
             elif transport_type == "sse":
-                if not await _probe_http_url(cfg.url):
-                    logger.warning("MCP server '{}': {} unreachable, skipping", name, cfg.url)
+                if not await _probe_http_url(cfg.url, headers=cfg.headers, name=name):
                     await server_stack.aclose()
                     return name, None
 
@@ -660,8 +677,7 @@ async def connect_mcp_servers(
                     sse_client(cfg.url, httpx_client_factory=httpx_client_factory)
                 )
             elif transport_type == "streamableHttp":
-                if not await _probe_http_url(cfg.url):
-                    logger.warning("MCP server '{}': {} unreachable, skipping", name, cfg.url)
+                if not await _probe_http_url(cfg.url, headers=cfg.headers, name=name):
                     await server_stack.aclose()
                     return name, None
 

@@ -1,4 +1,4 @@
-"""Tests for MCP HTTP probe guard (prevents event-loop crash on unreachable servers)."""
+"""Tests for the MCP HTTP probe guard — screens unreachable / auth-failing servers before entering the anyio transports (prevents the event-loop crash from GH #10)."""
 from __future__ import annotations
 
 import asyncio
@@ -13,17 +13,65 @@ from nanobot.agent.tools.registry import ToolRegistry
 # _probe_http_url unit tests
 # ---------------------------------------------------------------------------
 
-@pytest.mark.asyncio
-async def test_probe_returns_true_for_open_port(tmp_path):
-    """Start a trivial TCP server, probe should return True."""
-    async def _close_connection(_reader, writer):
+async def _http_server(status: int, reason: str = "OK"):
+    """Start a tiny HTTP/1.1 server on a random port that replies with ``status``
+    to any request. Returns ``(server, port)``."""
+    async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = await reader.read(4096)
+            if not chunk:
+                break
+            buf += chunk
+        head, _, body = buf.partition(b"\r\n\r\n")
+        content_length = 0
+        for line in head.split(b"\r\n"):
+            if line.lower().startswith(b"content-length:"):
+                content_length = int(line.split(b":", 1)[1].strip())
+        if len(body) < content_length:
+            try:
+                await reader.readexactly(content_length - len(body))
+            except asyncio.IncompleteReadError:
+                pass
+        writer.write(
+            f"HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".encode()
+        )
+        await writer.drain()
         writer.close()
         await writer.wait_closed()
 
-    server = await asyncio.start_server(_close_connection, "127.0.0.1", 0)
-    port = server.sockets[0].getsockname()[1]
+    server = await asyncio.start_server(handler, "127.0.0.1", 0)
+    return server, server.sockets[0].getsockname()[1]
+
+
+@pytest.mark.asyncio
+async def test_probe_returns_true_when_server_responds_ok():
+    """A live server returning 2xx means reachable + authed → proceed."""
+    server, port = await _http_server(200)
     try:
         assert await _probe_http_url(f"http://127.0.0.1:{port}/mcp") is True
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_probe_returns_false_on_401():
+    """401 = auth failed → skip. This is the GH #10 crash root cause."""
+    server, port = await _http_server(401, "Unauthorized")
+    try:
+        assert await _probe_http_url(f"http://127.0.0.1:{port}/mcp") is False
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_probe_returns_false_on_403():
+    """403 = auth failed → skip."""
+    server, port = await _http_server(403, "Forbidden")
+    try:
+        assert await _probe_http_url(f"http://127.0.0.1:{port}/mcp") is False
     finally:
         server.close()
         await server.wait_closed()
@@ -61,7 +109,7 @@ def _make_http_cfg(url: str, transport: str = "streamableHttp"):
 @pytest.mark.asyncio
 async def test_connect_skips_unreachable_streamable_http():
     """Unreachable streamableHttp server should be skipped with a warning, no crash."""
-    async def _unreachable(_url: str) -> bool:
+    async def _unreachable(_url: str, **_kw) -> bool:
         return False
 
     registry = ToolRegistry()
@@ -75,7 +123,7 @@ async def test_connect_skips_unreachable_streamable_http():
 @pytest.mark.asyncio
 async def test_connect_skips_unreachable_sse():
     """Unreachable SSE server should be skipped with a warning, no crash."""
-    async def _unreachable(_url: str) -> bool:
+    async def _unreachable(_url: str, **_kw) -> bool:
         return False
 
     registry = ToolRegistry()
