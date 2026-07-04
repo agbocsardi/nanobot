@@ -103,6 +103,7 @@ def _make_http_cfg(url: str, transport: str = "streamableHttp"):
     cfg.headers = None
     cfg.tool_timeout = 30
     cfg.enabled_tools = ["*"]
+    cfg.oauth = False
     return cfg
 
 

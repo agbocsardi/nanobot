@@ -637,6 +637,30 @@ async def connect_mcp_servers(
                     await server_stack.aclose()
                     return name, None
 
+            # OAuth-enabled servers: the OAuthClientProvider intercepts 401 inside
+            # httpx (discovery + refresh) so it never reaches the anyio TaskGroup —
+            # no probe, no static Bearer. Skip if not yet authorized.
+            oauth_provider = None
+            if cfg.oauth and transport_type in {"sse", "streamableHttp"}:
+                from nanobot.agent.tools.mcp_oauth import build_oauth_provider, has_stored_token
+
+                if not await has_stored_token(name):
+                    logger.warning(
+                        "MCP server '{}': OAuth enabled but no stored token — "
+                        "run `nanobot mcp auth {}` to authorize",
+                        name,
+                        name,
+                    )
+                    await server_stack.aclose()
+                    return name, None
+                oauth_provider = build_oauth_provider(
+                    cfg.url,
+                    name,
+                    interactive=False,
+                    redirect_port=cfg.oauth_redirect_port,
+                    scopes=cfg.oauth_scopes,
+                )
+
             if transport_type == "stdio":
                 command, args, env = _normalize_windows_stdio_command(
                     cfg.command,
@@ -651,7 +675,9 @@ async def connect_mcp_servers(
                 )
                 read, write = await server_stack.enter_async_context(stdio_client(params))
             elif transport_type == "sse":
-                if not await _probe_http_url(cfg.url, headers=cfg.headers, name=name):
+                if not oauth_provider and not await _probe_http_url(
+                    cfg.url, headers=cfg.headers, name=name
+                ):
                     await server_stack.aclose()
                     return name, None
 
@@ -670,14 +696,16 @@ async def connect_mcp_servers(
                         event_hooks={"request": [_validate_mcp_request_url]},
                         follow_redirects=True,
                         timeout=timeout,
-                        auth=auth,
+                        auth=oauth_provider or auth,
                     )
 
                 read, write = await server_stack.enter_async_context(
                     sse_client(cfg.url, httpx_client_factory=httpx_client_factory)
                 )
             elif transport_type == "streamableHttp":
-                if not await _probe_http_url(cfg.url, headers=cfg.headers, name=name):
+                if not oauth_provider and not await _probe_http_url(
+                    cfg.url, headers=cfg.headers, name=name
+                ):
                     await server_stack.aclose()
                     return name, None
 
@@ -687,6 +715,7 @@ async def connect_mcp_servers(
                         event_hooks={"request": [_validate_mcp_request_url]},
                         follow_redirects=True,
                         timeout=None,
+                        auth=oauth_provider,
                     )
                 )
                 read, write, _ = await server_stack.enter_async_context(

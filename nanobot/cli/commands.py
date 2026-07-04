@@ -1509,6 +1509,74 @@ provider_app = typer.Typer(help="Manage providers")
 app.add_typer(provider_app, name="provider")
 
 
+# ============================================================================
+# MCP OAuth
+# ============================================================================
+
+mcp_app = typer.Typer(help="Manage MCP servers")
+app.add_typer(mcp_app, name="mcp")
+
+
+@mcp_app.command("auth")
+def mcp_auth(
+    server: str = typer.Argument(..., help="MCP server name (as configured in tools.mcpServers)"),
+):
+    """Authorize an OAuth-enabled MCP server (one-time, interactive).
+
+    Prints the authorize URL; open it on your phone, approve, then paste the
+    redirect URL you end up on back into the prompt. Tokens are stored and the
+    gateway refreshes them automatically thereafter. On a headless server, run
+    this in your SSH session and relay the callback URL by hand.
+    """
+    import asyncio
+
+    from nanobot.config.loader import load_config, resolve_config_env_vars
+
+    config = resolve_config_env_vars(load_config())
+    cfg = config.tools.mcp_servers.get(server)
+    if cfg is None:
+        console.print(f"[red]No MCP server named '{server}' in config[/red]")
+        raise typer.Exit(1)
+    if not cfg.oauth:
+        console.print(f"[red]MCP server '{server}' is not OAuth-enabled (set \"oauth: true\" in config)[/red]")
+        raise typer.Exit(1)
+    if not cfg.url:
+        console.print(f"[red]MCP server '{server}' has no URL (OAuth needs an HTTP/SSE server)[/red]")
+        raise typer.Exit(1)
+
+    import httpx
+
+    from nanobot.agent.tools.mcp_oauth import build_oauth_provider, has_stored_token
+
+    async def _run() -> bool:
+        provider = build_oauth_provider(
+            cfg.url,
+            server,
+            interactive=True,
+            redirect_port=cfg.oauth_redirect_port,
+            scopes=cfg.oauth_scopes,
+        )
+        # Any request triggers discovery + DCR + the interactive authorize flow;
+        # the provider stores tokens before retrying.
+        async with httpx.AsyncClient(auth=provider, follow_redirects=True, timeout=30.0) as client:
+            try:
+                await client.get(cfg.url)
+            except Exception as e:  # noqa: BLE001 - surface the OAuth-flow failure, not the final GET
+                console.print(f"[yellow]Final request failed ({e!r}); checking stored token...[/yellow]")
+        return await has_stored_token(server)
+
+    console.print(f"{__logo__} MCP OAuth — {server}\n")
+    ok = asyncio.run(_run())
+    if ok:
+        console.print(
+            f"[green]✓ Authorized MCP server '{server}'[/green]  "
+            "tokens stored; the gateway will auto-refresh."
+        )
+    else:
+        console.print("[red]✗ Authorization did not store a token[/red]")
+        raise typer.Exit(1)
+
+
 _LOGIN_HANDLERS: dict[str, Callable[[], None]] = {}
 _LOGOUT_HANDLERS: dict[str, Callable[[], None]] = {}
 
