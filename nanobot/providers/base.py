@@ -14,7 +14,7 @@ from typing import Any
 import json_repair
 from loguru import logger
 
-from nanobot.utils.helpers import image_placeholder_text
+from nanobot.utils.helpers import image_placeholder_text, sanitize_surrogates_deep
 
 
 @dataclass
@@ -233,7 +233,15 @@ class LLMProvider(ABC):
 
     @staticmethod
     def _sanitize_empty_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Sanitize message content: fix empty blocks, strip internal _meta fields."""
+        """Sanitize message content: fix empty blocks, strip internal _meta fields.
+
+        Also strips unpaired UTF-16 surrogate code points from every string leaf
+        as a defense-in-depth pass before the payload leaves the process. Lone
+        surrogates (e.g. leaking from a Windows console, prompt_toolkit history,
+        or a truncated JSON round-trip) otherwise cause ``UnicodeEncodeError:
+        'utf-8' codec can't encode characters ... surrogates not allowed`` when
+        the HTTP client serializes the request body.
+        """
         result: list[dict[str, Any]] = []
         for msg in messages:
             content = msg.get("content")
@@ -278,7 +286,10 @@ class LLMProvider(ABC):
                 continue
 
             result.append(msg)
-        return result
+        # Defense-in-depth: scrub lone UTF-16 surrogates from every string leaf.
+        # This is idempotent and no-op when messages are already clean.
+        sanitized = sanitize_surrogates_deep(result)
+        return sanitized if isinstance(sanitized, list) else result
 
     @staticmethod
     def _tool_name(tool: dict[str, Any]) -> str:
