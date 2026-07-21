@@ -2,8 +2,10 @@
 
 import base64
 import json
+import os
 import re
 import shutil
+import stat
 import time
 import uuid
 from contextlib import suppress
@@ -428,8 +430,16 @@ def _cleanup_tool_result_buckets(root: Path, current_bucket: Path) -> None:
 
 def _write_text_atomic(path: Path, content: str) -> None:
     tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    existing_mode: int | None = None
+    with suppress(OSError):
+        existing_mode = stat.S_IMODE(path.stat().st_mode)
     try:
-        tmp.write_text(content, encoding="utf-8")
+        with open(tmp, "w", encoding="utf-8") as f:
+            if existing_mode is not None:
+                os.chmod(tmp, existing_mode)
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
         tmp.replace(path)
     finally:
         if tmp.exists():
