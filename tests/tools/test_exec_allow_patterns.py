@@ -15,7 +15,7 @@ def test_deny_patterns_block_rm_rf():
 
 def test_allow_patterns_bypass_deny():
     """allow_patterns take priority: matching command skips deny check."""
-    tool = ExecTool(allow_patterns=[r"rm\s+-rf\s+/tmp/"])
+    tool = ExecTool(allow_patterns=[r"rm\s+-rf\s+/tmp/.*"])
     result = tool._guard_command("rm -rf /tmp/build", "/tmp")
     assert result is None
 
@@ -49,7 +49,7 @@ def test_allow_patterns_bypass_extra_deny():
 
 def test_allow_patterns_is_whitelist_only():
     """When allow_patterns is set, non-matching non-denied commands are blocked."""
-    tool = ExecTool(allow_patterns=[r"\becho\b"])
+    tool = ExecTool(allow_patterns=[r"echo\s+hello"])
     # echo matches allow → ok
     assert tool._guard_command("echo hello", "/tmp") is None
     # ls does not match allow and is not in deny → blocked by allowlist
