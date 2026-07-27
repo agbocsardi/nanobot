@@ -10,7 +10,6 @@ from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
 
 from nanobot.agent.tools.cron import CronTool
-from nanobot.agent.tools.message import MessageTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.cron.session_delivery import origin_delivery_context
 from nanobot.cron.session_turns import (
@@ -225,9 +224,10 @@ async def run_isolated_cron_job(
 
     Unlike ``run_bound_cron_job`` (in-band in the chat session), this runs the
     turn via ``process_direct`` in a per-run ephemeral session: no shared chat
-    context, no progress chatter, no mid-turn message-tool delivery, and
-    foreground replies cannot redirect it. Only the final reply is delivered
-    to the origin chat — and only when the job is not ``silent``.
+    context, no progress chatter, and foreground replies cannot redirect it.
+    The ``message()`` tool remains available for targeted pings during the
+    turn. Only the final auto-reply is delivered to the origin chat — and only
+    when the job is not ``silent``.
     """
     if not job.payload.session_key:
         raise ValueError(f"cron job {job.id} is missing payload.session_key")
@@ -272,12 +272,6 @@ async def run_isolated_cron_job(
     cron_token = None
     if isinstance(cron_tool, CronTool):
         cron_token = cron_tool.set_cron_context(True)
-    # Block any mid-turn message-tool delivery to the origin chat; the turn
-    # publishes nothing on its own. Final delivery is explicit below.
-    message_tool = agent.tools.get("message")
-    suppress_token = None
-    if isinstance(message_tool, MessageTool):
-        suppress_token = message_tool.set_suppress_delivery(True)
     try:
         resp = await agent.process_direct(
             prompt,
@@ -300,8 +294,6 @@ async def run_isolated_cron_job(
         )
         raise
     finally:
-        if isinstance(message_tool, MessageTool) and suppress_token is not None:
-            message_tool.reset_suppress_delivery(suppress_token)
         if isinstance(cron_tool, CronTool) and cron_token is not None:
             cron_tool.reset_cron_context(cron_token)
 

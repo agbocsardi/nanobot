@@ -2,7 +2,7 @@
 
 Verifies run_isolated_cron_job:
 - executes via process_direct (not submit_cron_turn), in a fresh per-run session,
-- suppresses message-tool delivery and toggles the cron context for the turn,
+- toggles the cron context for the turn (and restores it on error),
 - delivers the final reply to the origin chat only when the job is not silent,
 - writes queued -> ok run records, and an error record when the turn raises.
 """
@@ -15,7 +15,6 @@ from typing import Any
 import pytest
 
 from nanobot.agent.tools.cron import CronTool
-from nanobot.agent.tools.message import MessageTool
 from nanobot.bus.events import OutboundMessage
 from nanobot.cron.bound_runner import run_isolated_cron_job
 from nanobot.cron.types import CronJob, CronPayload, CronSchedule
@@ -43,38 +42,13 @@ def _spied_cron_tool() -> CronTool:
     return tool
 
 
-def _spied_message_tool() -> MessageTool:
-    tool = MessageTool(workspace=".", restrict_to_workspace=False)
-    set_calls: list[bool] = []
-    resets: list[bool] = []
-    orig_set = tool.set_suppress_delivery
-    orig_reset = tool.reset_suppress_delivery
-
-    def set_suppress(active: bool) -> bool:
-        set_calls.append(active)
-        return orig_set(active)
-
-    def reset_suppress(token: bool) -> None:
-        resets.append(token)
-        orig_reset(token)
-
-    tool.set_suppress_delivery = set_suppress  # type: ignore[method-assign]
-    tool.reset_suppress_delivery = reset_suppress  # type: ignore[method-assign]
-    tool._spy_set_calls = set_calls  # type: ignore[attr-defined]
-    tool._spy_resets = resets  # type: ignore[attr-defined]
-    return tool
-
-
 class _FakeTools:
     def __init__(self) -> None:
         self.cron = _spied_cron_tool()
-        self.message = _spied_message_tool()
 
     def get(self, name: str) -> Any:
         if name == "cron":
             return self.cron
-        if name == "message":
-            return self.message
         return None
 
 
@@ -158,9 +132,6 @@ async def test_isolated_runs_via_process_direct_and_delivers_when_not_silent() -
     assert call["ephemeral"] is True
     assert call["channel"] == "telegram"
     assert call["chat_id"] == "42"
-    # message-tool delivery suppressed around the turn, then restored
-    assert agent.tools.message._spy_set_calls == [True]
-    assert len(agent.tools.message._spy_resets) == 1
     # cron context toggled for the turn, then restored
     assert agent.tools.cron._spy_tokens == [True]
     assert len(agent.tools.cron._spy_resets) == 1
@@ -188,9 +159,6 @@ async def test_isolated_silent_job_does_not_deliver() -> None:
     assert delivered == []  # silent swallows the final reply
     assert recorder.records[-1][1]["silent"] is True
     assert recorder.records[-1][1]["status"] == "ok"
-    # suppression still toggled even when silent
-    assert agent.tools.message._spy_set_calls == [True]
-    assert len(agent.tools.message._spy_resets) == 1
 
 
 @pytest.mark.asyncio
@@ -207,7 +175,6 @@ async def test_isolated_records_error_and_reraises_when_turn_raises() -> None:
     assert statuses == ["queued", "error"]
     assert recorder.records[-1][1]["error"] == "boom"
     # tokens restored despite the exception
-    assert len(agent.tools.message._spy_resets) == 1
     assert len(agent.tools.cron._spy_resets) == 1
 
 
