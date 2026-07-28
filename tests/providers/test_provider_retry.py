@@ -595,17 +595,19 @@ async def test_chat_with_retry_prefers_structured_retry_after(monkeypatch) -> No
 
 
 @pytest.mark.asyncio
-async def test_persistent_retry_aborts_after_ten_identical_transient_errors(monkeypatch) -> None:
+async def test_persistent_retry_aborts_after_identical_transient_error_limit(monkeypatch) -> None:
     provider = ScriptedProvider([
-        *[LLMResponse(content="429 rate limit", finish_reason="error") for _ in range(10)],
+        *[LLMResponse(content="429 rate limit", finish_reason="error") for _ in range(15)],
         LLMResponse(content="ok"),
     ])
     delays: list[float] = []
 
-    async def _fake_sleep(delay: float) -> None:
+    # Patch the heartbeat sleeper so we record the delay decision directly;
+    # _sleep_with_heartbeat otherwise chunks >30s sleeps into 30s pieces.
+    async def _record_sleep(delay: float, **_kw: object) -> None:
         delays.append(delay)
 
-    monkeypatch.setattr("nanobot.providers.base.asyncio.sleep", _fake_sleep)
+    provider._sleep_with_heartbeat = _record_sleep  # type: ignore[method-assign]
 
     response = await provider.chat_with_retry(
         messages=[{"role": "user", "content": "hello"}],
@@ -614,14 +616,16 @@ async def test_persistent_retry_aborts_after_ten_identical_transient_errors(monk
 
     assert response.finish_reason == "error"
     assert response.content == "429 rate limit"
-    assert provider.calls == 10
-    assert delays == [1, 2, 4, 4, 4, 4, 4, 4, 4]
+    assert provider.calls == 15
+    # Escalating backoff (2s base, capped at 60s); the 15th error hits the
+    # identical-error limit and returns without sleeping.
+    assert delays == [2, 4, 8, 16, 32, 60, 60, 60, 60, 60, 60, 60, 60, 60]
 
 
 @pytest.mark.asyncio
 async def test_persistent_retry_emits_terminal_progress_on_identical_error_limit(monkeypatch) -> None:
     provider = ScriptedProvider([
-        *[LLMResponse(content="429 rate limit", finish_reason="error") for _ in range(10)],
+        *[LLMResponse(content="429 rate limit", finish_reason="error") for _ in range(15)],
     ])
     progress: list[str] = []
 
@@ -640,7 +644,7 @@ async def test_persistent_retry_emits_terminal_progress_on_identical_error_limit
     )
 
     assert response.finish_reason == "error"
-    assert progress[-1] == "Persistent retry stopped after 10 identical errors."
+    assert progress[-1] == "Persistent retry stopped after 15 identical errors."
 
 
 @pytest.mark.asyncio

@@ -157,8 +157,9 @@ class LLMProvider(ABC):
     supports_progress_deltas = False
 
     _CHAT_RETRY_DELAYS = (1, 2, 4)
+    _PERSISTENT_BASE_DELAY = 2  # exponential backoff base for persistent mode (seconds)
     _PERSISTENT_MAX_DELAY = 60
-    _PERSISTENT_IDENTICAL_ERROR_LIMIT = 10
+    _PERSISTENT_IDENTICAL_ERROR_LIMIT = 15
     _RETRY_HEARTBEAT_CHUNK = 30
     _TRANSIENT_ERROR_MARKERS = (
         "429",
@@ -919,10 +920,21 @@ class LLMProvider(ABC):
                     )
                 break
 
-            base_delay = delays[min(attempt - 1, len(delays) - 1)]
-            delay = self._extract_retry_after_from_response(response) or base_delay
+            retry_after = self._extract_retry_after_from_response(response)
             if persistent:
-                delay = min(delay, self._PERSISTENT_MAX_DELAY)
+                # Escalating backoff so a tiny server `retry-after` (e.g. Umans'
+                # 2s on 529) doesn't pin every retry to the same short gap and
+                # burn the identical-error budget before the upstream recovers.
+                # Honor a server delay only when it asks for MORE than our climb.
+                # ponytail: cap at _PERSISTENT_MAX_DELAY; raise base if finer control needed.
+                escalating = min(
+                    self._PERSISTENT_BASE_DELAY * 2 ** (attempt - 1),
+                    self._PERSISTENT_MAX_DELAY,
+                )
+                delay = min(max(escalating, retry_after or 0), self._PERSISTENT_MAX_DELAY)
+            else:
+                base_delay = delays[min(attempt - 1, len(delays) - 1)]
+                delay = retry_after or base_delay
 
             logger.warning(
                 "LLM transient error (attempt {}{}), retrying in {}s: {}",
