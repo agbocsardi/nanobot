@@ -437,8 +437,14 @@ class DiscordHistoryTool(Tool):
         for tc in guild.text_channels:
             try_add(tc)
 
+        # discord.py exposes forums through Guild.channels; Guild.forum_channels
+        # does not exist (including in 2.7.x).
+        forums = [
+            source for source in guild.channels if isinstance(source, discord.ForumChannel)
+        ]
+
         if include_threads:
-            for forum in guild.forum_channels:
+            for forum in forums:
                 if not channel.is_channel_allowed(forum) or not self._can_read(forum, me):
                     continue
                 for thread in forum.threads:
@@ -466,7 +472,7 @@ class DiscordHistoryTool(Tool):
                         try_add(thread)
                 except Exception as e:
                     warnings.append(f"archived_threads failed in {tc.name}: {e}")
-            for forum in guild.forum_channels:
+            for forum in forums:
                 if not channel.is_channel_allowed(forum) or not self._can_read(forum, me):
                     continue
                 try:

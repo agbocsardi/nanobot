@@ -134,7 +134,7 @@ def _make_guild(
     g.id = gid
     g.name = name
     g.text_channels = list(text_channels)
-    g.forum_channels = list(forums)
+    g.channels = [*text_channels, *forums]
     g.me = me or _make_member()
     g.active_threads = AsyncMock(return_value=list(active_threads))
     return g
@@ -145,7 +145,9 @@ def _make_client(guilds):
     for g in guilds:
         for tc in g.text_channels:
             registry[tc.id] = tc
-        for f in g.forum_channels:
+        for f in g.channels:
+            if not isinstance(f, discord.ForumChannel):
+                continue
             registry[f.id] = f
             for t in f.threads:
                 registry[t.id] = t
@@ -492,6 +494,23 @@ async def test_text_channel_direct_fetch():
     assert len(data["messages"]) == 1
     assert data["messages"][0]["content"] == "hello"
     assert data["messages"][0]["channel"] == "general"
+
+
+@pytest.mark.asyncio
+async def test_guild_discovery_finds_forums_via_channels():
+    forum = _make_forum(50, "dev", guild=None)
+    post = _make_thread(500, "intro", parent=forum)
+    forum.threads = [post]
+    guild = _make_guild(forums=[forum])
+    forum.guild = guild
+    post.history = _history_factory([_make_msg(7, "post msg", channel=post)])
+    tool, _ = _make_setup(guilds=[guild])
+
+    assert not hasattr(guild, "forum_channels")
+    data = json.loads(await tool.execute())
+
+    assert len(data["messages"]) == 1
+    assert data["messages"][0]["thread_id"] == "500"
 
 
 @pytest.mark.asyncio
