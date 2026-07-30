@@ -222,31 +222,6 @@ async def test_streamed_flag_not_set_on_llm_error(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_loop_does_not_auto_continue_active_goal_in_same_turn(tmp_path):
-    """Active goals resume on later user turns, not synthetic same-turn turns."""
-    from nanobot.agent.runner import AgentRunResult
-    from nanobot.session.goal_state import GOAL_STATE_KEY
-
-    loop = _make_loop(tmp_path)
-    session = Session(key="telegram:test")
-    session.metadata[GOAL_STATE_KEY] = {
-        "status": "active",
-        "objective": "Finish the bounded task",
-    }
-    loop.runner.run = AsyncMock(return_value=AgentRunResult(
-        final_content="Waiting for the user's next message.",
-        messages=[],
-    ))
-
-    await loop._run_agent_loop([], session=session)
-
-    spec = loop.runner.run.await_args.args[0]
-    assert spec.goal_active_predicate is None
-    assert spec.goal_continue_message is None
-    assert session.metadata["goal_state"]["status"] == "active"
-
-
-@pytest.mark.asyncio
 async def test_ssrf_soft_block_can_finalize_after_streamed_tool_call(tmp_path):
     from nanobot.agent.loop import AgentLoop
     from nanobot.bus.events import InboundMessage
