@@ -226,6 +226,7 @@ class AgentLoop:
         runtime_events: RuntimeEventBus | None = None,
         runtime_model_publisher: Callable[[str, str | None], None] | None = None,
         vision_handoff: Any = None,
+        discord_runtime_handle: Any | None = None,
     ):
         from nanobot.config.schema import ToolsConfig
 
@@ -237,6 +238,7 @@ class AgentLoop:
         self.channels_config = channels_config
         self.provider = provider
         self.vision_handoff = vision_handoff
+        self._discord_runtime_handle = discord_runtime_handle
         self._provider_snapshot_loader = provider_snapshot_loader
         self._preset_snapshot_loader = preset_snapshot_loader
         self._runtime_model_publisher = runtime_model_publisher
@@ -548,6 +550,7 @@ class AgentLoop:
             timezone=self.context.timezone or "UTC",
             workspace_sandbox=self.workspace_scopes.sandbox_status,
             runtime_events=self.runtime_events,
+            discord_runtime_handle=self._discord_runtime_handle,
         )
         loader = ToolLoader()
         registered = loader.load(ctx, self.tools)

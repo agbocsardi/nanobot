@@ -59,3 +59,8 @@ class ToolContext:
     timezone: str = "UTC"
     workspace_sandbox: Any | None = None
     runtime_events: Any | None = None
+    # Late-bound Discord runtime handle; created by the gateway before
+    # AgentLoop construction and bound to the live DiscordChannel after
+    # ChannelManager starts. ``DiscordHistoryTool`` resolves the connected
+    # client through it at execution time. None outside the gateway.
+    discord_runtime_handle: Any | None = None
