@@ -391,6 +391,29 @@ class DiscordChannel(BaseChannel):
     def _forget_channel(self, channel_or_id: Any) -> None:
         self._known_channels.pop(self._channel_key(channel_or_id), None)
 
+    @property
+    def client(self) -> Any | None:
+        """Read-only access to the connected discord.py client, or None.
+
+        Tools and runtime plumbing resolve the live client through this
+        accessor at execution time (after ``start`` has connected) rather
+        than reaching into private ``_client`` state.
+        """
+        return self._client
+
+    def is_channel_allowed(self, channel: Any) -> bool:
+        """Return True if *channel* (or its parent) satisfies allow_channels.
+
+        Reuses the existing channel-key/parent-key allowlist semantics so
+        history access never broadens Discord configuration. When
+        ``allow_channels`` is empty, the bot's effective Discord
+        permissions are the only gate.
+        """
+        allow = self.config.allow_channels
+        if not allow:
+            return True
+        return not self._channel_allow_keys(channel).isdisjoint(allow)
+
     async def start(self) -> None:
         """Start the Discord client."""
         if not DISCORD_AVAILABLE:

@@ -700,6 +700,19 @@ def _run_gateway(
     cron_store_path = config.workspace_path / "cron" / "jobs.json"
     cron = CronService(cron_store_path)
 
+    # Late-bound Discord runtime handle: created now so DiscordHistoryTool can
+    # register against it during AgentLoop construction, then bound to the live
+    # DiscordChannel after ChannelManager starts (see below).
+    from nanobot.agent.tools.discord_history import DiscordRuntimeHandle
+
+    discord_section = getattr(config.channels, "discord", None)
+    discord_enabled = bool(
+        discord_section.get("enabled", False)
+        if isinstance(discord_section, dict)
+        else getattr(discord_section, "enabled", False)
+    )
+    discord_runtime = DiscordRuntimeHandle() if discord_enabled else None
+
     # Create agent with cron service
     agent = AgentLoop.from_config(
         config, bus,
@@ -712,6 +725,7 @@ def _run_gateway(
         provider_snapshot_loader=load_provider_snapshot,
         runtime_events=runtime_events,
         provider_signature=provider_snapshot.signature,
+        discord_runtime_handle=discord_runtime,
     )
 
     from nanobot.bus.events import OutboundMessage
@@ -935,6 +949,18 @@ def _run_gateway(
         session_manager=session_manager,
         cron_service=cron,
     )
+
+    # Bind the Discord runtime handle to the live channel now that it exists.
+    # The handle stays None-resolving until DiscordChannel.start() connects.
+    if discord_runtime is not None:
+        discord_channel = channels.get_channel("discord")
+        if discord_channel is not None:
+            discord_runtime.bind(discord_channel)
+        else:
+            logger.warning(
+                "Discord history tool enabled but discord channel is not "
+                "available; tool will report not-ready until Discord starts."
+            )
 
     def _pick_heartbeat_target() -> tuple[str, str]:
         """Pick a routable channel/chat target for heartbeat-triggered messages."""
