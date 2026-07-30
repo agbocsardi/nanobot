@@ -11,9 +11,11 @@ import base64
 import json
 import mimetypes
 import os
+import shutil
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 from loguru import logger
@@ -78,6 +80,14 @@ def _resolve_stepfun_asr_url(api_base: str | None) -> str:
     if base.endswith(_STEPFUN_ASR_PATH):
         return base
     return f"{base}/{_STEPFUN_ASR_PATH}"
+
+
+def _port_from_url(url: str) -> int:
+    """Extract the port from a base URL (used to spawn a matching server)."""
+    parsed = urlparse(url)
+    if parsed.port:
+        return parsed.port
+    return 443 if parsed.scheme == "https" else 80
 
 
 def _audio_mime_type(path: Path) -> str:
@@ -828,19 +838,36 @@ class StepFunTranscriptionProvider:
 
 
 class WhisperCppTranscriptionProvider:
-    """Local transcription via a running ``whisper-server`` (whisper.cpp).
+    """Local transcription via ``whisper-server`` (whisper.cpp), auto-managed.
 
     The native C++ server loads the ggml model once at startup and keeps it
-    resident, so per-call cost is just inference — no Python/CTranslate2
-    cold start or model reload (the bottleneck on the faster-whisper path on
+    resident, so per-call cost is just inference — no Python/CTranslate2 cold
+    start or model reload (the bottleneck on the faster-whisper path on
     CPU-only boxes). It speaks an OpenAI-style multipart upload at
     ``/inference`` and returns ``{"text": "..."}``, so we reuse the shared
     multipart/retry/parse helper. No API key required (server is local).
 
-    ``api_base`` defaults to ``$WHISPERCPP_BASE_URL`` or
-    ``http://127.0.0.1:8888``. ``model`` is accepted for signature parity but
-    ignored — the model is fixed at server startup via ``-m``.
+    Lifecycle: if a server is already reachable at ``base_url`` (someone ran
+    one / a systemd unit), it is reused as-is. Otherwise nanobot spawns one
+    for this transcription and kills it the instant the request finishes —
+    ~250 MB freed between calls, no persistent daemon, no idle timer to manage.
+    The cold spawn adds only ~0.3 s over the resident case (model load is
+    ~100 ms when page-cached, which it stays on a box with free RAM).
+
+    Config (env overridable; defaults point at a build in ``~/src/whisper.cpp``):
+      WHISPERCPP_BASE_URL    default http://127.0.0.1:8888 (probed first)
+      WHISPERCPP_BINARY      default whisper-server in PATH or the build tree
+      WHISPERCPP_MODEL       default ggml-base.en.bin (English; set a
+                             multilingual ggml-base.bin for other languages)
+      WHISPERCPP_VAD_MODEL   silero VAD model; enables --vad when set+present
+      WHISPERCPP_THREADS     default 4
+
+    ``model`` is accepted for signature parity but ignored — the model is
+    fixed at server startup via ``-m``, not per request.
     """
+
+    _SPAWN_READY_TIMEOUT_S = 10.0
+    _KILL_GRACE_S = 3.0
 
     def __init__(
         self,
@@ -854,26 +881,112 @@ class WhisperCppTranscriptionProvider:
             or os.environ.get("WHISPERCPP_BASE_URL")
             or "http://127.0.0.1:8888"
         ).rstrip("/")
+        self.base_url = base
         self.api_url = f"{base}/inference"
         self.language = language or None
-        # Sent in the multipart for shape parity; whisper-server ignores it
-        # (the model is loaded at startup, not per request).
+        # Sent in the multipart for shape parity; whisper-server ignores it.
         self.model = model or "whispercpp"
+        home = str(Path.home())
+        src = f"{home}/src/whisper.cpp"
+        self.binary = (
+            os.environ.get("WHISPERCPP_BINARY")
+            or shutil.which("whisper-server")
+            or f"{src}/build/bin/whisper-server"
+        )
+        self.model_path = os.environ.get("WHISPERCPP_MODEL") or f"{src}/models/ggml-base.en.bin"
+        self.vad_model = os.environ.get("WHISPERCPP_VAD_MODEL") or f"{src}/models/ggml-silero-v5.1.2.bin"
+        self.threads = os.environ.get("WHISPERCPP_THREADS", "4")
         logger.debug("whisper.cpp transcription endpoint: {}", self.api_url)
+
+    async def _server_up(self) -> bool:
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(self.base_url, timeout=1.0)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    async def _spawn_server(self) -> asyncio.subprocess.Process | None:
+        """Start whisper-server and block until it serves. None on failure."""
+        if not Path(self.binary).exists():
+            logger.error(
+                "whisper.cpp server binary not found at {}; set WHISPERCPP_BINARY", self.binary
+            )
+            return None
+        if not Path(self.model_path).exists():
+            logger.error(
+                "whisper.cpp model not found at {}; set WHISPERCPP_MODEL", self.model_path
+            )
+            return None
+        args = [
+            self.binary,
+            "-m", self.model_path,
+            "--host", "127.0.0.1",
+            "--port", str(_port_from_url(self.base_url)),
+            "--convert",
+            "-t", str(self.threads),
+        ]
+        if self.vad_model and Path(self.vad_model).exists():
+            args += ["--vad", "-vm", self.vad_model]
+        # The build-tree binary needs libwhisper.so / libggML*.so next to it.
+        env = {**os.environ}
+        bindir = str(Path(self.binary).resolve().parent)
+        env["LD_LIBRARY_PATH"] = f"{bindir}:{env.get('LD_LIBRARY_PATH', '')}"
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+                start_new_session=True,
+            )
+        except Exception as e:
+            logger.error("whisper.cpp failed to spawn server: {}", e)
+            return None
+        deadline = asyncio.get_event_loop().time() + self._SPAWN_READY_TIMEOUT_S
+        while asyncio.get_event_loop().time() < deadline:
+            if proc.returncode is not None:
+                err = await proc.stderr.read() if proc.stderr else b""
+                logger.error(
+                    "whisper.cpp server exited early ({}): {}",
+                    proc.returncode, err.decode(errors="replace").strip()[:500],
+                )
+                return None
+            if await self._server_up():
+                return proc
+            await asyncio.sleep(0.25)
+        logger.error("whisper.cpp server did not become ready in {}s", self._SPAWN_READY_TIMEOUT_S)
+        proc.kill()
+        await proc.wait()
+        return None
 
     async def transcribe(self, file_path: str | Path) -> str:
         path = Path(file_path)
         if not path.exists():
             logger.error("Audio file not found: {}", file_path)
             return ""
-        return await _post_transcription_with_retry(
-            self.api_url,
-            api_key=None,
-            path=path,
-            model=self.model,
-            provider_label="whisper.cpp",
-            language=self.language,
-        )
+        spawned: asyncio.subprocess.Process | None = None
+        if not await self._server_up():
+            spawned = await self._spawn_server()
+            if spawned is None:
+                return ""
+        try:
+            return await _post_transcription_with_retry(
+                self.api_url,
+                api_key=None,
+                path=path,
+                model=self.model,
+                provider_label="whisper.cpp",
+                language=self.language,
+            )
+        finally:
+            if spawned is not None and spawned.returncode is None:
+                spawned.terminate()
+                try:
+                    await asyncio.wait_for(spawned.wait(), timeout=self._KILL_GRACE_S)
+                except asyncio.TimeoutError:
+                    spawned.kill()
+                    await spawned.wait()
 
 
 class FasterWhisperTranscriptionProvider:
