@@ -210,6 +210,14 @@ class DiscordHistoryTool(Tool):
                 "This tool only works in the gateway with Discord enabled."
             )
 
+        # Some providers serialize omitted optional string parameters as "".
+        # Treat blank Discord ids as omitted instead of rejecting an otherwise
+        # valid guild-wide discovery request.
+        if isinstance(guild_id, str) and not guild_id.strip():
+            guild_id = None
+        if isinstance(channel_id, str) and not channel_id.strip():
+            channel_id = None
+
         # --- parameter validation ---
         err = _valid_snowflake(guild_id, "guild_id")
         if err:

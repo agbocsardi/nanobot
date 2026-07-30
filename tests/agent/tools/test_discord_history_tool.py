@@ -282,6 +282,20 @@ async def test_invalid_snowflake_rejected():
 
 
 @pytest.mark.asyncio
+async def test_blank_ids_are_treated_as_omitted():
+    tc = _make_text(10, "general", guild=None)
+    guild = _make_guild(text_channels=[tc])
+    tc.guild = guild
+    tc.history = _history_factory([_make_msg(1, "hi", channel=tc)])
+    tool, _ = _make_setup(guilds=[guild])
+
+    data = json.loads(await tool.execute(guild_id="", channel_id=" "))
+
+    assert data["guild"]["id"] == "1"
+    assert data["messages"][0]["channel_id"] == "10"
+
+
+@pytest.mark.asyncio
 async def test_naive_datetime_rejected():
     tool, _ = _make_setup(guilds=[_make_guild()])
     result = await tool.execute(since="2024-01-01T00:00:00")
