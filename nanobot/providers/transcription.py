@@ -827,6 +827,55 @@ class StepFunTranscriptionProvider:
         )
 
 
+class WhisperCppTranscriptionProvider:
+    """Local transcription via a running ``whisper-server`` (whisper.cpp).
+
+    The native C++ server loads the ggml model once at startup and keeps it
+    resident, so per-call cost is just inference — no Python/CTranslate2
+    cold start or model reload (the bottleneck on the faster-whisper path on
+    CPU-only boxes). It speaks an OpenAI-style multipart upload at
+    ``/inference`` and returns ``{"text": "..."}``, so we reuse the shared
+    multipart/retry/parse helper. No API key required (server is local).
+
+    ``api_base`` defaults to ``$WHISPERCPP_BASE_URL`` or
+    ``http://127.0.0.1:8888``. ``model`` is accepted for signature parity but
+    ignored — the model is fixed at server startup via ``-m``.
+    """
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        api_base: str | None = None,
+        language: str | None = None,
+        model: str | None = None,
+    ):
+        base = (
+            api_base
+            or os.environ.get("WHISPERCPP_BASE_URL")
+            or "http://127.0.0.1:8888"
+        ).rstrip("/")
+        self.api_url = f"{base}/inference"
+        self.language = language or None
+        # Sent in the multipart for shape parity; whisper-server ignores it
+        # (the model is loaded at startup, not per request).
+        self.model = model or "whispercpp"
+        logger.debug("whisper.cpp transcription endpoint: {}", self.api_url)
+
+    async def transcribe(self, file_path: str | Path) -> str:
+        path = Path(file_path)
+        if not path.exists():
+            logger.error("Audio file not found: {}", file_path)
+            return ""
+        return await _post_transcription_with_retry(
+            self.api_url,
+            api_key=None,
+            path=path,
+            model=self.model,
+            provider_label="whisper.cpp",
+            language=self.language,
+        )
+
+
 class FasterWhisperTranscriptionProvider:
     """Local voice transcription using faster-whisper via `uv run --script`.
 

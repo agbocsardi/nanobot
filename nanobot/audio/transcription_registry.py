@@ -60,6 +60,12 @@ TRANSCRIPTION_PROVIDERS: tuple[TranscriptionProviderSpec, ...] = (
         aliases=("mimo", "xiaomi"),
     ),
     TranscriptionProviderSpec(
+        name="whispercpp",
+        default_model="whispercpp",
+        adapter="nanobot.providers.transcription:WhisperCppTranscriptionProvider",
+        aliases=("whisper.cpp", "whisper-cpp", "whisper_server", "whisper-server"),
+    ),
+    TranscriptionProviderSpec(
         name="faster_whisper",
         default_model="small",
         adapter="nanobot.providers.transcription:FasterWhisperTranscriptionProvider",

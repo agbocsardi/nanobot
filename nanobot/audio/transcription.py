@@ -55,7 +55,7 @@ class EffectiveTranscriptionConfig:
 
     @property
     def configured(self) -> bool:
-        if self.provider == "faster_whisper":
+        if self.provider in ("faster_whisper", "whispercpp"):
             return True
         return bool(self.api_key)
 
