@@ -53,11 +53,7 @@ from nanobot.security.workspace_access import (
     reset_workspace_scope,
 )
 from nanobot.session import turn_continuation
-from nanobot.session.goal_state import (
-    goal_state_runtime_lines,
-    runner_wall_llm_timeout_s,
-    sustained_goal_active,
-)
+from nanobot.session.goal_state import runner_wall_llm_timeout_s
 from nanobot.session.keys import UNIFIED_SESSION_KEY, session_key_for_channel
 from nanobot.session.manager import Session, SessionManager, sanitize_message_for_persistence
 from nanobot.utils.document import extract_documents, reference_non_image_attachments
@@ -65,10 +61,7 @@ from nanobot.utils.helpers import image_placeholder_text
 from nanobot.utils.helpers import truncate_text as truncate_text_fn
 from nanobot.utils.image_generation_intent import image_generation_prompt
 from nanobot.utils.llm_runtime import LLMRuntime
-from nanobot.utils.runtime import (
-    EMPTY_FINAL_RESPONSE_MESSAGE,
-    SUSTAINED_GOAL_CONTINUE_PROMPT,
-)
+from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
 from nanobot.utils.usage import add_usage
 
 if TYPE_CHECKING:
@@ -915,15 +908,6 @@ class AgentLoop:
         file_state_token = bind_file_states(self._file_state_store.for_session(active_session_key))
         request_token = bind_request_context(request_ctx)
         workspace_token = bind_workspace_scope(effective_scope)
-        # Build continuation message that embeds the active goal objective so
-        # the LLM can see it even if earlier Runtime Context was truncated.
-        _goal_lines = goal_state_runtime_lines(session.metadata if session is not None else None)
-        _goal_continue = (
-            "You have an active sustained goal:\n\n"
-            + "\n".join(_goal_lines)
-            + "\n\nPlease continue working toward the objective using your tools, "
-            "or call complete_goal if the work is truly finished."
-        ) if _goal_lines else SUSTAINED_GOAL_CONTINUE_PROMPT
         session_metadata = session.metadata if session is not None else None
         runner = AgentRunner(run_provider) if run_provider is not None else self.runner
         effective_model = run_model or self.model
@@ -959,8 +943,11 @@ class AgentLoop:
                 # Sustained goals may legitimately exceed NANOBOT_LLM_TIMEOUT_S; idle stall
                 # is still capped by NANOBOT_STREAM_IDLE_TIMEOUT_S in streaming providers.
                 llm_timeout_s=effective_llm_timeout_s,
-                goal_active_predicate=lambda: sustained_goal_active(session.metadata) if session is not None else False,
-                goal_continue_message=_goal_continue,
+                # Active goals persist across user turns through Runtime Context.
+                # Don't auto-inject synthetic continuation turns: they can trap the
+                # agent in a same-turn loop after it has already answered the user.
+                goal_active_predicate=None,
+                goal_continue_message=None,
                 finalize_on_max_iterations=turn_continuation.should_finalize_on_max_iterations(
                     pending_queue_available=pending_queue is not None and session is not None,
                     session_metadata=session_metadata,
