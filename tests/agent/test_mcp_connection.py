@@ -42,6 +42,29 @@ class _FakeMcpTool(Tool):
         return "ok"
 
 
+@pytest.mark.asyncio
+async def test_owned_mcp_connection_closes_from_owner_task():
+    close_requested = asyncio.Event()
+    ready = asyncio.Event()
+    tasks: dict[str, asyncio.Task] = {}
+
+    async def own_connection() -> None:
+        tasks["open"] = asyncio.current_task()  # type: ignore[assignment]
+        ready.set()
+        await close_requested.wait()
+        tasks["close"] = asyncio.current_task()  # type: ignore[assignment]
+
+    owner = asyncio.create_task(own_connection())
+    connection = mcp_runtime._OwnedMCPConnection(owner, close_requested)
+    await ready.wait()
+
+    await connection.aclose()
+
+    assert tasks["open"] is owner
+    assert tasks["close"] is owner
+    assert tasks["close"] is not asyncio.current_task()
+
+
 def _make_loop(tmp_path, *, mcp_servers: dict | None = None) -> AgentLoop:
     bus = MessageBus()
     provider = MagicMock()
