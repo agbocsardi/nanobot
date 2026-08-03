@@ -943,10 +943,13 @@ class TelegramChannel(BaseChannel):
                 return
             if stream_id is not None and buf.stream_id is not None and buf.stream_id != stream_id:
                 return
-            self._stop_typing(chat_id)
-            if reply_to_message_id := meta.get("message_id"):
-                with suppress(ValueError):
-                    await self._remove_reaction(chat_id, int(reply_to_message_id))
+            # A stream segment ends before tool execution too. Keep the activity
+            # indicator alive until the runner marks the final segment complete.
+            if not meta.get("_resuming", False):
+                self._stop_typing(chat_id)
+                if reply_to_message_id := meta.get("message_id"):
+                    with suppress(ValueError):
+                        await self._remove_reaction(chat_id, int(reply_to_message_id))
             thread_kwargs = {}
             if message_thread_id := meta.get("message_thread_id"):
                 thread_kwargs["message_thread_id"] = message_thread_id

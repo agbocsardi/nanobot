@@ -626,6 +626,23 @@ async def test_send_delta_stream_end_treats_not_modified_as_success() -> None:
 
 
 @pytest.mark.asyncio
+async def test_resuming_stream_end_keeps_typing_active() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    channel._app.bot.edit_message_text = AsyncMock()
+    channel._stream_bufs["123"] = _StreamBuf(text="Working", message_id=7, last_edit=0.0)
+    stopped: list[str] = []
+    channel._stop_typing = stopped.append  # type: ignore[method-assign]
+
+    await channel.send_delta("123", "", {"_stream_end": True, "_resuming": True})
+
+    assert stopped == []
+
+
+@pytest.mark.asyncio
 async def test_send_delta_stream_end_does_not_fallback_on_network_timeout() -> None:
     """TimedOut during HTML edit should propagate, never fall back to plain text."""
     from telegram.error import TimedOut
