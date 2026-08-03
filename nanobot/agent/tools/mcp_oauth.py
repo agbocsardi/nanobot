@@ -20,9 +20,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
+import time
 from urllib.parse import parse_qs, urlparse
 
 from loguru import logger
+from mcp.client.auth import OAuthClientProvider
 
 from nanobot.config.paths import get_runtime_subdir
 
@@ -53,12 +56,37 @@ class FileTokenStorage:
     async def get_tokens(self):
         from mcp.shared.auth import OAuthToken
 
-        data = self._load().get("tokens")
-        return OAuthToken.model_validate(data) if data else None
+        stored = self._load()
+        data = stored.get("tokens")
+        if not data:
+            return None
+        token = OAuthToken.model_validate(data)
+        if token.expires_in is None:
+            return token
+
+        expires_at = stored.get("token_expires_at")
+        if isinstance(expires_at, int | float) and not isinstance(expires_at, bool):
+            remaining = math.ceil(float(expires_at) - time.time())
+        else:
+            # Older files did not persist issuance time. Their mtime tracks the
+            # last token/client write closely enough to migrate without granting
+            # an old token a fresh lifetime or refreshing a newly issued token.
+            try:
+                expires_at = self.path.stat().st_mtime + int(token.expires_in)
+                remaining = math.ceil(expires_at - time.time())
+                stored["token_expires_at"] = expires_at
+                self._save(stored)
+            except OSError:
+                return token
+        return token.model_copy(update={"expires_in": remaining})
 
     async def set_tokens(self, tokens) -> None:
         data = self._load()
         data["tokens"] = tokens.model_dump(mode="json")
+        if tokens.expires_in is None:
+            data.pop("token_expires_at", None)
+        else:
+            data["token_expires_at"] = time.time() + int(tokens.expires_in)
         self._save(data)
 
     async def get_client_info(self):
@@ -93,7 +121,6 @@ def build_oauth_provider(
     (gateway): handlers raise, so a needed full re-auth skips the server instead
     of blocking on stdin.
     """
-    from mcp.client.auth import OAuthClientProvider
     from mcp.shared.auth import OAuthClientMetadata
 
     storage = FileTokenStorage(name)
@@ -128,7 +155,13 @@ def build_oauth_provider(
         async def callback_handler() -> tuple[str, str | None]:
             raise RuntimeError(f"MCP OAuth [{name}]: interactive auth required ({hint})")
 
-    return OAuthClientProvider(
+    class PersistedExpiryOAuthClientProvider(OAuthClientProvider):
+        async def _initialize(self) -> None:
+            await super()._initialize()
+            if self.context.current_tokens is not None:
+                self.context.update_token_expiry(self.context.current_tokens)
+
+    return PersistedExpiryOAuthClientProvider(
         server_url=server_url,
         client_metadata=client_metadata,
         storage=storage,

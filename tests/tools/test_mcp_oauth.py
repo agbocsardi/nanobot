@@ -1,6 +1,10 @@
 """Tests for MCP OAuth wiring — file token storage + provider factory UX handlers."""
 from __future__ import annotations
 
+import json
+import os
+import time
+
 import pytest
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
@@ -41,6 +45,66 @@ async def test_file_token_storage_roundtrip(monkeypatch, tmp_path):
     assert got is not None and got.access_token == "abc" and got.refresh_token == "def"
     info = await reloaded.get_client_info()
     assert info is not None and info.client_id == "cid-123"
+
+
+@pytest.mark.asyncio
+async def test_provider_restores_expired_persisted_token_deadline(monkeypatch, tmp_path):
+    _isolate_storage(monkeypatch, tmp_path)
+    storage = FileTokenStorage("coros")
+    await storage.set_tokens(
+        OAuthToken(access_token="expired", refresh_token="refresh", expires_in=3600)
+    )
+    await storage.set_client_info(
+        OAuthClientInformationFull(
+            client_id="cid-123",
+            redirect_uris=["http://localhost:8765/callback"],
+            token_endpoint_auth_method="none",
+        )
+    )
+    data = json.loads(storage.path.read_text())
+    data["token_expires_at"] = time.time() - 60
+    storage.path.write_text(json.dumps(data))
+
+    provider = build_oauth_provider(
+        "https://mcp.coros.com/mcp", "coros", interactive=False
+    )
+    await provider._initialize()
+
+    assert provider.context.token_expiry_time is not None
+    assert provider.context.token_expiry_time <= time.time()
+    assert provider.context.is_token_valid() is False
+    assert provider.context.can_refresh_token() is True
+
+
+@pytest.mark.asyncio
+async def test_provider_migrates_legacy_token_expiry_from_file_mtime(monkeypatch, tmp_path):
+    _isolate_storage(monkeypatch, tmp_path)
+    storage = FileTokenStorage("coros")
+    await storage.set_tokens(
+        OAuthToken(access_token="expired", refresh_token="refresh", expires_in=60)
+    )
+    await storage.set_client_info(
+        OAuthClientInformationFull(
+            client_id="cid-123",
+            redirect_uris=["http://localhost:8765/callback"],
+            token_endpoint_auth_method="none",
+        )
+    )
+    data = json.loads(storage.path.read_text())
+    data.pop("token_expires_at")
+    storage.path.write_text(json.dumps(data))
+    expired_mtime = time.time() - 120
+    os.utime(storage.path, (expired_mtime, expired_mtime))
+
+    provider = build_oauth_provider(
+        "https://mcp.coros.com/mcp", "coros", interactive=False
+    )
+    await provider._initialize()
+
+    assert provider.context.token_expiry_time is not None
+    assert provider.context.is_token_valid() is False
+    assert provider.context.can_refresh_token() is True
+    assert "token_expires_at" in json.loads(storage.path.read_text())
 
 
 @pytest.mark.asyncio
