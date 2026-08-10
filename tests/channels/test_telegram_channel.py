@@ -11,7 +11,7 @@ try:
 except ImportError:
     pytest.skip("Telegram dependencies not installed (python-telegram-bot)", allow_module_level=True)
 
-from nanobot.bus.events import OutboundMessage
+from nanobot.bus.events import OUTBOUND_META_REACTION, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.telegram import (
     TELEGRAM_REPLY_CONTEXT_MAX_LEN,
@@ -367,7 +367,7 @@ async def test_start_webhook_mode(monkeypatch) -> None:
         "port": 8081,
         "url_path": "telegram",
         "webhook_url": "https://example.com/telegram",
-        "allowed_updates": ["message"],
+        "allowed_updates": ["message", "message_reaction"],
         "drop_pending_updates": False,
         "secret_token": "secret-token",
         "max_connections": 1,
@@ -401,6 +401,43 @@ async def test_running_message_handler_reorders_same_session_updates() -> None:
     channel._running = False
 
     assert seen == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_running_handler_orders_reaction_after_earlier_message() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    seen: list[str] = []
+
+    async def fake_message(update, context) -> None:
+        seen.append("message")
+
+    async def fake_reaction(update, context) -> None:
+        seen.append("reaction")
+
+    channel._process_message_update = fake_message
+    channel._process_message_reaction = fake_reaction
+    channel._running = True
+
+    message = _make_telegram_update(text="first")
+    message.update_id = 100
+    reaction = SimpleNamespace(
+        update_id=101,
+        message=None,
+        message_reaction=SimpleNamespace(
+            chat=SimpleNamespace(id=message.message.chat_id),
+            message_id=message.message.message_id,
+        ),
+    )
+
+    await channel._on_message_reaction(reaction, None)
+    await channel._on_message(message, None)
+    await asyncio.sleep(0.3)
+    channel._running = False
+
+    assert seen == ["message", "reaction"]
 
 
 @pytest.mark.asyncio
@@ -749,6 +786,8 @@ async def test_send_delta_stream_end_splits_oversized_reply() -> None:
     channel._app.bot.send_message.assert_called_once()
     send_text = channel._app.bot.send_message.call_args.kwargs.get("text", "")
     assert len(send_text) <= 4096
+    assert channel._sent_messages[("123", 7)] == edit_text
+    assert channel._sent_messages[("123", 99)] == send_text
     assert "123" not in channel._stream_bufs
 
 
@@ -958,6 +997,8 @@ async def test_send_delta_incremental_edit_splits_oversized_buffer() -> None:
     assert buf.message_id == 99
     assert len(buf.text) <= TELEGRAM_MAX_MESSAGE_LEN
     assert buf.last_edit > 0.0
+    assert channel._sent_messages[("123", 7)] == edit_text
+    assert channel._sent_messages[("123", 99)] == buf.text
 
 
 @pytest.mark.asyncio
@@ -1800,6 +1841,123 @@ async def test_on_message_location_with_text() -> None:
     assert len(handled) == 1
     assert "meet me here" in handled[0]["content"]
     assert "[location: 51.5074, -0.1278]" in handled[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_send_agent_reaction_replaces_pending_receipt() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    channel._app.bot.set_message_reaction = AsyncMock()
+    channel._pending_receipts.add(("123", 42))
+
+    await channel.send(
+        OutboundMessage(
+            channel="telegram",
+            chat_id="123",
+            content="",
+            metadata={OUTBOUND_META_REACTION: {"message_id": "42", "emoji": "👍"}},
+        )
+    )
+
+    call = channel._app.bot.set_message_reaction.await_args
+    assert call.kwargs["chat_id"] == 123
+    assert call.kwargs["message_id"] == 42
+    assert call.kwargs["reaction"][0].emoji == "👍"
+    assert ("123", 42) not in channel._pending_receipts
+
+
+@pytest.mark.asyncio
+async def test_final_cleanup_preserves_agent_reaction() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    channel._app.bot.set_message_reaction = AsyncMock()
+
+    await channel._add_reaction("123", 42, "👀")
+    await channel._set_agent_reaction("123", 42, "👍")
+    await channel._remove_reaction("123", 42)
+
+    assert channel._app.bot.set_message_reaction.await_count == 2
+    assert channel._app.bot.set_message_reaction.await_args.kwargs["reaction"][0].emoji == "👍"
+
+
+@pytest.mark.asyncio
+async def test_user_reaction_becomes_immediate_agent_turn_with_target_context() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._bot_user_id = 999
+    channel._remember_sent_message("123", 42, "The answer you reacted to")
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    user = SimpleNamespace(
+        id=7,
+        username="alice",
+        first_name="Alice",
+        is_bot=False,
+    )
+    event = SimpleNamespace(
+        user=user,
+        chat=SimpleNamespace(id=123, type="private"),
+        message_id=42,
+        old_reaction=[],
+        new_reaction=[SimpleNamespace(emoji="👍")],
+    )
+    update = SimpleNamespace(message_reaction=event, effective_user=user)
+
+    await channel._on_message_reaction(update, None)
+
+    assert len(handled) == 1
+    assert "Action: added" in handled[0]["content"]
+    assert "New reactions: 👍" in handled[0]["content"]
+    assert "Reacted-to message: The answer you reacted to" in handled[0]["content"]
+    assert handled[0]["metadata"]["reaction"] == {
+        "action": "added",
+        "message_id": 42,
+        "old": [],
+        "new": ["👍"],
+        "target_content": "The answer you reacted to",
+    }
+
+
+@pytest.mark.asyncio
+async def test_bot_reaction_update_does_not_create_agent_turn() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._bot_user_id = 999
+    channel._handle_message = AsyncMock()
+    bot_user = SimpleNamespace(
+        id=999,
+        username="nanobot_test",
+        first_name="Nanobot",
+        is_bot=True,
+    )
+    event = SimpleNamespace(
+        user=bot_user,
+        chat=SimpleNamespace(id=123, type="private"),
+        message_id=42,
+        old_reaction=[],
+        new_reaction=[SimpleNamespace(emoji="👀")],
+    )
+
+    await channel._on_message_reaction(
+        SimpleNamespace(message_reaction=event, effective_user=bot_user),
+        None,
+    )
+
+    channel._handle_message.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

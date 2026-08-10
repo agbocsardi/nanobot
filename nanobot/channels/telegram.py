@@ -8,6 +8,7 @@ import time
 import unicodedata
 from contextlib import suppress
 from dataclasses import dataclass
+from html import unescape
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
@@ -22,10 +23,17 @@ from telegram import (
     Update,
 )
 from telegram.error import BadRequest, NetworkError, TimedOut
-from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    ContextTypes,
+    MessageHandler,
+    MessageReactionHandler,
+    filters,
+)
 from telegram.request import HTTPXRequest
 
-from nanobot.bus.events import OutboundMessage
+from nanobot.bus.events import OUTBOUND_META_REACTION, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.command.builtin import build_help_text
@@ -329,7 +337,7 @@ class _StreamBuf:
 class _QueuedTelegramUpdate:
     """Telegram update staged for per-session ordered processing."""
 
-    kind: Literal["command", "message"]
+    kind: Literal["command", "message", "reaction"]
     update: Update
     context: Any
     sort_key: tuple[int, int]
@@ -443,6 +451,8 @@ class TelegramChannel(BaseChannel):
         self._media_group_buffers: dict[str, dict] = {}
         self._media_group_tasks: dict[str, asyncio.Task] = {}
         self._message_threads: dict[tuple[str, int], int] = {}
+        self._pending_receipts: set[tuple[str, int]] = set()
+        self._sent_messages: dict[tuple[str, int], str] = {}
         self._bot_user_id: int | None = None
         self._bot_username: str | None = None
         self._stream_bufs: dict[str, _StreamBuf] = {}  # chat_id -> streaming state
@@ -522,6 +532,7 @@ class TelegramChannel(BaseChannel):
                 self._forward_command,
             )
         )
+        self._app.add_handler(MessageReactionHandler(self._on_message_reaction))
         self._app.add_handler(
             MessageHandler(
                 filters.Regex(r"^/(dream-log|dream_log|dream-restore|dream_restore)(?:@\w+)?(?:\s+.*)?$"),
@@ -544,10 +555,10 @@ class TelegramChannel(BaseChannel):
         # Conditionally register inline keyboard callback handler
         if self.config.inline_keyboards:
             self._app.add_handler(CallbackQueryHandler(self._on_callback_query))
-            allowed_updates = ["message", "callback_query"]
+            allowed_updates = ["message", "message_reaction", "callback_query"]
             self.logger.debug("inline keyboards enabled")
         else:
-            allowed_updates = ["message"]
+            allowed_updates = ["message", "message_reaction"]
 
         if self.config.mode == "webhook":
             self.logger.info("Starting bot (webhook mode)...")
@@ -681,11 +692,13 @@ class TelegramChannel(BaseChannel):
             payload["reply_markup"] = reply_markup
 
         try:
-            await self._call_with_retry(
+            result = await self._call_with_retry(
                 self._app.bot.do_api_request,
                 "sendRichMessage",
                 api_kwargs=payload,
             )
+            if isinstance(result, dict) and result.get("message_id") is not None:
+                self._remember_sent_message(chat_id, int(result["message_id"]), content)
             return True
         except BadRequest as exc:
             if self._is_rich_capability_error(exc):
@@ -748,6 +761,14 @@ class TelegramChannel(BaseChannel):
             self.logger.warning("bot not running")
             return
 
+        if reaction := msg.metadata.get(OUTBOUND_META_REACTION):
+            await self._set_agent_reaction(
+                msg.chat_id,
+                int(reaction["message_id"]),
+                str(reaction.get("emoji") or ""),
+            )
+            return
+
         # Only stop typing indicator and remove reaction for final responses
         if not msg.metadata.get("_progress", False):
             self._stop_typing(msg.chat_id)
@@ -801,7 +822,7 @@ class TelegramChannel(BaseChannel):
                     ok, error = validate_url_target(media_path)
                     if not ok:
                         raise ValueError(f"unsafe media URL: {error}")
-                    await self._call_with_retry(
+                    sent = await self._call_with_retry(
                         sender,
                         chat_id=chat_id,
                         **{param: media_path},
@@ -809,12 +830,16 @@ class TelegramChannel(BaseChannel):
                         **thread_kwargs,
                         **extra,
                     )
+                    if (sent_message_id := getattr(sent, "message_id", None)) is not None:
+                        self._remember_sent_message(
+                            str(chat_id), sent_message_id, f"[{media_type}: {media_path}]"
+                        )
                     continue
 
                 media_bytes = Path(media_path).read_bytes()
                 filename = Path(media_path).name
                 send_kwargs = {param: media_bytes, "filename": filename}
-                await self._call_with_retry(
+                sent = await self._call_with_retry(
                     sender,
                     chat_id=chat_id,
                     reply_parameters=reply_params,
@@ -822,6 +847,10 @@ class TelegramChannel(BaseChannel):
                     **extra,
                     **send_kwargs,
                 )
+                if (sent_message_id := getattr(sent, "message_id", None)) is not None:
+                    self._remember_sent_message(
+                        str(chat_id), sent_message_id, f"[{media_type}: {filename}]"
+                    )
             except Exception:
                 filename = media_path.rsplit("/", 1)[-1]
                 self.logger.exception("Failed to send media {}", media_path)
@@ -903,17 +932,18 @@ class TelegramChannel(BaseChannel):
         """Send a plain text message with HTML fallback."""
         try:
             html = _tool_hint_to_telegram_blockquote(text) if render_as_blockquote else _markdown_to_telegram_html(text)
-            await self._call_with_retry(
+            sent = await self._call_with_retry(
                 self._app.bot.send_message,
                 chat_id=chat_id, text=html, parse_mode="HTML",
                 reply_parameters=reply_params,
                 reply_markup=reply_markup,
                 **(thread_kwargs or {}),
             )
+            self._remember_sent_message(str(chat_id), sent.message_id, text)
         except BadRequest as e:
             self.logger.warning("HTML parse failed, falling back to plain text: {}", e)
             try:
-                await self._call_with_retry(
+                sent = await self._call_with_retry(
                     self._app.bot.send_message,
                     chat_id=chat_id,
                     text=text,
@@ -921,6 +951,7 @@ class TelegramChannel(BaseChannel):
                     reply_markup=reply_markup,
                     **(thread_kwargs or {}),
                 )
+                self._remember_sent_message(str(chat_id), sent.message_id, text)
             except Exception:
                 self.logger.exception("Error sending message")
                 raise
@@ -966,6 +997,7 @@ class TelegramChannel(BaseChannel):
                 and not getattr(self, "_rich_send_disabled", False)
             ):
                 if await self._try_edit_rich(int_chat_id, buf.message_id, raw_text):
+                    self._remember_sent_message(chat_id, buf.message_id, raw_text)
                     self._stream_bufs.pop(chat_id, None)
                     return
 
@@ -978,6 +1010,9 @@ class TelegramChannel(BaseChannel):
                     self._app.bot.edit_message_text,
                     chat_id=int_chat_id, message_id=buf.message_id,
                     text=primary_html, parse_mode="HTML",
+                )
+                self._remember_sent_message(
+                    chat_id, buf.message_id, self._visible_html_text(primary_html)
                 )
             except BadRequest as e:
                 # Only fall back to plain text on actual HTML parse/format errors.
@@ -996,6 +1031,7 @@ class TelegramChannel(BaseChannel):
                         chat_id=int_chat_id, message_id=buf.message_id,
                         text=primary_plain,
                     )
+                    self._remember_sent_message(chat_id, buf.message_id, primary_plain)
                 except Exception as e2:
                     if self._is_not_modified_error(e2):
                         self.logger.debug("Final stream plain edit already applied for {}", chat_id)
@@ -1004,11 +1040,14 @@ class TelegramChannel(BaseChannel):
                         raise  # Let ChannelManager handle retry
             for extra_html_chunk in extra_html_chunks:
                 try:
-                    await self._call_with_retry(
+                    sent = await self._call_with_retry(
                         self._app.bot.send_message,
                         chat_id=int_chat_id, text=extra_html_chunk,
                         parse_mode="HTML",
                         **thread_kwargs,
+                    )
+                    self._remember_sent_message(
+                        chat_id, sent.message_id, self._visible_html_text(extra_html_chunk)
                     )
                 except Exception:
                     # Fall back to _send_text which handles HTML→plain gracefully.
@@ -1040,6 +1079,7 @@ class TelegramChannel(BaseChannel):
                     **thread_kwargs,
                 )
                 buf.message_id = sent.message_id
+                self._remember_sent_message(chat_id, sent.message_id, buf.text)
                 buf.last_edit = now
             except Exception as e:
                 self.logger.warning("Stream initial send failed: {}", e)
@@ -1056,6 +1096,7 @@ class TelegramChannel(BaseChannel):
                     chat_id=int_chat_id, message_id=buf.message_id,
                     text=preview,
                 )
+                self._remember_sent_message(chat_id, buf.message_id, buf.text)
                 buf.last_edit = now
             except Exception as e:
                 if self._is_not_modified_error(e):
@@ -1085,15 +1126,18 @@ class TelegramChannel(BaseChannel):
                 chat_id=chat_id, message_id=buf.message_id,
                 text=chunks[0],
             )
+            if buf.message_id is not None:
+                self._remember_sent_message(str(chat_id), buf.message_id, chunks[0])
         except Exception as e:
             if not self._is_not_modified_error(e):
                 self.logger.warning("Stream overflow edit failed: {}", e)
                 raise
         for chunk in chunks[1:-1]:
-            await self._call_with_retry(
+            sent = await self._call_with_retry(
                 self._app.bot.send_message,
                 chat_id=chat_id, text=chunk, **thread_kwargs,
             )
+            self._remember_sent_message(str(chat_id), sent.message_id, chunk)
         tail = chunks[-1]
         sent = await self._call_with_retry(
             self._app.bot.send_message,
@@ -1101,6 +1145,7 @@ class TelegramChannel(BaseChannel):
         )
         buf.message_id = sent.message_id
         buf.text = tail
+        self._remember_sent_message(str(chat_id), sent.message_id, tail)
 
     async def _on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /start command."""
@@ -1328,22 +1373,32 @@ class TelegramChannel(BaseChannel):
 
     @staticmethod
     def _sort_key_for_update(update: Update) -> tuple[int, int]:
-        """Sort by chat message id first, then Telegram update id."""
+        """Sort by Telegram update id, falling back to message id in tests."""
         message = getattr(update, "message", None)
-        message_id = int(getattr(message, "message_id", 0) or 0)
+        reaction = getattr(update, "message_reaction", None)
+        message_id = int(
+            getattr(message, "message_id", None)
+            or getattr(reaction, "message_id", 0)
+            or 0
+        )
         update_id = int(getattr(update, "update_id", 0) or 0)
-        return (message_id, update_id)
+        return (update_id or message_id, message_id)
 
     def _enqueue_ordered_update(
         self,
         *,
-        kind: Literal["command", "message"],
+        kind: Literal["command", "message", "reaction"],
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
     ) -> None:
         """Stage a Telegram update behind a short per-session reorder window."""
         message = update.message
-        key = self._queue_key_for_message(message)
+        reaction = getattr(update, "message_reaction", None)
+        key = (
+            self._queue_key_for_message(message)
+            if message is not None
+            else f"telegram:{reaction.chat.id}"
+        )
         self._inbound_buffers.setdefault(key, []).append(
             _QueuedTelegramUpdate(
                 kind=kind,
@@ -1371,6 +1426,8 @@ class TelegramChannel(BaseChannel):
                     try:
                         if item.kind == "command":
                             await self._process_forward_command(item.update, item.context)
+                        elif item.kind == "reaction":
+                            await self._process_message_reaction(item.update, item.context)
                         else:
                             await self._process_message_update(item.update, item.context)
                     except Exception as e:
@@ -1546,6 +1603,108 @@ class TelegramChannel(BaseChannel):
         finally:
             self._media_group_tasks.pop(key, None)
 
+    def _remember_sent_message(self, chat_id: str | int, message_id: int, content: str) -> None:
+        """Cache recent bot messages so reaction events can identify their target."""
+        key = (str(chat_id), int(message_id))
+        self._sent_messages[key] = (
+            content[:TELEGRAM_REPLY_CONTEXT_MAX_LEN] + "..."
+            if len(content) > TELEGRAM_REPLY_CONTEXT_MAX_LEN
+            else content
+        )
+        if len(self._sent_messages) > 1000:
+            self._sent_messages.pop(next(iter(self._sent_messages)))
+
+    @staticmethod
+    def _visible_html_text(content: str) -> str:
+        """Reduce Telegram HTML to the text a user sees for reaction context."""
+        return unescape(re.sub(r"<[^>]+>", "", content))
+
+    @staticmethod
+    def _reaction_values(reactions) -> list[str]:
+        values = []
+        for reaction in reactions or []:
+            if emoji := getattr(reaction, "emoji", None):
+                values.append(str(emoji))
+            elif custom_id := getattr(reaction, "custom_emoji_id", None):
+                values.append(f"custom:{custom_id}")
+            elif getattr(reaction, "type", None) == "paid":
+                values.append("paid")
+        return values
+
+    async def _on_message_reaction(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Stage a reaction change in the ordered ingress queue."""
+        if not update.message_reaction:
+            return
+        if not self._running:
+            await self._process_message_reaction(update, context)
+            return
+        self._enqueue_ordered_update(kind="reaction", update=update, context=context)
+
+    async def _process_message_reaction(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Forward a user's reaction change as an immediate agent turn."""
+        event = update.message_reaction
+        user = getattr(event, "user", None) or update.effective_user
+        if event is None or user is None:
+            return
+        if getattr(user, "is_bot", False) or getattr(user, "id", None) == self._bot_user_id:
+            return
+
+        sender_id = self._sender_id(user)
+        if not self.is_allowed(sender_id):
+            return
+        chat_id = str(event.chat.id)
+        message_id = int(event.message_id)
+        target_content = self._sent_messages.get((chat_id, message_id))
+        if event.chat.type != "private" and target_content is None:
+            return
+
+        old_reactions = self._reaction_values(event.old_reaction)
+        new_reactions = self._reaction_values(event.new_reaction)
+        if old_reactions == new_reactions:
+            return
+        if not old_reactions:
+            action = "added"
+        elif not new_reactions:
+            action = "removed"
+        else:
+            action = "changed"
+
+        lines = [
+            "[Telegram Reaction Event]",
+            f"Action: {action}",
+            f"Message ID: {message_id}",
+            f"Previous reactions: {', '.join(old_reactions) or 'none'}",
+            f"New reactions: {', '.join(new_reactions) or 'none'}",
+        ]
+        if target_content:
+            lines.append(f"Reacted-to message: {target_content}")
+        lines.append("[/Telegram Reaction Event]")
+        metadata = {
+            "message_id": message_id,
+            "user_id": user.id,
+            "username": user.username,
+            "first_name": user.first_name,
+            "is_group": event.chat.type != "private",
+            "reaction": {
+                "action": action,
+                "message_id": message_id,
+                "old": old_reactions,
+                "new": new_reactions,
+                "target_content": target_content,
+            },
+        }
+        await self._handle_message(
+            sender_id=sender_id,
+            chat_id=chat_id,
+            content="\n".join(lines),
+            metadata=metadata,
+            is_dm=event.chat.type == "private",
+        )
+
     def _start_typing(self, chat_id: str) -> None:
         """Start sending 'typing...' indicator for a chat."""
         # Cancel any existing typing task for this chat
@@ -1568,12 +1727,14 @@ class TelegramChannel(BaseChannel):
                 message_id=message_id,
                 reaction=[ReactionTypeEmoji(emoji=emoji)],
             )
+            self._pending_receipts.add((str(chat_id), message_id))
         except Exception as e:
             self.logger.debug("reaction failed: {}", e)
 
     async def _remove_reaction(self, chat_id: str, message_id: int) -> None:
         """Remove emoji reaction from a message (best-effort, non-blocking)."""
-        if not self._app:
+        key = (str(chat_id), message_id)
+        if not self._app or key not in self._pending_receipts:
             return
         try:
             await self._app.bot.set_message_reaction(
@@ -1583,6 +1744,20 @@ class TelegramChannel(BaseChannel):
             )
         except Exception as e:
             self.logger.debug("reaction removal failed: {}", e)
+        finally:
+            self._pending_receipts.discard(key)
+
+    async def _set_agent_reaction(self, chat_id: str, message_id: int, emoji: str) -> None:
+        """Set an intentional reaction and prevent receipt cleanup from removing it."""
+        if not self._app:
+            raise RuntimeError("Telegram bot is not running")
+        reaction = [ReactionTypeEmoji(emoji=emoji)] if emoji else []
+        await self._app.bot.set_message_reaction(
+            chat_id=int(chat_id),
+            message_id=message_id,
+            reaction=reaction,
+        )
+        self._pending_receipts.discard((str(chat_id), message_id))
 
     async def _typing_loop(self, chat_id: str) -> None:
         """Repeatedly send 'typing' action until cancelled."""
