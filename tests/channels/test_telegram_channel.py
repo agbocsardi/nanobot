@@ -370,7 +370,7 @@ async def test_start_webhook_mode(monkeypatch) -> None:
         "port": 8081,
         "url_path": "telegram",
         "webhook_url": "https://example.com/telegram",
-        "allowed_updates": ["message", "message_reaction"],
+        "allowed_updates": ["message", "edited_message", "message_reaction"],
         "drop_pending_updates": False,
         "secret_token": "secret-token",
         "max_connections": 1,
@@ -441,6 +441,52 @@ async def test_running_handler_orders_reaction_after_earlier_message() -> None:
     channel._running = False
 
     assert seen == ["message", "reaction"]
+
+
+@pytest.mark.asyncio
+async def test_edited_message_becomes_marked_replacement_turn() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    channel._start_typing = lambda _chat_id: None
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    update = _make_telegram_update(text="corrected text")
+    update.edited_message = update.message
+    update.edited_message.edit_date = datetime(2026, 8, 10, 13, 45, tzinfo=timezone.utc)
+    update.message = None
+
+    await channel._on_message(update, None)
+
+    assert len(handled) == 1
+    assert handled[0]["content"].startswith("[Telegram Edited Message]")
+    assert "Message ID: 1" in handled[0]["content"]
+    assert "replaces the sender's earlier version" in handled[0]["content"]
+    assert handled[0]["content"].endswith("corrected text")
+    assert handled[0]["metadata"]["is_edit"] is True
+    assert handled[0]["metadata"]["edit_date"] == "2026-08-10T13:45:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_edited_slash_command_is_not_reexecuted() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._handle_message = AsyncMock()
+    update = _make_telegram_update(text="/new")
+    update.edited_message = update.message
+    update.message = None
+
+    await channel._forward_command(update, None)
+
+    channel._handle_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio

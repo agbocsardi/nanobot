@@ -555,10 +555,15 @@ class TelegramChannel(BaseChannel):
         # Conditionally register inline keyboard callback handler
         if self.config.inline_keyboards:
             self._app.add_handler(CallbackQueryHandler(self._on_callback_query))
-            allowed_updates = ["message", "message_reaction", "callback_query"]
+            allowed_updates = [
+                "message",
+                "edited_message",
+                "message_reaction",
+                "callback_query",
+            ]
             self.logger.debug("inline keyboards enabled")
         else:
-            allowed_updates = ["message", "message_reaction"]
+            allowed_updates = ["message", "edited_message", "message_reaction"]
 
         if self.config.mode == "webhook":
             self.logger.info("Starting bot (webhook mode)...")
@@ -1555,7 +1560,7 @@ class TelegramChannel(BaseChannel):
     @staticmethod
     def _sort_key_for_update(update: Update) -> tuple[int, int]:
         """Sort by Telegram update id, falling back to message id in tests."""
-        message = getattr(update, "message", None)
+        message = TelegramChannel._message_for_update(update)
         reaction = getattr(update, "message_reaction", None)
         message_id = int(
             getattr(message, "message_id", None)
@@ -1565,6 +1570,11 @@ class TelegramChannel(BaseChannel):
         update_id = int(getattr(update, "update_id", 0) or 0)
         return (update_id or message_id, message_id)
 
+    @staticmethod
+    def _message_for_update(update: Update):
+        """Return a new or edited Telegram message from an update."""
+        return getattr(update, "message", None) or getattr(update, "edited_message", None)
+
     def _enqueue_ordered_update(
         self,
         *,
@@ -1573,7 +1583,7 @@ class TelegramChannel(BaseChannel):
         context: ContextTypes.DEFAULT_TYPE,
     ) -> None:
         """Stage a Telegram update behind a short per-session reorder window."""
-        message = update.message
+        message = self._message_for_update(update)
         reaction = getattr(update, "message_reaction", None)
         key = (
             self._queue_key_for_message(message)
@@ -1669,7 +1679,7 @@ class TelegramChannel(BaseChannel):
 
     async def _on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming messages (text, photos, voice, documents)."""
-        if not update.message or not update.effective_user:
+        if not self._message_for_update(update) or not update.effective_user:
             return
         if not self._running:
             await self._process_message_update(update, context)
@@ -1679,7 +1689,7 @@ class TelegramChannel(BaseChannel):
     async def _process_message_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Process a queued Telegram message update."""
 
-        message = update.message
+        message = self._message_for_update(update)
         user = update.effective_user
         chat_id = message.chat_id
         sender_id = self._sender_id(user)
@@ -1739,6 +1749,23 @@ class TelegramChannel(BaseChannel):
         forward_details = self._extract_forward_details(message)
         if forward_details is not None:
             content_parts.insert(0, self._format_forward_context(forward_details))
+        edit_date = getattr(message, "edit_date", None)
+        if edit_date is not None:
+            formatted_edit_date = (
+                edit_date.isoformat() if hasattr(edit_date, "isoformat") else str(edit_date)
+            )
+            content_parts.insert(
+                0,
+                "\n".join(
+                    [
+                        "[Telegram Edited Message]",
+                        f"Message ID: {message.message_id}",
+                        f"Edited at: {formatted_edit_date}",
+                        "This content replaces the sender's earlier version of the message.",
+                        "[/Telegram Edited Message]",
+                    ]
+                ),
+            )
         content = "\n".join(content_parts) if content_parts else "[empty message]"
 
         self.logger.debug("message from {}: {}...", sender_id, content[:50])
@@ -1747,6 +1774,9 @@ class TelegramChannel(BaseChannel):
         metadata = self._build_message_metadata(
             message, user, reply_details, forward_details
         )
+        if edit_date is not None:
+            metadata["is_edit"] = True
+            metadata["edit_date"] = formatted_edit_date
         session_key = self._derive_topic_session_key(message)
 
         # Telegram media groups: buffer briefly, forward as one aggregated turn.
