@@ -1207,7 +1207,12 @@ class TelegramChannel(BaseChannel):
         return f"telegram:{message.chat_id}:topic:{message_thread_id}"
 
     @staticmethod
-    def _build_message_metadata(message, user, reply_details: dict | None = None) -> dict:
+    def _build_message_metadata(
+        message,
+        user,
+        reply_details: dict | None = None,
+        forward_details: dict | None = None,
+    ) -> dict:
         """Build common Telegram inbound metadata payload."""
         reply_to = TelegramChannel._reply_source(message)
         metadata = {
@@ -1226,7 +1231,75 @@ class TelegramChannel(BaseChannel):
         }
         if reply_details is not None:
             metadata["reply_to"] = reply_details
+        if forward_details is not None:
+            metadata["forward_origin"] = forward_details
         return metadata
+
+    @staticmethod
+    def _extract_forward_details(message) -> dict | None:
+        """Extract JSON-safe attribution for a forwarded Telegram message."""
+        origin = getattr(message, "forward_origin", None)
+        if origin is None:
+            return None
+
+        origin_type = getattr(origin, "type", None)
+        if hasattr(origin_type, "value"):
+            origin_type = origin_type.value
+        details = {"type": str(origin_type or origin.__class__.__name__).lower()}
+        if (date := getattr(origin, "date", None)) is not None:
+            details["date"] = date.isoformat() if hasattr(date, "isoformat") else str(date)
+        if (message_id := getattr(origin, "message_id", None)) is not None:
+            details["message_id"] = message_id
+        if author_signature := getattr(origin, "author_signature", None):
+            details["author_signature"] = author_signature
+        if sender_name := getattr(origin, "sender_user_name", None):
+            details["sender_name"] = sender_name
+
+        sender = getattr(origin, "sender_user", None)
+        if sender is not None:
+            details["sender"] = {
+                "id": getattr(sender, "id", None),
+                "username": getattr(sender, "username", None),
+                "first_name": getattr(sender, "first_name", None),
+            }
+        chat = getattr(origin, "chat", None) or getattr(origin, "sender_chat", None)
+        if chat is not None:
+            details["chat"] = {
+                "id": getattr(chat, "id", None),
+                "type": getattr(chat, "type", None),
+                "title": getattr(chat, "title", None),
+                "username": getattr(chat, "username", None),
+            }
+        return details
+
+    @staticmethod
+    def _format_forward_context(details: dict) -> str:
+        """Render forward attribution as clearly delimited prompt context."""
+        lines = [
+            "[Telegram Forward Context]",
+            "The message content below was forwarded and was not authored by the sender.",
+            f"Origin type: {details['type']}",
+        ]
+        sender = details.get("sender") or {}
+        chat = details.get("chat") or {}
+        if sender.get("username"):
+            lines.append(f"Original author: @{sender['username']}")
+        elif sender.get("first_name"):
+            lines.append(f"Original author: {sender['first_name']}")
+        elif details.get("sender_name"):
+            lines.append(f"Original author: {details['sender_name']}")
+        elif chat.get("title"):
+            lines.append(f"Original chat: {chat['title']}")
+        elif chat.get("username"):
+            lines.append(f"Original chat: @{chat['username']}")
+        if details.get("author_signature"):
+            lines.append(f"Author signature: {details['author_signature']}")
+        if details.get("message_id") is not None:
+            lines.append(f"Original message ID: {details['message_id']}")
+        if details.get("date"):
+            lines.append(f"Original date: {details['date']}")
+        lines.append("[/Telegram Forward Context]")
+        return "\n".join(lines)
 
     @staticmethod
     def _reply_source(message):
@@ -1582,11 +1655,14 @@ class TelegramChannel(BaseChannel):
         content = self._normalize_telegram_command(content)
 
         reply_details = await self._extract_reply_details(message)
+        forward_details = self._extract_forward_details(message)
         await self._handle_message(
             sender_id=sender_id,
             chat_id=str(message.chat_id),
             content=content,
-            metadata=self._build_message_metadata(message, user, reply_details),
+            metadata=self._build_message_metadata(
+                message, user, reply_details, forward_details
+            ),
             session_key=self._derive_topic_session_key(message),
             is_dm=message.chat.type == "private",
         )
@@ -1660,12 +1736,17 @@ class TelegramChannel(BaseChannel):
                     f"Media: {reply_media_parts[0]}\n[/Telegram Reply Context]",
                 )
             content_parts.insert(0, reply_ctx)
+        forward_details = self._extract_forward_details(message)
+        if forward_details is not None:
+            content_parts.insert(0, self._format_forward_context(forward_details))
         content = "\n".join(content_parts) if content_parts else "[empty message]"
 
         self.logger.debug("message from {}: {}...", sender_id, content[:50])
 
         str_chat_id = str(chat_id)
-        metadata = self._build_message_metadata(message, user, reply_details)
+        metadata = self._build_message_metadata(
+            message, user, reply_details, forward_details
+        )
         session_key = self._derive_topic_session_key(message)
 
         # Telegram media groups: buffer briefly, forward as one aggregated turn.

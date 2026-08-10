@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -158,6 +159,7 @@ def _make_telegram_update(
     entities=None,
     caption_entities=None,
     reply_to_message=None,
+    forward_origin=None,
     location=None,
 ):
     user = SimpleNamespace(id=12345, username="alice", first_name="Alice")
@@ -169,6 +171,7 @@ def _make_telegram_update(
         entities=entities or [],
         caption_entities=caption_entities or [],
         reply_to_message=reply_to_message,
+        forward_origin=forward_origin,
         photo=None,
         voice=None,
         audio=None,
@@ -1514,6 +1517,93 @@ async def test_extract_reply_context_supports_quote_without_reply_object() -> No
         "media": [],
     }
     assert "Selected quote: selected words" in context
+
+
+@pytest.mark.asyncio
+async def test_on_message_includes_forward_origin_context_and_metadata() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    channel._start_typing = lambda _chat_id: None
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    origin = SimpleNamespace(
+        type=SimpleNamespace(value="user"),
+        date=datetime(2026, 8, 10, 12, 30, tzinfo=timezone.utc),
+        sender_user=SimpleNamespace(
+            id=77,
+            username="original_author",
+            first_name="Original",
+        ),
+    )
+
+    await channel._on_message(
+        _make_telegram_update(text="Forwarded words", forward_origin=origin),
+        None,
+    )
+
+    assert len(handled) == 1
+    assert handled[0]["content"].startswith("[Telegram Forward Context]")
+    assert "was not authored by the sender" in handled[0]["content"]
+    assert "Original author: @original_author" in handled[0]["content"]
+    assert handled[0]["content"].endswith("Forwarded words")
+    assert handled[0]["metadata"]["forward_origin"] == {
+        "type": "user",
+        "date": "2026-08-10T12:30:00+00:00",
+        "sender": {
+            "id": 77,
+            "username": "original_author",
+            "first_name": "Original",
+        },
+    }
+
+
+def test_extract_forward_details_supports_hidden_and_channel_origins() -> None:
+    hidden = SimpleNamespace(
+        type=SimpleNamespace(value="hidden_user"),
+        sender_user_name="Private Person",
+    )
+    channel_origin = SimpleNamespace(
+        type=SimpleNamespace(value="channel"),
+        message_id=88,
+        author_signature="Editor",
+        chat=SimpleNamespace(
+            id=-1001,
+            type="channel",
+            title="News Desk",
+            username="newsdesk",
+        ),
+    )
+
+    assert TelegramChannel._extract_forward_details(
+        SimpleNamespace(forward_origin=hidden)
+    ) == {
+        "type": "hidden_user",
+        "sender_name": "Private Person",
+    }
+    details = TelegramChannel._extract_forward_details(
+        SimpleNamespace(forward_origin=channel_origin)
+    )
+    assert details == {
+        "type": "channel",
+        "message_id": 88,
+        "author_signature": "Editor",
+        "chat": {
+            "id": -1001,
+            "type": "channel",
+            "title": "News Desk",
+            "username": "newsdesk",
+        },
+    }
+    context = TelegramChannel._format_forward_context(details)
+    assert "Original chat: News Desk" in context
+    assert "Original message ID: 88" in context
 
 
 @pytest.mark.asyncio
