@@ -1200,10 +1200,10 @@ class TelegramChannel(BaseChannel):
         return f"telegram:{message.chat_id}:topic:{message_thread_id}"
 
     @staticmethod
-    def _build_message_metadata(message, user) -> dict:
+    def _build_message_metadata(message, user, reply_details: dict | None = None) -> dict:
         """Build common Telegram inbound metadata payload."""
-        reply_to = getattr(message, "reply_to_message", None)
-        return {
+        reply_to = TelegramChannel._reply_source(message)
+        metadata = {
             "message_id": message.message_id,
             "user_id": user.id,
             "username": user.username,
@@ -1211,32 +1211,133 @@ class TelegramChannel(BaseChannel):
             "is_group": message.chat.type != "private",
             "message_thread_id": getattr(message, "message_thread_id", None),
             "is_forum": bool(getattr(message.chat, "is_forum", False)),
-            "reply_to_message_id": getattr(reply_to, "message_id", None) if reply_to else None,
+            "reply_to_message_id": (
+                reply_details.get("message_id")
+                if reply_details is not None
+                else getattr(reply_to, "message_id", None) if reply_to else None
+            ),
         }
+        if reply_details is not None:
+            metadata["reply_to"] = reply_details
+        return metadata
+
+    @staticmethod
+    def _reply_source(message):
+        """Return Telegram's available direct or external reply object."""
+        return getattr(message, "reply_to_message", None) or getattr(message, "external_reply", None)
+
+    @staticmethod
+    def _describe_reply_media(reply) -> list[dict]:
+        """Return JSON-safe descriptors for media attached to a replied-to message."""
+        media = []
+        for attribute, media_type in (
+            ("photo", "photo"),
+            ("document", "document"),
+            ("voice", "voice"),
+            ("audio", "audio"),
+            ("video", "video"),
+            ("video_note", "video_note"),
+            ("animation", "animation"),
+            ("sticker", "sticker"),
+        ):
+            value = getattr(reply, attribute, None)
+            if not value:
+                continue
+            item = value[-1] if attribute == "photo" else value
+            descriptor = {"type": media_type}
+            for field in (
+                "file_unique_id",
+                "file_name",
+                "mime_type",
+                "file_size",
+                "duration",
+                "width",
+                "height",
+            ):
+                if (field_value := getattr(item, field, None)) is not None:
+                    descriptor[field] = field_value
+            media.append(descriptor)
+        return media
+
+    async def _extract_reply_details(self, message) -> dict | None:
+        """Extract structured context from the message being replied to."""
+        reply = self._reply_source(message)
+        quote = getattr(getattr(message, "quote", None), "text", None)
+        if reply is None and not quote:
+            return None
+
+        bot_id = self._bot_user_id
+        if bot_id is None:
+            try:
+                bot_id, _ = await self._ensure_bot_identity()
+            except Exception as e:
+                self.logger.warning("Failed to identify bot while extracting reply context: {}", e)
+
+        reply_user = getattr(reply, "from_user", None) if reply is not None else None
+        sender_id = getattr(reply_user, "id", None)
+        text = getattr(reply, "text", None) if reply is not None else None
+        caption = getattr(reply, "caption", None) if reply is not None else None
+        details = {
+            "message_id": getattr(reply, "message_id", None) if reply is not None else None,
+            "sent_by_bot": sender_id == bot_id if sender_id is not None and bot_id is not None else None,
+            "text": self._truncate_reply_text(text),
+            "caption": self._truncate_reply_text(caption),
+            "quote": self._truncate_reply_text(quote),
+            "media": self._describe_reply_media(reply) if reply is not None else [],
+        }
+        if reply_user is not None:
+            details["sender"] = {
+                "id": sender_id,
+                "username": getattr(reply_user, "username", None),
+                "first_name": getattr(reply_user, "first_name", None),
+            }
+        return details
+
+    @staticmethod
+    def _truncate_reply_text(text: str | None) -> str | None:
+        if text and len(text) > TELEGRAM_REPLY_CONTEXT_MAX_LEN:
+            return text[:TELEGRAM_REPLY_CONTEXT_MAX_LEN] + "..."
+        return text
+
+    @staticmethod
+    def _format_reply_context(details: dict) -> str:
+        """Render structured reply details as clearly delimited prompt context."""
+        sent_by_bot = details.get("sent_by_bot")
+        bot_label = "yes" if sent_by_bot is True else "no" if sent_by_bot is False else "unknown"
+        lines = [
+            "[Telegram Reply Context]",
+            f"Message ID: {details.get('message_id') or 'unknown'}",
+            f"Sent by this bot: {bot_label}",
+        ]
+        sender = details.get("sender") or {}
+        if sender.get("username"):
+            lines.append(f"Author: @{sender['username']}")
+        elif sender.get("first_name"):
+            lines.append(f"Author: {sender['first_name']}")
+        elif sender.get("id") is not None:
+            lines.append(f"Author ID: {sender['id']}")
+        if details.get("text"):
+            lines.append(f"Text: {details['text']}")
+        if details.get("caption"):
+            lines.append(f"Caption: {details['caption']}")
+        if details.get("quote"):
+            lines.append(f"Selected quote: {details['quote']}")
+        for media in details.get("media") or []:
+            description = media["type"]
+            if media.get("file_name"):
+                description += f" ({media['file_name']})"
+            elif media.get("mime_type"):
+                description += f" ({media['mime_type']})"
+            lines.append(f"Media: {description}")
+        lines.append("[/Telegram Reply Context]")
+        return "\n".join(lines)
 
     async def _extract_reply_context(self, message) -> str | None:
-        """Extract text from the message being replied to, if any."""
-        reply = getattr(message, "reply_to_message", None)
-        if not reply:
+        """Extract prompt context from the message being replied to, if any."""
+        details = await self._extract_reply_details(message)
+        if details is None:
             return None
-        text = getattr(reply, "text", None) or getattr(reply, "caption", None) or ""
-        if len(text) > TELEGRAM_REPLY_CONTEXT_MAX_LEN:
-            text = text[:TELEGRAM_REPLY_CONTEXT_MAX_LEN] + "..."
-
-        if not text:
-            return None
-
-        bot_id, _ = await self._ensure_bot_identity()
-        reply_user = getattr(reply, "from_user", None)
-
-        if bot_id and reply_user and getattr(reply_user, "id", None) == bot_id:
-            return f"[Reply to bot: {text}]"
-        elif reply_user and getattr(reply_user, "username", None):
-            return f"[Reply to @{reply_user.username}: {text}]"
-        elif reply_user and getattr(reply_user, "first_name", None):
-            return f"[Reply to {reply_user.first_name}: {text}]"
-        else:
-            return f"[Reply to: {text}]"
+        return self._format_reply_context(details)
 
     async def _download_message_media(
         self, msg, *, add_failure_content: bool = False
@@ -1473,11 +1574,12 @@ class TelegramChannel(BaseChannel):
             content = f"{cmd_part} {rest[0]}" if rest else cmd_part
         content = self._normalize_telegram_command(content)
 
+        reply_details = await self._extract_reply_details(message)
         await self._handle_message(
             sender_id=sender_id,
             chat_id=str(message.chat_id),
             content=content,
-            metadata=self._build_message_metadata(message, user),
+            metadata=self._build_message_metadata(message, user, reply_details),
             session_key=self._derive_topic_session_key(message),
             is_dm=message.chat.type == "private",
         )
@@ -1535,22 +1637,28 @@ class TelegramChannel(BaseChannel):
             self.logger.debug("Downloaded message media to {}", current_media_paths[0])
 
         # Reply context: text and/or media from the replied-to message
-        reply = getattr(message, "reply_to_message", None)
-        if reply is not None:
-            reply_ctx = await self._extract_reply_context(message)
-            reply_media, reply_media_parts = await self._download_message_media(reply)
+        reply = self._reply_source(message)
+        reply_details = await self._extract_reply_details(message)
+        if reply_details is not None:
+            reply_ctx = self._format_reply_context(reply_details)
+            reply_media, reply_media_parts = (
+                await self._download_message_media(reply) if reply is not None else ([], [])
+            )
             if reply_media:
                 media_paths = reply_media + media_paths
                 self.logger.debug("Attached replied-to media: {}", reply_media[0])
-            tag = reply_ctx or (f"[Reply to: {reply_media_parts[0]}]" if reply_media_parts else None)
-            if tag:
-                content_parts.insert(0, tag)
+            if reply_media_parts and not reply_details["media"]:
+                reply_ctx = reply_ctx.replace(
+                    "[/Telegram Reply Context]",
+                    f"Media: {reply_media_parts[0]}\n[/Telegram Reply Context]",
+                )
+            content_parts.insert(0, reply_ctx)
         content = "\n".join(content_parts) if content_parts else "[empty message]"
 
         self.logger.debug("message from {}: {}...", sender_id, content[:50])
 
         str_chat_id = str(chat_id)
-        metadata = self._build_message_metadata(message, user)
+        metadata = self._build_message_metadata(message, user, reply_details)
         session_key = self._derive_topic_session_key(message)
 
         # Telegram media groups: buffer briefly, forward as one aggregated turn.
