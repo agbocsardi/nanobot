@@ -1253,6 +1253,7 @@ async def test_group_policy_mention_accepts_reply_to_bot() -> None:
     await channel._on_message(_make_telegram_update(text="reply", reply_to_message=reply), None)
 
     assert len(handled) == 1
+    assert handled[0]["metadata"]["reply_to"]["sent_by_bot"] is True
 
 
 @pytest.mark.asyncio
@@ -1287,12 +1288,20 @@ async def test_extract_reply_context_no_reply() -> None:
 
 @pytest.mark.asyncio
 async def test_extract_reply_context_with_text() -> None:
-    """When reply has text, return prefixed string."""
+    """When reply has text, return explicit delimited context."""
     channel = TelegramChannel(TelegramConfig(enabled=True, token="123:abc"), MessageBus())
     channel._app = _FakeApp(lambda: None)
     reply = SimpleNamespace(text="Hello world", caption=None, from_user=SimpleNamespace(id=2, username="testuser", first_name="Test"))
     message = SimpleNamespace(reply_to_message=reply)
-    assert await channel._extract_reply_context(message) == "[Reply to @testuser: Hello world]"
+    context = await channel._extract_reply_context(message)
+    assert context == (
+        "[Telegram Reply Context]\n"
+        "Message ID: unknown\n"
+        "Sent by this bot: no\n"
+        "Author: @testuser\n"
+        "Text: Hello world\n"
+        "[/Telegram Reply Context]"
+    )
 
 
 @pytest.mark.asyncio
@@ -1302,7 +1311,9 @@ async def test_extract_reply_context_with_caption_only() -> None:
     channel._app = _FakeApp(lambda: None)
     reply = SimpleNamespace(text=None, caption="Photo caption", from_user=SimpleNamespace(id=2, username=None, first_name="Test"))
     message = SimpleNamespace(reply_to_message=reply)
-    assert await channel._extract_reply_context(message) == "[Reply to Test: Photo caption]"
+    context = await channel._extract_reply_context(message)
+    assert "Author: Test" in context
+    assert "Caption: Photo caption" in context
 
 
 @pytest.mark.asyncio
@@ -1315,18 +1326,19 @@ async def test_extract_reply_context_truncation() -> None:
     message = SimpleNamespace(reply_to_message=reply)
     result = await channel._extract_reply_context(message)
     assert result is not None
-    assert result.startswith("[Reply to: ")
-    assert result.endswith("...]")
-    assert len(result) == len("[Reply to: ]") + TELEGRAM_REPLY_CONTEXT_MAX_LEN + len("...")
+    assert f"Text: {'x' * TELEGRAM_REPLY_CONTEXT_MAX_LEN}..." in result
+    assert result.endswith("[/Telegram Reply Context]")
 
 
 @pytest.mark.asyncio
-async def test_extract_reply_context_no_text_returns_none() -> None:
-    """When reply has no text/caption, _extract_reply_context returns None (media handled separately)."""
+async def test_extract_reply_context_no_text_still_identifies_reply() -> None:
+    """A reply remains explicit even when Telegram provides no quoted body."""
     channel = TelegramChannel(TelegramConfig(enabled=True, token="123:abc"), MessageBus())
     reply = SimpleNamespace(text=None, caption=None)
     message = SimpleNamespace(reply_to_message=reply)
-    assert await channel._extract_reply_context(message) is None
+    context = await channel._extract_reply_context(message)
+    assert "Message ID: unknown" in context
+    assert context.endswith("[/Telegram Reply Context]")
 
 
 @pytest.mark.asyncio
@@ -1348,8 +1360,78 @@ async def test_on_message_includes_reply_context() -> None:
     await channel._on_message(update, None)
 
     assert len(handled) == 1
-    assert handled[0]["content"].startswith("[Reply to: Hello]")
+    assert handled[0]["content"].startswith("[Telegram Reply Context]")
+    assert "Message ID: 2" in handled[0]["content"]
+    assert "Text: Hello" in handled[0]["content"]
     assert "translate this" in handled[0]["content"]
+    assert handled[0]["metadata"]["reply_to"] == {
+        "message_id": 2,
+        "sent_by_bot": False,
+        "text": "Hello",
+        "caption": None,
+        "quote": None,
+        "media": [],
+        "sender": {"id": 1, "username": None, "first_name": None},
+    }
+
+
+@pytest.mark.asyncio
+async def test_extract_reply_context_supports_external_reply_and_selected_quote() -> None:
+    """Telegram external replies retain their available ID, media, and selected quote."""
+    channel = TelegramChannel(TelegramConfig(enabled=True, token="123:abc"), MessageBus())
+    channel._bot_user_id = 999
+    external_reply = SimpleNamespace(
+        message_id=42,
+        text=None,
+        caption=None,
+        from_user=None,
+        photo=[SimpleNamespace(file_unique_id="photo-1", mime_type="image/jpeg")],
+    )
+    message = SimpleNamespace(
+        reply_to_message=None,
+        external_reply=external_reply,
+        quote=SimpleNamespace(text="selected words"),
+    )
+
+    details = await channel._extract_reply_details(message)
+    context = await channel._extract_reply_context(message)
+
+    assert details == {
+        "message_id": 42,
+        "sent_by_bot": None,
+        "text": None,
+        "caption": None,
+        "quote": "selected words",
+        "media": [{"type": "photo", "file_unique_id": "photo-1", "mime_type": "image/jpeg"}],
+    }
+    assert "Message ID: 42" in context
+    assert "Selected quote: selected words" in context
+    assert "Media: photo (image/jpeg)" in context
+
+
+@pytest.mark.asyncio
+async def test_extract_reply_context_supports_quote_without_reply_object() -> None:
+    """A selected quote remains available when Telegram omits the replied-to message."""
+    channel = TelegramChannel(TelegramConfig(enabled=True, token="123:abc"), MessageBus())
+    channel._bot_user_id = 999
+    message = SimpleNamespace(
+        reply_to_message=None,
+        external_reply=None,
+        quote=SimpleNamespace(text="selected words"),
+    )
+
+    details = await channel._extract_reply_details(message)
+    context = await channel._extract_reply_context(message)
+
+    assert details == {
+        "message_id": None,
+        "sent_by_bot": None,
+        "text": None,
+        "caption": None,
+        "quote": "selected words",
+        "media": [],
+    }
+    assert "Selected quote: selected words" in context
 
 
 @pytest.mark.asyncio
@@ -1482,7 +1564,8 @@ async def test_on_message_attaches_reply_to_media_when_available(monkeypatch, tm
     await channel._on_message(update, None)
 
     assert len(handled) == 1
-    assert handled[0]["content"].startswith("[Reply to: [image:")
+    assert handled[0]["content"].startswith("[Telegram Reply Context]")
+    assert "Media: photo" in handled[0]["content"]
     assert "what is the image?" in handled[0]["content"]
     assert len(handled[0]["media"]) == 1
     assert "reply_photo_fid" in handled[0]["media"][0]
@@ -1490,7 +1573,7 @@ async def test_on_message_attaches_reply_to_media_when_available(monkeypatch, tm
 
 @pytest.mark.asyncio
 async def test_on_message_reply_to_media_fallback_when_download_fails() -> None:
-    """When reply has media but download fails, no media attached and no reply tag."""
+    """Reply metadata and prompt context survive a media download failure."""
     channel = TelegramChannel(
         TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
         MessageBus(),
@@ -1519,7 +1602,11 @@ async def test_on_message_reply_to_media_fallback_when_download_fails() -> None:
 
     assert len(handled) == 1
     assert "what is this?" in handled[0]["content"]
+    assert "Media: photo (image/jpeg)" in handled[0]["content"]
     assert handled[0]["media"] == []
+    assert handled[0]["metadata"]["reply_to"]["media"] == [
+        {"type": "photo", "mime_type": "image/jpeg"}
+    ]
 
 
 @pytest.mark.asyncio
@@ -1565,7 +1652,8 @@ async def test_on_message_reply_to_caption_and_media(monkeypatch, tmp_path) -> N
     await channel._on_message(update, None)
 
     assert len(handled) == 1
-    assert "[Reply to: A cute cat]" in handled[0]["content"]
+    assert "Caption: A cute cat" in handled[0]["content"]
+    assert "Media: photo (image/jpeg)" in handled[0]["content"]
     assert "what breed is this?" in handled[0]["content"]
     assert len(handled[0]["media"]) == 1
     assert "cat_fid" in handled[0]["media"][0]
