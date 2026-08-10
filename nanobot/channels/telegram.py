@@ -1070,12 +1070,19 @@ class TelegramChannel(BaseChannel):
         thread_kwargs = {}
         if message_thread_id := meta.get("message_thread_id"):
             thread_kwargs["message_thread_id"] = message_thread_id
+        reply_params = None
+        if self.config.reply_to_message and (reply_to_message_id := meta.get("message_id")):
+            reply_params = ReplyParameters(
+                message_id=int(reply_to_message_id),
+                allow_sending_without_reply=True,
+            )
         if buf.message_id is None:
             preview = _strip_md_block(buf.text)
             try:
                 sent = await self._call_with_retry(
                     self._app.bot.send_message,
                     chat_id=int_chat_id, text=preview,
+                    reply_parameters=reply_params,
                     **thread_kwargs,
                 )
                 buf.message_id = sent.message_id

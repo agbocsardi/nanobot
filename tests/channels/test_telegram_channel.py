@@ -1018,6 +1018,47 @@ async def test_send_delta_initial_send_keeps_message_in_thread() -> None:
     assert channel._app.bot.sent_messages[0]["message_thread_id"] == 42
 
 
+@pytest.mark.asyncio
+async def test_send_delta_initial_send_replies_to_source_message_when_enabled() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(
+            enabled=True,
+            token="123:abc",
+            allow_from=["*"],
+            reply_to_message=True,
+        ),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+
+    await channel.send_delta(
+        "123",
+        "hello",
+        {"_stream_delta": True, "_stream_id": "s:0", "message_id": "42"},
+    )
+
+    reply = channel._app.bot.sent_messages[0]["reply_parameters"]
+    assert reply.message_id == 42
+    assert reply.allow_sending_without_reply is True
+
+
+@pytest.mark.asyncio
+async def test_send_delta_initial_send_does_not_reply_when_disabled() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+
+    await channel.send_delta(
+        "123",
+        "hello",
+        {"_stream_delta": True, "_stream_id": "s:0", "message_id": "42"},
+    )
+
+    assert channel._app.bot.sent_messages[0]["reply_parameters"] is None
+
+
 def test_derive_topic_session_key_uses_thread_id() -> None:
     message = SimpleNamespace(
         chat=SimpleNamespace(type="supergroup"),
