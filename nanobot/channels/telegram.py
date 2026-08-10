@@ -1241,9 +1241,8 @@ class TelegramChannel(BaseChannel):
         return metadata
 
     @staticmethod
-    def _extract_forward_details(message) -> dict | None:
-        """Extract JSON-safe attribution for a forwarded Telegram message."""
-        origin = getattr(message, "forward_origin", None)
+    def _extract_origin_details(origin) -> dict | None:
+        """Extract JSON-safe attribution from a Telegram message origin."""
         if origin is None:
             return None
 
@@ -1276,6 +1275,13 @@ class TelegramChannel(BaseChannel):
                 "username": getattr(chat, "username", None),
             }
         return details
+
+    @staticmethod
+    def _extract_forward_details(message) -> dict | None:
+        """Extract JSON-safe attribution for a forwarded Telegram message."""
+        return TelegramChannel._extract_origin_details(
+            getattr(message, "forward_origin", None)
+        )
 
     @staticmethod
     def _format_forward_context(details: dict) -> str:
@@ -1359,7 +1365,12 @@ class TelegramChannel(BaseChannel):
                 self.logger.warning("Failed to identify bot while extracting reply context: {}", e)
 
         reply_user = getattr(reply, "from_user", None) if reply is not None else None
+        origin_details = self._extract_origin_details(
+            getattr(reply, "origin", None) if reply is not None else None
+        )
         sender_id = getattr(reply_user, "id", None)
+        if sender_id is None and origin_details is not None:
+            sender_id = (origin_details.get("sender") or {}).get("id")
         text = getattr(reply, "text", None) if reply is not None else None
         caption = getattr(reply, "caption", None) if reply is not None else None
         details = {
@@ -1376,6 +1387,8 @@ class TelegramChannel(BaseChannel):
                 "username": getattr(reply_user, "username", None),
                 "first_name": getattr(reply_user, "first_name", None),
             }
+        if origin_details is not None:
+            details["origin"] = origin_details
         return details
 
     @staticmethod
@@ -1394,13 +1407,21 @@ class TelegramChannel(BaseChannel):
             f"Message ID: {details.get('message_id') or 'unknown'}",
             f"Sent by this bot: {bot_label}",
         ]
-        sender = details.get("sender") or {}
+        origin = details.get("origin") or {}
+        sender = details.get("sender") or origin.get("sender") or {}
+        origin_chat = origin.get("chat") or {}
         if sender.get("username"):
             lines.append(f"Author: @{sender['username']}")
         elif sender.get("first_name"):
             lines.append(f"Author: {sender['first_name']}")
         elif sender.get("id") is not None:
             lines.append(f"Author ID: {sender['id']}")
+        elif origin.get("sender_name"):
+            lines.append(f"Author: {origin['sender_name']}")
+        elif origin_chat.get("title"):
+            lines.append(f"Source chat: {origin_chat['title']}")
+        elif origin_chat.get("username"):
+            lines.append(f"Source chat: @{origin_chat['username']}")
         if details.get("text"):
             lines.append(f"Text: {details['text']}")
         if details.get("caption"):

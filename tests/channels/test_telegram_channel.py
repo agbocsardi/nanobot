@@ -1508,15 +1508,30 @@ async def test_on_message_includes_reply_context() -> None:
 
 @pytest.mark.asyncio
 async def test_extract_reply_context_supports_external_reply_and_selected_quote() -> None:
-    """Telegram external replies retain their available ID, media, and selected quote."""
+    """Real PTB external replies retain attribution, ID, media, and selected quote."""
     channel = TelegramChannel(TelegramConfig(enabled=True, token="123:abc"), MessageBus())
     channel._bot_user_id = 999
-    external_reply = SimpleNamespace(
+    origin_date = datetime(2026, 8, 10, 12, 30, tzinfo=timezone.utc)
+    origin = telegram.MessageOriginUser(
+        date=origin_date,
+        sender_user=telegram.User(
+            id=77,
+            first_name="External",
+            is_bot=False,
+            username="external_author",
+        ),
+    )
+    external_reply = telegram.ExternalReplyInfo(
+        origin=origin,
         message_id=42,
-        text=None,
-        caption=None,
-        from_user=None,
-        photo=[SimpleNamespace(file_unique_id="photo-1", mime_type="image/jpeg")],
+        photo=[
+            telegram.PhotoSize(
+                file_id="photo-file",
+                file_unique_id="photo-1",
+                width=10,
+                height=10,
+            )
+        ],
     )
     message = SimpleNamespace(
         reply_to_message=None,
@@ -1529,15 +1544,27 @@ async def test_extract_reply_context_supports_external_reply_and_selected_quote(
 
     assert details == {
         "message_id": 42,
-        "sent_by_bot": None,
+        "sent_by_bot": False,
         "text": None,
         "caption": None,
         "quote": "selected words",
-        "media": [{"type": "photo", "file_unique_id": "photo-1", "mime_type": "image/jpeg"}],
+        "media": [
+            {"type": "photo", "file_unique_id": "photo-1", "width": 10, "height": 10}
+        ],
+        "origin": {
+            "type": "user",
+            "date": "2026-08-10T12:30:00+00:00",
+            "sender": {
+                "id": 77,
+                "username": "external_author",
+                "first_name": "External",
+            },
+        },
     }
     assert "Message ID: 42" in context
+    assert "Author: @external_author" in context
     assert "Selected quote: selected words" in context
-    assert "Media: photo (image/jpeg)" in context
+    assert "Media: photo" in context
 
 
 @pytest.mark.asyncio
