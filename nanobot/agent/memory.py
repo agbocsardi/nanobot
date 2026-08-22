@@ -852,10 +852,32 @@ class MemoryStore:
         """Remove the oldest Dream session files, keeping only the N most recent.
 
         Only files matching ``dream_*.jsonl`` are considered. Non-dream session
-        files are never touched.
+        files are never touched. Persisted session timestamps are authoritative;
+        filenames provide a deterministic fallback for incomplete files.
         """
+        def session_order(path: Path) -> tuple[int, float, str]:
+            try:
+                with path.open(encoding="utf-8") as file:
+                    metadata = json.loads(file.readline())
+                if isinstance(metadata, dict):
+                    for field in ("updated_at", "created_at"):
+                        value = metadata.get(field)
+                        if isinstance(value, str):
+                            try:
+                                return 2, datetime.fromisoformat(value).timestamp(), path.name
+                            except ValueError:
+                                continue
+            except (OSError, json.JSONDecodeError):
+                pass
+
+            timestamp = path.stem.removeprefix("dream_")
+            try:
+                return 1, datetime.strptime(timestamp, "%Y%m%d-%H%M%S").timestamp(), path.name
+            except ValueError:
+                return 0, 0.0, path.name
+
         dream_files = sorted(
-            sessions_dir.glob("dream_*.jsonl"), key=lambda p: p.stat().st_mtime,
+            sessions_dir.glob("dream_*.jsonl"), key=session_order,
         )
         if len(dream_files) <= keep:
             return
