@@ -7,6 +7,7 @@ that ran, token usage, iterations, and tool events — everything previously
 lost when a subagent finished.
 """
 
+import asyncio
 import json
 import time
 from pathlib import Path
@@ -196,12 +197,14 @@ class TestSubagentRunRecord:
                 _status(),
                 max_iterations=7,
                 context_window_tokens=32_000,
+                model_preset="careful",
             )
 
         rec = _read_record(tmp_path, "t1")
         assert rec["params"]["max_iterations"] == 7
         assert rec["params"]["context_window_tokens"] == 32_000
         assert rec["params"]["max_tool_result_chars"] == 16_000
+        assert rec["params"]["model_preset"] == "careful"
 
     @pytest.mark.asyncio
     async def test_record_persists_task_relevant_context_decisions(self, tmp_path):
@@ -250,3 +253,26 @@ class TestSubagentRunRecord:
                 {"channel": "cli", "chat_id": "direct"}, _status(),
             )
             announce.assert_called_once()  # announce still happened
+
+    @pytest.mark.asyncio
+    async def test_spawned_cancellation_persists_real_terminal_record(self, tmp_path):
+        sm = _manager(tmp_path)
+        started = asyncio.Event()
+
+        async def block(_spec):
+            started.set()
+            await asyncio.sleep(60)
+
+        sm.runner.run = block
+        response = await sm.spawn("cancel me", session_key="cli:cancel")
+        task_id = response.split("id: ", 1)[1].split(")", 1)[0]
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        assert await sm.cancel_by_session("cli:cancel") == 1
+        await asyncio.sleep(0)
+
+        record = _read_record(tmp_path, task_id)
+        assert record["phase"] == "cancelled"
+        assert record["stop_reason"] == "cancelled"
+        assert record["result"] == "Task was cancelled before completion."
+        assert sm.runtime_statuses()[task_id].phase == "cancelled"

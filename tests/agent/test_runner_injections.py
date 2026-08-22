@@ -681,6 +681,51 @@ async def test_followup_routed_to_pending_queue(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_subagent_result_routes_to_live_parent_queue(tmp_path):
+    """A real subagent announcement must enter its parent's active turn queue."""
+    from nanobot.agent.subagent import SubagentManager
+
+    loop = _make_loop(tmp_path)
+    loop._dispatch = AsyncMock()  # type: ignore[method-assign]
+    session_key = "telegram:42"
+    pending = asyncio.Queue(maxsize=20)
+    loop._pending_queues[session_key] = pending
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    manager = SubagentManager(
+        provider=provider,
+        workspace=tmp_path,
+        bus=loop.bus,
+        max_tool_result_chars=16_000,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    await manager._announce_result(
+        "sub-1",
+        "worker",
+        "inspect",
+        "finished",
+        {"channel": "telegram", "chat_id": "42", "session_key": session_key},
+        "ok",
+        stop_reason="completed",
+    )
+    queued_msg = await asyncio.wait_for(pending.get(), timeout=2)
+
+    loop.stop()
+    await asyncio.wait_for(run_task, timeout=2)
+
+    assert loop._dispatch.await_count == 0
+    assert queued_msg.session_key == session_key
+    assert queued_msg.metadata["delivery_policy"] == "parent"
+    assert queued_msg.metadata["subagent_result"] == {
+        "task_id": "sub-1",
+        "status": "ok",
+        "stop_reason": "completed",
+        "result": "finished",
+    }
+
+
+@pytest.mark.asyncio
 async def test_cron_turn_deferred_while_session_active(tmp_path):
     """Cron turns wait for the active session instead of becoming injections."""
     from nanobot.bus.events import InboundMessage
