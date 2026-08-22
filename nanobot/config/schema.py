@@ -294,6 +294,20 @@ class MCPServerConfig(Base):
     oauth_scopes: str = "openid mcp.tools offline_access"  # OAuth scopes; `offline_access` yields a refresh token so the gateway can auto-refresh
 
 
+class ToolPolicyRuleConfig(Base):
+    """One ordered tool policy rule; later matching rules take precedence."""
+
+    id: str = Field(min_length=1)
+    outcome: Literal["allow", "deny", "ask"]
+    mode: str = "*"
+    tool: str = "*"
+    resource: str = "*"
+    mutation: Literal["read", "write", "*"] = "*"
+    model: str = "*"
+    preset: str = "*"
+    reason: str = ""
+
+
 def _lazy_default(module_path: str, class_name: str) -> Any:
     """Deferred import helper for ToolsConfig default factories."""
     import importlib
@@ -320,6 +334,7 @@ class ToolsConfig(Base):
     restrict_to_workspace: bool = False  # policy intent: keep tool access inside workspace when possible
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
     ssrf_whitelist: list[str] = Field(default_factory=list)  # CIDR ranges to exempt from SSRF blocking (e.g. ["100.64.0.0/10"] for Tailscale)
+    policies: list[ToolPolicyRuleConfig] = Field(default_factory=list)
 
 
 class Config(BaseSettings):
