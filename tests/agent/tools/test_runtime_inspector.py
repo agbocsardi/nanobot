@@ -185,11 +185,17 @@ def test_snapshot_uses_live_goal_delegated_and_cron_state(tmp_path) -> None:
     assert delegated["runs"][0]["phase"] == "running"
     assert delegated["runs"][0]["effective_budgets"]["available"] is False
     assert delegated["manager_budgets"]["max_concurrent"] == 2
-    assert delegated["queue"] == {"available": True, "queued": 1, "capacity": 8}
+    assert delegated["queue"] == {
+        "available": True,
+        "queued": 1,
+        "capacity": 8,
+        "available_slots": 7,
+    }
     assert delegated["execution_capacity"] == {
         "available": True,
         "in_use": 2,
         "capacity": 2,
+        "available_slots": 0,
     }
     cron = snapshot["cron"]["jobs"][0]
     assert cron["recent_terminal"]["status"] == "error"

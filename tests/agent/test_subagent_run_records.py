@@ -205,6 +205,7 @@ class TestSubagentRunRecord:
         assert rec["params"]["context_window_tokens"] == 32_000
         assert rec["params"]["max_tool_result_chars"] == 16_000
         assert rec["params"]["model_preset"] == "careful"
+        assert rec["model_preset"] == "careful"
 
     @pytest.mark.asyncio
     async def test_record_persists_task_relevant_context_decisions(self, tmp_path):
@@ -276,3 +277,17 @@ class TestSubagentRunRecord:
         assert record["stop_reason"] == "cancelled"
         assert record["result"] == "Task was cancelled before completion."
         assert sm.runtime_statuses()[task_id].phase == "cancelled"
+
+    @pytest.mark.asyncio
+    async def test_immediate_cancellation_awaits_fallback_announcement(self, tmp_path):
+        sm = _manager(tmp_path)
+        response = await sm.spawn("cancel before start", session_key="cli:immediate")
+        task_id = response.split("id: ", 1)[1].split(")", 1)[0]
+
+        assert await sm.cancel_by_session("cli:immediate") == 1
+
+        announcement = await asyncio.wait_for(sm.bus.consume_inbound(), timeout=1)
+        record = _read_record(tmp_path, task_id)
+        assert announcement.metadata["subagent_result"]["stop_reason"] == "cancelled"
+        assert record["phase"] == "cancelled"
+        assert sm._finalizer_tasks == set()

@@ -682,14 +682,21 @@ async def test_followup_routed_to_pending_queue(tmp_path):
 
 @pytest.mark.asyncio
 async def test_subagent_result_routes_to_live_parent_queue(tmp_path):
-    """A real subagent announcement must enter its parent's active turn queue."""
+    """A subagent result must route through AgentLoop into its active parent dispatch."""
     from nanobot.agent.subagent import SubagentManager
+    from nanobot.bus.events import InboundMessage, OutboundMessage
 
     loop = _make_loop(tmp_path)
-    loop._dispatch = AsyncMock()  # type: ignore[method-assign]
     session_key = "telegram:42"
-    pending = asyncio.Queue(maxsize=20)
-    loop._pending_queues[session_key] = pending
+    parent_started = asyncio.Event()
+    received = []
+
+    async def process_parent(msg, *, pending_queue, **_kwargs):
+        parent_started.set()
+        received.append(await asyncio.wait_for(pending_queue.get(), timeout=2))
+        return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content="done")
+
+    loop._process_message = process_parent  # type: ignore[method-assign]
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
     manager = SubagentManager(
@@ -700,6 +707,13 @@ async def test_subagent_result_routes_to_live_parent_queue(tmp_path):
     )
 
     run_task = asyncio.create_task(loop.run())
+    await loop.bus.publish_inbound(InboundMessage(
+        channel="telegram",
+        sender_id="user",
+        chat_id="42",
+        content="start parent turn",
+    ))
+    await asyncio.wait_for(parent_started.wait(), timeout=2)
     await manager._announce_result(
         "sub-1",
         "worker",
@@ -709,12 +723,14 @@ async def test_subagent_result_routes_to_live_parent_queue(tmp_path):
         "ok",
         stop_reason="completed",
     )
-    queued_msg = await asyncio.wait_for(pending.get(), timeout=2)
+    outbound = await asyncio.wait_for(loop.bus.consume_outbound(), timeout=2)
 
     loop.stop()
     await asyncio.wait_for(run_task, timeout=2)
 
-    assert loop._dispatch.await_count == 0
+    assert outbound.content == "done"
+    assert len(received) == 1
+    queued_msg = received[0]
     assert queued_msg.session_key == session_key
     assert queued_msg.metadata["delivery_policy"] == "parent"
     assert queued_msg.metadata["subagent_result"] == {

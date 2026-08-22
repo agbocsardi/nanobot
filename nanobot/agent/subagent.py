@@ -141,6 +141,7 @@ class SubagentManager:
         # it cost". Defaults to <workspace>/subagents/.
         self.records_dir = workspace / "subagents"
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
+        self._finalizer_tasks: set[asyncio.Task[None]] = set()
         self._task_statuses: dict[str, SubagentStatus] = {}
         self._terminal_statuses: dict[str, SubagentStatus] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
@@ -284,7 +285,7 @@ class SubagentManager:
                     provider=effective_provider,
                     model=effective_model,
                 )
-                asyncio.create_task(self._announce_result(
+                finalizer = asyncio.create_task(self._announce_result(
                     task_id,
                     display_label,
                     task,
@@ -294,6 +295,8 @@ class SubagentManager:
                     origin_message_id,
                     stop_reason="cancelled",
                 ))
+                self._finalizer_tasks.add(finalizer)
+                finalizer.add_done_callback(self._finalizer_tasks.discard)
             self._running_tasks.pop(task_id, None)
             terminal_status = self._task_statuses.pop(task_id, None)
             if terminal_status is not None:
@@ -718,6 +721,9 @@ class SubagentManager:
             t.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.sleep(0)
+            if self._finalizer_tasks:
+                await asyncio.gather(*list(self._finalizer_tasks), return_exceptions=True)
         return len(tasks)
 
     def get_running_count(self) -> int:
@@ -785,6 +791,7 @@ class SubagentManager:
                 ),
             },
             "model": model or self.model,
+            "model_preset": status.effective_budgets.get("model_preset"),
             "provider": self._provider_name(provider),
             "iterations": int(status.iteration),
             "stop_reason": status.stop_reason,

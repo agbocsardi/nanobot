@@ -131,29 +131,41 @@ class RuntimeInspector:
                     **dict(getattr(status, "effective_budgets", None) or {}),
                 },
             })
+        queued = (
+            manager.get_queued_count()
+            if manager is not None and hasattr(manager, "get_queued_count")
+            else None
+        )
+        queue_capacity = self._primitive(getattr(manager, "max_queued_subagents", None))
+        executing = (
+            manager.get_executing_count()
+            if manager is not None and hasattr(manager, "get_executing_count")
+            else None
+        )
+        execution_capacity = self._primitive(
+            getattr(manager, "max_concurrent_subagents", None)
+        )
         return {
             "available": manager is not None,
             "runs": runs,
             "queue": {
                 "available": manager is not None,
-                "queued": (
-                    manager.get_queued_count()
-                    if manager is not None and hasattr(manager, "get_queued_count")
+                "queued": queued,
+                "capacity": queue_capacity,
+                "available_slots": (
+                    max(0, queue_capacity - queued)
+                    if isinstance(queue_capacity, int) and isinstance(queued, int)
                     else None
-                ),
-                "capacity": self._primitive(
-                    getattr(manager, "max_queued_subagents", None)
                 ),
             },
             "execution_capacity": {
                 "available": manager is not None,
-                "in_use": (
-                    manager.get_executing_count()
-                    if manager is not None and hasattr(manager, "get_executing_count")
+                "in_use": executing,
+                "capacity": execution_capacity,
+                "available_slots": (
+                    max(0, execution_capacity - executing)
+                    if isinstance(execution_capacity, int) and isinstance(executing, int)
                     else None
-                ),
-                "capacity": self._primitive(
-                    getattr(manager, "max_concurrent_subagents", None)
                 ),
             },
             "manager_budgets": {
