@@ -427,6 +427,11 @@ class AgentLoop:
         from nanobot.config.loader import get_config_path
 
         config_path = get_config_path()
+        loaded_config_path = extra.pop("loaded_config_path", config_path)
+        loaded_config_fingerprint = extra.pop(
+            "loaded_config_fingerprint",
+            fingerprint_file(loaded_config_path),
+        )
         return cls(
             bus=bus,
             provider=provider,
@@ -445,8 +450,8 @@ class AgentLoop:
             timezone=defaults.timezone,
             unified_session=defaults.unified_session,
             disabled_skills=defaults.disabled_skills,
-            loaded_config_path=config_path,
-            loaded_config_fingerprint=fingerprint_file(config_path),
+            loaded_config_path=loaded_config_path,
+            loaded_config_fingerprint=loaded_config_fingerprint,
             session_ttl_minutes=defaults.session_ttl_minutes,
             consolidation_ratio=defaults.consolidation_ratio,
             max_messages=defaults.max_messages,

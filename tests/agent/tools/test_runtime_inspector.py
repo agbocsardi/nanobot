@@ -53,6 +53,7 @@ def test_snapshot_represents_absent_subsystems_and_repository_identity(tmp_path)
         ("status", "--porcelain"): " M file.py",
         ("branch", "--show-current"): "feat/status",
         ("rev-parse", "HEAD"): "abc123",
+        ("remote", "get-url", "origin"): "git@github.com:agbocsardi/nanobot.git",
     }
 
     with patch.object(
@@ -63,6 +64,7 @@ def test_snapshot_represents_absent_subsystems_and_repository_identity(tmp_path)
         snapshot = RuntimeInspector(runtime).snapshot(session_key="telegram:1")
 
     assert set(snapshot) == {
+        "version",
         "runtime",
         "config",
         "session",
@@ -85,6 +87,7 @@ def test_snapshot_represents_absent_subsystems_and_repository_identity(tmp_path)
         "commit": "abc123",
         "dirty": True,
         "upstream": "origin/main",
+        "origin": "git@github.com:agbocsardi/nanobot.git",
         "ahead": 3,
         "behind": 2,
     }
@@ -111,6 +114,60 @@ def test_snapshot_detects_restart_required_config_drift(tmp_path) -> None:
         "restart_required",
         "drift_status",
     }
+
+
+def test_snapshot_uses_live_goal_delegated_and_cron_state(tmp_path) -> None:
+    runtime = _runtime(tmp_path)
+    runtime.sessions._cache["telegram:1"] = SimpleNamespace(metadata={
+        "goal_state": {"status": "active", "objective": "Finish the migration"},
+    })
+    status = SimpleNamespace(
+        label="worker",
+        phase="running",
+        iteration=3,
+        stop_reason=None,
+        error=None,
+    )
+    runtime.subagents = SimpleNamespace(
+        runtime_statuses=lambda: {"task-1": status},
+        max_iterations=20,
+        max_concurrent_subagents=2,
+        max_tool_result_chars=8000,
+    )
+    recent = SimpleNamespace(
+        run_at_ms=100,
+        status="error",
+        duration_ms=25,
+        error="delivery failed",
+    )
+    job = SimpleNamespace(
+        id="job-1",
+        name="daily",
+        enabled=True,
+        state=SimpleNamespace(
+            last_status="error",
+            last_error="delivery failed",
+            last_run_at_ms=100,
+            next_run_at_ms=200,
+            run_history=[recent],
+        ),
+    )
+    runtime.cron_service = SimpleNamespace(list_jobs=lambda: [job])
+
+    with patch.object(RuntimeInspector, "_repository", return_value={"available": False}):
+        snapshot = RuntimeInspector(runtime).snapshot(session_key="telegram:1")
+
+    assert snapshot["session"]["active_goal"] == {
+        "active": True,
+        "objective": "Finish the migration",
+    }
+    delegated = snapshot["delegated_work"]
+    assert delegated["runs"][0]["phase"] == "running"
+    assert delegated["runs"][0]["effective_budgets"]["available"] is False
+    assert delegated["manager_budgets"]["max_concurrent"] == 2
+    cron = snapshot["cron"]["jobs"][0]
+    assert cron["recent_terminal"]["status"] == "error"
+    assert cron["delivery"]["available"] is False
 
 
 @pytest.mark.asyncio

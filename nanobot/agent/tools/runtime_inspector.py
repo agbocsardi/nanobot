@@ -25,6 +25,7 @@ class RuntimeInspector:
 
     def snapshot(self, *, session_key: str | None = None) -> dict[str, Any]:
         return {
+            "version": 1,
             "runtime": self._runtime(),
             "config": self._config(),
             "session": self._session(session_key),
@@ -69,15 +70,18 @@ class RuntimeInspector:
         loaded = self._primitive(getattr(self.runtime, "_loaded_config_fingerprint", None))
         on_disk = fingerprint_file(path)
         available = path.exists()
+        restart_required = loaded != on_disk if loaded else None
         return {
             "available": available,
             "path": str(path),
             "loaded_fingerprint": loaded,
             "on_disk_fingerprint": on_disk,
-            "restart_required": bool(loaded and on_disk and loaded != on_disk),
+            "restart_required": restart_required,
             "drift_status": (
-                "unavailable"
-                if not available or not loaded
+                "missing"
+                if loaded and not available
+                else "untracked"
+                if not loaded
                 else "changed"
                 if loaded != on_disk
                 else "current"
@@ -91,7 +95,12 @@ class RuntimeInspector:
         if session_key and isinstance(cache, dict):
             session = cache.get(session_key)
         metadata = getattr(session, "metadata", None)
-        goal = metadata.get("goal_state") if isinstance(metadata, dict) else None
+        if isinstance(metadata, dict):
+            from nanobot.session.goal_state import goal_state_ws_blob
+
+            goal = goal_state_ws_blob(metadata)
+        else:
+            goal = None
         return {
             "available": session is not None,
             "key": session_key,
@@ -116,6 +125,10 @@ class RuntimeInspector:
                 "iteration": self._primitive(getattr(status, "iteration", None)),
                 "stop_reason": self._primitive(getattr(status, "stop_reason", None)),
                 "error": self._primitive(getattr(status, "error", None)),
+                "effective_budgets": {
+                    "available": False,
+                    "reason": "per-run budgets are not recorded in runtime status",
+                },
             })
         return {
             "available": manager is not None,
@@ -142,6 +155,8 @@ class RuntimeInspector:
             try:
                 for job in service.list_jobs():
                     state = getattr(job, "state", None)
+                    history = list(getattr(state, "run_history", None) or [])
+                    recent = history[-1] if history else None
                     jobs.append({
                         "id": self._primitive(getattr(job, "id", None)),
                         "name": self._primitive(getattr(job, "name", None)),
@@ -154,6 +169,24 @@ class RuntimeInspector:
                         "next_run_at_ms": self._primitive(
                             getattr(state, "next_run_at_ms", None)
                         ),
+                        "recent_terminal": (
+                            {
+                                "run_at_ms": self._primitive(
+                                    getattr(recent, "run_at_ms", None)
+                                ),
+                                "status": self._primitive(getattr(recent, "status", None)),
+                                "duration_ms": self._primitive(
+                                    getattr(recent, "duration_ms", None)
+                                ),
+                                "error": self._primitive(getattr(recent, "error", None)),
+                            }
+                            if recent is not None
+                            else None
+                        ),
+                        "delivery": {
+                            "available": False,
+                            "reason": "cron state does not record delivery postconditions",
+                        },
                     })
             except Exception:
                 jobs = []
@@ -178,6 +211,7 @@ class RuntimeInspector:
                 "commit": None,
                 "dirty": None,
                 "upstream": None,
+                "origin": None,
                 "ahead": None,
                 "behind": None,
             }
@@ -201,6 +235,7 @@ class RuntimeInspector:
             "commit": self._git(root_path, "rev-parse", "HEAD"),
             "dirty": bool(status),
             "upstream": upstream,
+            "origin": self._git(root_path, "remote", "get-url", "origin"),
             "ahead": ahead,
             "behind": behind,
         }
