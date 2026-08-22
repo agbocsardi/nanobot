@@ -39,12 +39,13 @@ class SubagentStatus:
     label: str
     task_description: str
     started_at: float          # time.monotonic()
-    phase: str = "initializing"  # initializing | awaiting_tools | tools_completed | final_response | done | error
+    phase: str = "queued"
     iteration: int = 0
     tool_events: list = field(default_factory=list)   # [{name, status, detail}, ...]
     usage: dict = field(default_factory=dict)          # token usage
     stop_reason: str | None = None
     error: str | None = None
+    effective_budgets: dict[str, Any] = field(default_factory=dict)
 
 
 class _SubagentHook(AgentHook):
@@ -181,20 +182,28 @@ class SubagentManager:
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
         origin = {"channel": origin_channel, "chat_id": origin_chat_id, "session_key": session_key}
 
-        status = SubagentStatus(
-            task_id=task_id,
-            label=display_label,
-            task_description=task,
-            started_at=time.monotonic(),
-        )
-        self._task_statuses[task_id] = status
-
         provider_override: LLMProvider | None = None
         model_override: str | None = None
         preset_ctx: int | None = None
         if model_preset:
             provider_override, model_override, preset_ctx = self._resolve_preset_override(model_preset)
         effective_ctx = context_window_tokens or preset_ctx
+
+        status = SubagentStatus(
+            task_id=task_id,
+            label=display_label,
+            task_description=task,
+            started_at=time.monotonic(),
+            effective_budgets={
+                "max_iterations": (
+                    max_iterations if max_iterations is not None else self.max_iterations
+                ),
+                "context_window_tokens": effective_ctx,
+                "max_tool_result_chars": self.max_tool_result_chars,
+                "model": model_override or self.run_model or self.model,
+            },
+        )
+        self._task_statuses[task_id] = status
 
         bg_task = asyncio.create_task(
             self._run_subagent(
@@ -261,6 +270,7 @@ class SubagentManager:
         max_iterations: int | None = None,
     ) -> None:
         """Execute the subagent task and announce the result."""
+        status.phase = "running"
         logger.info("Subagent [{}] starting task: {}", task_id, label)
 
         async def _on_checkpoint(payload: dict) -> None:
@@ -273,6 +283,14 @@ class SubagentManager:
         # raises before the inner try resolves them.
         run_provider = provider_override or self.run_provider or self.provider
         run_model = model_override or self.run_model or self.model
+        eff_max_iterations = max_iterations if max_iterations is not None else self.max_iterations
+        if not status.effective_budgets:
+            status.effective_budgets = {
+                "max_iterations": eff_max_iterations,
+                "context_window_tokens": context_window_tokens,
+                "max_tool_result_chars": self.max_tool_result_chars,
+                "model": run_model,
+            }
         try:
             root = workspace_scope.project_path if workspace_scope is not None else self.workspace
             cfg = None
@@ -294,9 +312,6 @@ class SubagentManager:
             )
             token = bind_workspace_scope(workspace_scope) if workspace_scope is not None else None
             try:
-                eff_max_iterations = (
-                    max_iterations if max_iterations is not None else self.max_iterations
-                )
                 dedicated = provider_override is not None or self.run_provider is not None
                 runner = AgentRunner(run_provider) if dedicated else self.runner
                 result = await runner.run(AgentRunSpec(
@@ -308,10 +323,10 @@ class SubagentManager:
                     max_tool_result_chars=self.max_tool_result_chars,
                     context_window_tokens=context_window_tokens,
                     hook=_SubagentHook(task_id, status),
-                    max_iterations_message="Task completed but no final response was generated.",
-                    finalize_on_max_iterations=False,
+                    max_iterations_message="Task ended without a verified final synthesis.",
+                    finalize_on_max_iterations=True,
                     error_message=None,
-                    fail_on_tool_error=True,
+                    fail_on_tool_error=False,
                     checkpoint_callback=_on_checkpoint,
                     session_key=sess_key,
                     workspace=root,
@@ -320,7 +335,6 @@ class SubagentManager:
             finally:
                 if token is not None:
                     reset_workspace_scope(token)
-            status.phase = "done"
             status.stop_reason = result.stop_reason
             status.tool_events = list(result.tool_events)
             # result.usage is the authoritative token count for the run; mirror
@@ -330,20 +344,30 @@ class SubagentManager:
                 status.usage = dict(result.usage)
 
             if result.stop_reason == "tool_error":
+                status.phase = "failed"
                 record_result = self._format_partial_progress(result)
                 await self._announce_result(
                     task_id, label, task,
                     record_result,
                     origin, "error", origin_message_id,
+                    stop_reason=result.stop_reason,
                 )
             elif result.stop_reason in {"error", "provider_error"}:
+                status.phase = "failed"
                 record_result = result.error or "Error: subagent execution failed."
                 await self._announce_result(
                     task_id, label, task,
                     record_result,
                     origin, "error", origin_message_id,
+                    stop_reason=result.stop_reason,
                 )
-            elif result.stop_reason in {"partial_completion", "policy_block"}:
+            elif result.stop_reason in {
+                "partial_completion",
+                "policy_block",
+                "max_iterations",
+                "empty_final_response",
+            }:
+                status.phase = "incomplete"
                 record_result = result.final_content or "Task ended without verified completion."
                 logger.info(
                     "Subagent [{}] ended with {}",
@@ -354,18 +378,36 @@ class SubagentManager:
                     task_id, label, task,
                     record_result,
                     origin, "error", origin_message_id,
+                    stop_reason=result.stop_reason,
                 )
             else:
+                status.phase = "completed"
                 record_result = result.final_content or "Task completed but no final response was generated."
                 logger.info("Subagent [{}] completed successfully", task_id)
-                await self._announce_result(task_id, label, task, record_result, origin, "ok", origin_message_id)
+                await self._announce_result(
+                    task_id, label, task, record_result, origin, "ok", origin_message_id,
+                    stop_reason=result.stop_reason,
+                )
 
+        except asyncio.CancelledError:
+            status.phase = "cancelled"
+            status.stop_reason = "cancelled"
+            record_result = "Task was cancelled before completion."
+            await self._announce_result(
+                task_id, label, task, record_result, origin, "error", origin_message_id,
+                stop_reason="cancelled",
+            )
+            raise
         except Exception as e:
-            status.phase = "error"
+            status.phase = "failed"
+            status.stop_reason = "error"
             status.error = str(e)
             record_result = f"Error: {e}"
             logger.exception("Subagent [{}] failed", task_id)
-            await self._announce_result(task_id, label, task, record_result, origin, "error", origin_message_id)
+            await self._announce_result(
+                task_id, label, task, record_result, origin, "error", origin_message_id,
+                stop_reason="error",
+            )
         finally:
             # One record per run, all outcomes (success/tool_error/error/exception).
             # Same writer + schema as cron run records; the kind field distinguishes.
@@ -385,6 +427,7 @@ class SubagentManager:
         origin: dict[str, str],
         status: str,
         origin_message_id: str | None = None,
+        stop_reason: str | None = None,
     ) -> None:
         """Announce the subagent result to the main agent via the message bus."""
         status_text = "completed successfully" if status == "ok" else "failed"
@@ -406,6 +449,13 @@ class SubagentManager:
         metadata: dict[str, Any] = {
             "injected_event": "subagent_result",
             "subagent_task_id": task_id,
+            "delivery_policy": "parent",
+            "subagent_result": {
+                "task_id": task_id,
+                "status": status,
+                "stop_reason": stop_reason,
+                "result": result,
+            },
         }
         if origin_message_id:
             metadata["origin_message_id"] = origin_message_id
@@ -478,8 +528,12 @@ class SubagentManager:
         return len(tasks)
 
     def get_running_count(self) -> int:
-        """Return the number of currently running subagents."""
-        return len(self._running_tasks)
+        """Return active delegated tasks, including queued work."""
+        return sum(not task.done() for task in self._running_tasks.values())
+
+    def get_executing_count(self) -> int:
+        """Return tasks that currently hold execution capacity."""
+        return sum(status.phase == "running" for status in self._task_statuses.values())
 
     def get_running_count_by_session(self, session_key: str) -> int:
         """Return the number of currently running subagents for a session."""
@@ -488,6 +542,10 @@ class SubagentManager:
             1 for tid in tids
             if tid in self._running_tasks and not self._running_tasks[tid].done()
         )
+
+    def runtime_statuses(self) -> dict[str, SubagentStatus]:
+        """Return a detached task-status mapping for read-only inspection."""
+        return dict(self._task_statuses)
 
     def _provider_name(self, provider: LLMProvider | None = None) -> str:
         provider = provider or self.provider
@@ -524,7 +582,7 @@ class SubagentManager:
             "workspace": str(workspace_scope.project_path) if workspace_scope else str(self.workspace),
             "params": {
                 "temperature": temperature,
-                "max_iterations": self.max_iterations,
+                **status.effective_budgets,
                 "restrict_to_workspace": bool(
                     workspace_scope.restrict_to_workspace if workspace_scope else self.restrict_to_workspace
                 ),

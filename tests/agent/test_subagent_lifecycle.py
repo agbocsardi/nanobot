@@ -68,7 +68,7 @@ class TestSubagentStatus:
             task_id="abc", label="test", task_description="do stuff",
             started_at=time.monotonic(),
         )
-        assert s.phase == "initializing"
+        assert s.phase == "queued"
         assert s.iteration == 0
         assert s.tool_events == []
         assert s.usage == {}
@@ -219,6 +219,35 @@ class TestSpawn:
 
 class TestRunSubagent:
     @pytest.mark.asyncio
+    async def test_run_reserves_finalization_and_allows_tool_recovery(self, tmp_path):
+        sm = _manager(tmp_path)
+        captured = []
+
+        async def capture(spec):
+            captured.append(spec)
+            return AgentRunResult(
+                final_content="done",
+                messages=[],
+                stop_reason="completed",
+            )
+
+        sm.runner.run = capture
+        with patch.object(sm, "_announce_result", new_callable=AsyncMock):
+            await sm._run_subagent(
+                "t1", "do task", "label",
+                {"channel": "cli", "chat_id": "direct"},
+                SubagentStatus(
+                    task_id="t1",
+                    label="label",
+                    task_description="do task",
+                    started_at=time.monotonic(),
+                ),
+            )
+
+        assert captured[0].fail_on_tool_error is False
+        assert captured[0].finalize_on_max_iterations is True
+
+    @pytest.mark.asyncio
     async def test_successful_run(self, tmp_path):
         sm = _manager(tmp_path)
         sm.runner.run = AsyncMock(return_value=AgentRunResult(
@@ -258,7 +287,7 @@ class TestRunSubagent:
                 "t1", "do task", "label",
                 {"channel": "cli", "chat_id": "direct"}, status,
             )
-            assert status.phase == "error"
+            assert status.phase == "failed"
             assert "LLM down" in status.error
             assert mock_announce.call_args.args[-2] == "error"
 
@@ -274,8 +303,37 @@ class TestRunSubagent:
                 "t1", "do task", "label",
                 {"channel": "cli", "chat_id": "direct"}, status,
             )
-            assert status.phase == "done"
+            assert status.phase == "completed"
             assert status.stop_reason == "completed"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stop_reason", ["max_iterations", "empty_final_response"])
+    async def test_missing_or_budget_exhausted_final_is_incomplete(
+        self,
+        tmp_path,
+        stop_reason,
+    ):
+        sm = _manager(tmp_path)
+        sm.runner.run = AsyncMock(return_value=AgentRunResult(
+            final_content="Task ended without a verified final synthesis.",
+            messages=[],
+            stop_reason=stop_reason,
+        ))
+        status = SubagentStatus(
+            task_id="t1",
+            label="label",
+            task_description="do task",
+            started_at=time.monotonic(),
+        )
+
+        with patch.object(sm, "_announce_result", new_callable=AsyncMock) as announce:
+            await sm._run_subagent(
+                "t1", "do task", "label",
+                {"channel": "cli", "chat_id": "direct"}, status,
+            )
+
+        assert status.phase == "incomplete"
+        assert announce.call_args.args[-2] == "error"
 
 
 # ---------------------------------------------------------------------------
@@ -301,6 +359,13 @@ class TestAnnounceResult:
         assert msg.sender_id == "subagent"
         assert msg.metadata["injected_event"] == "subagent_result"
         assert msg.metadata["subagent_task_id"] == "t1"
+        assert msg.metadata["delivery_policy"] == "parent"
+        assert msg.metadata["subagent_result"] == {
+            "task_id": "t1",
+            "status": "ok",
+            "stop_reason": None,
+            "result": "result text",
+        }
 
     @pytest.mark.asyncio
     async def test_session_key_override(self, tmp_path):

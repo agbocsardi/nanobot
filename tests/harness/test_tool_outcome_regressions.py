@@ -95,3 +95,40 @@ async def test_policy_block_stays_distinct_from_operational_failure() -> None:
     assert event["evidence"] == [{"kind": "policy", "rule": "deny"}]
     assert result.stop_reason == "policy_block"
     assert result.final_content.startswith("Incomplete:")
+
+
+@pytest.mark.asyncio
+async def test_retryable_error_can_recover_with_later_success() -> None:
+    class RecoveringTool(StaticTool):
+        def __init__(self):
+            super().__init__("inspect", None)
+            self.calls = 0
+
+        async def execute(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return ToolResult.retryable_error("missing file")
+            return ToolResult("found alternate file")
+
+    tools = ToolRegistry()
+    tools.register(RecoveringTool())
+    responses = [
+        LLMResponse(
+            content="trying",
+            tool_calls=[ToolCallRequest(id="call_1", name="inspect", arguments={})],
+        ),
+        LLMResponse(
+            content="recovering",
+            tool_calls=[ToolCallRequest(id="call_2", name="inspect", arguments={})],
+        ),
+        LLMResponse(content="done with evidence"),
+    ]
+
+    result, _ = await run_script(responses, tools=tools)
+
+    assert [event["status"] for event in result.tool_events] == [
+        "retryable_error",
+        "success",
+    ]
+    assert result.stop_reason == "completed"
+    assert result.final_content == "done with evidence"

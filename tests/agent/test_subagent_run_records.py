@@ -145,7 +145,7 @@ class TestSubagentRunRecord:
             )
 
         rec = _read_record(tmp_path, "t1")
-        assert rec["phase"] == "error"
+        assert rec["phase"] == "failed"
         assert "LLM down" in rec["error"]
         assert "LLM down" in rec["result"]
 
@@ -180,6 +180,27 @@ class TestSubagentRunRecord:
         assert rec["iterations"] == 4
         assert rec["params"]["temperature"] == 0.4
         assert rec["params"]["max_iterations"] == sm.max_iterations
+
+    @pytest.mark.asyncio
+    async def test_record_uses_effective_per_spawn_budgets(self, tmp_path):
+        sm = _manager(tmp_path)
+        sm.runner.run = AsyncMock(return_value=AgentRunResult(
+            final_content="ok", messages=[], stop_reason="completed",
+        ))
+
+        with patch.object(sm, "_announce_result", new_callable=AsyncMock):
+            await sm._run_subagent(
+                "t1", "do task", "label",
+                {"channel": "cli", "chat_id": "direct"},
+                _status(),
+                max_iterations=7,
+                context_window_tokens=32_000,
+            )
+
+        rec = _read_record(tmp_path, "t1")
+        assert rec["params"]["max_iterations"] == 7
+        assert rec["params"]["context_window_tokens"] == 32_000
+        assert rec["params"]["max_tool_result_chars"] == 16_000
 
     @pytest.mark.asyncio
     async def test_record_write_failure_does_not_break_run(self, tmp_path):

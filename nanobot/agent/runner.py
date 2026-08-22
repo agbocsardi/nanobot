@@ -709,7 +709,21 @@ class AgentRunner:
         statuses = set(latest_by_tool.values())
         if "policy_block" in statuses:
             return "policy_block"
-        if statuses & {"partial", "retryable_error"}:
+        if "partial" in statuses:
+            return "partial_completion"
+        last_retryable = max(
+            (
+                index
+                for index, event in enumerate(tool_events)
+                if event.get("status") == "retryable_error"
+            ),
+            default=-1,
+        )
+        recovered = any(
+            index > last_retryable and event.get("status") == "success"
+            for index, event in enumerate(tool_events)
+        )
+        if last_retryable >= 0 and not recovered:
             return "partial_completion"
         return None
 
