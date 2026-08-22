@@ -210,11 +210,17 @@ class RuntimeInspector:
 
     def _repository(self) -> dict[str, Any]:
         workspace = Path(getattr(self.runtime, "workspace", Path.cwd()))
-        root = self._git(workspace, "rev-parse", "--show-toplevel")
+        source = Path(__file__).resolve().parents[3]
+        repository = self._repository_at(source)
+        repository["workspace"] = self._repository_at(workspace)
+        return repository
+
+    def _repository_at(self, path: Path) -> dict[str, Any]:
+        root = self._git(path, "rev-parse", "--show-toplevel")
         if root is None:
             return {
                 "available": False,
-                "path": str(workspace),
+                "path": str(path),
                 "branch": None,
                 "commit": None,
                 "dirty": None,

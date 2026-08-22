@@ -90,6 +90,17 @@ def test_snapshot_represents_absent_subsystems_and_repository_identity(tmp_path)
         "origin": "git@github.com:agbocsardi/nanobot.git",
         "ahead": 3,
         "behind": 2,
+        "workspace": {
+            "available": True,
+            "path": str(tmp_path),
+            "branch": "feat/status",
+            "commit": "abc123",
+            "dirty": True,
+            "upstream": "origin/main",
+            "origin": "git@github.com:agbocsardi/nanobot.git",
+            "ahead": 3,
+            "behind": 2,
+        },
     }
     assert snapshot["environment"]["allowed_names"] == ["HOME", "PATH"]
     assert snapshot["capabilities"] == {
