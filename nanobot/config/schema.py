@@ -97,6 +97,16 @@ class VisionHandoffConfig(Base):
     prompt: str | None = None  # override the describer system prompt
 
 
+class ContextRetrievalConfig(Base):
+    """Three-tier context assembly with an all-pinned compatibility mode."""
+
+    mode: Literal["all_pinned", "manifest"] = "all_pinned"
+    manifest_path: str = "context-manifest.json"
+    constitutional_budget_chars: int = Field(default=24_000, ge=1_000)
+    current_budget_chars: int = Field(default=8_000, ge=1_000)
+    retrieved_budget_chars: int = Field(default=24_000, ge=1_000)
+
+
 class InlineFallbackConfig(Base):
     """One inline fallback model configuration."""
 
@@ -167,6 +177,7 @@ class AgentDefaults(Base):
     bot_icon: str = "🐈"  # Short icon (emoji or text) shown next to the bot name in CLI; "" to omit
     unified_session: bool = False  # Share one session across all channels (single-user multi-device)
     disabled_skills: list[str] = Field(default_factory=list)  # Skill names to exclude from loading (e.g. ["summarize", "skill-creator"])
+    context_retrieval: ContextRetrievalConfig = Field(default_factory=ContextRetrievalConfig)
     session_ttl_minutes: int = Field(
         default=0,
         ge=0,
