@@ -48,6 +48,7 @@ class SubagentStatus:
     stop_reason: str | None = None
     error: str | None = None
     effective_budgets: dict[str, Any] = field(default_factory=dict)
+    context_report: dict[str, Any] = field(default_factory=dict)
 
 
 class _SubagentHook(AgentHook):
@@ -100,6 +101,7 @@ class SubagentManager:
         run_model: str | None = None,
         preset_snapshot_loader: Callable[[str], Any] | None = None,
         presets: dict[str, Any] | None = None,
+        context_retrieval: Any | None = None,
     ):
         defaults = AgentDefaults()
         self.provider = provider
@@ -132,6 +134,7 @@ class SubagentManager:
         self._preset_snapshot_loader = preset_snapshot_loader
         self._presets = presets
         self._llm_wall_timeout_for_session = llm_wall_timeout_for_session
+        self.context_retrieval = context_retrieval
         # Per-run observability records: prompt, params, model/provider, usage,
         # status. Source of truth for "which model ran this subagent + what did
         # it cost". Defaults to <workspace>/subagents/.
@@ -422,7 +425,11 @@ class SubagentManager:
                 tools_config=cfg,
                 policy_model=run_model,
             )
-            system_prompt = self._build_subagent_prompt(workspace=root)
+            system_prompt = self._build_subagent_prompt(
+                workspace=root,
+                task=task,
+                status=status,
+            )
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": task},
@@ -627,7 +634,13 @@ class SubagentManager:
             lines.append(f"- {result.error}")
         return "\n".join(lines) or (result.error or "Error: subagent execution failed.")
 
-    def _build_subagent_prompt(self, workspace: Path | None = None) -> str:
+    def _build_subagent_prompt(
+        self,
+        workspace: Path | None = None,
+        *,
+        task: str = "",
+        status: SubagentStatus | None = None,
+    ) -> str:
         """Build a focused system prompt for the subagent."""
         from nanobot.agent.context import ContextBuilder
         from nanobot.agent.skills import SkillsLoader
@@ -638,12 +651,35 @@ class SubagentManager:
             root,
             disabled_skills=self.disabled_skills,
         ).build_skills_summary()
-        return render_template(
+        prompt = render_template(
             "agent/subagent_system.md",
             time_ctx=time_ctx,
             workspace=str(root),
             skills_summary=skills_summary or "",
         )
+        if (
+            self.context_retrieval is not None
+            and getattr(self.context_retrieval, "mode", "all_pinned") == "manifest"
+        ):
+            builder = ContextBuilder(
+                root,
+                disabled_skills=list(self.disabled_skills),
+                context_retrieval=self.context_retrieval,
+            )
+            retrieved = builder.build_system_prompt(
+                include_memory_recent_history=False,
+                retrieval_query=task,
+            )
+            if status is not None:
+                status.context_report = dict(builder.last_context_report)
+            prompt = f"{prompt}\n\n---\n\n{retrieved}"
+        elif status is not None:
+            status.context_report = {
+                "mode": "all_pinned",
+                "sources": [],
+                "totals": {},
+            }
+        return prompt
 
     async def cancel_by_session(self, session_key: str) -> int:
         """Cancel all subagents for the given session. Returns count cancelled."""
@@ -732,6 +768,7 @@ class SubagentManager:
                 model=model or self.model,
             ),
             "tool_events": list(status.tool_events),
+            "context": dict(status.context_report),
             "result": result_text,
         }
         try:

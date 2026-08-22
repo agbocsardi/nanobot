@@ -95,6 +95,12 @@ def test_snapshot_represents_absent_subsystems_and_repository_identity(tmp_path)
     assert snapshot["capabilities"] == {
         "tools": ["exec", "my"],
         "skills": ["github", "memory"],
+        "context": {
+            "mode": "all_pinned",
+            "constitutional_budget_chars": None,
+            "current_budget_chars": None,
+            "retrieved_budget_chars": None,
+        },
     }
 
 

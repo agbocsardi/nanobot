@@ -327,6 +327,7 @@ class AgentLoop:
             run_model=(subagent_run_snapshot.model if subagent_run_snapshot else None),
             preset_snapshot_loader=self._preset_snapshot_loader,
             presets=model_presets,
+            context_retrieval=context_retrieval,
         )
         self._unified_session = unified_session
         self._max_messages = max_messages if max_messages > 0 else 120

@@ -21,6 +21,7 @@ from nanobot.agent.subagent import (
     SubagentStatus,
 )
 from nanobot.bus.queue import MessageBus
+from nanobot.config.schema import ContextRetrievalConfig
 from nanobot.providers.base import LLMProvider
 
 
@@ -201,6 +202,37 @@ class TestSubagentRunRecord:
         assert rec["params"]["max_iterations"] == 7
         assert rec["params"]["context_window_tokens"] == 32_000
         assert rec["params"]["max_tool_result_chars"] == 16_000
+
+    @pytest.mark.asyncio
+    async def test_record_persists_task_relevant_context_decisions(self, tmp_path):
+        (tmp_path / "rules.md").write_text("nanobot repository rules", encoding="utf-8")
+        (tmp_path / "context-manifest.json").write_text(
+            '{"retrieved":[{"path":"rules.md","owners":["repo:nanobot"]}]}',
+            encoding="utf-8",
+        )
+        sm = _manager(
+            tmp_path,
+            context_retrieval=ContextRetrievalConfig(mode="manifest"),
+        )
+        sm.runner.run = AsyncMock(return_value=AgentRunResult(
+            final_content="ok", messages=[], stop_reason="completed",
+        ))
+
+        with patch.object(sm, "_announce_result", new_callable=AsyncMock):
+            await sm._run_subagent(
+                "t1", "fix the nanobot repository", "label",
+                {"channel": "cli", "chat_id": "direct"},
+                _status(),
+            )
+
+        rec = _read_record(tmp_path, "t1")
+        assert rec["context"]["mode"] == "manifest"
+        selected = [
+            source["path"]
+            for source in rec["context"]["sources"]
+            if source["selected"]
+        ]
+        assert selected == ["rules.md"]
 
     @pytest.mark.asyncio
     async def test_record_write_failure_does_not_break_run(self, tmp_path):

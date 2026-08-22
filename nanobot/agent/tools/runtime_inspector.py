@@ -258,9 +258,23 @@ class RuntimeInspector:
                 skills = [entry["name"] for entry in skills_loader.list_skills()]
             except Exception:
                 skills = []
+        context_config = getattr(getattr(self.runtime, "context", None), "context_retrieval", None)
         return {
             "tools": sorted(str(name) for name in tool_names or []),
             "skills": sorted(skills),
+            "context": {
+                "mode": self._primitive(getattr(context_config, "mode", None))
+                or "all_pinned",
+                "constitutional_budget_chars": self._primitive(
+                    getattr(context_config, "constitutional_budget_chars", None)
+                ),
+                "current_budget_chars": self._primitive(
+                    getattr(context_config, "current_budget_chars", None)
+                ),
+                "retrieved_budget_chars": self._primitive(
+                    getattr(context_config, "retrieved_budget_chars", None)
+                ),
+            },
         }
 
     @staticmethod
