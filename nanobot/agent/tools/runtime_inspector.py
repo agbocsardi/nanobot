@@ -122,6 +122,7 @@ class RuntimeInspector:
                 "task_id": str(task_id),
                 "label": self._primitive(getattr(status, "label", None)),
                 "phase": self._primitive(getattr(status, "phase", None)),
+                "activity": self._primitive(getattr(status, "activity", None)),
                 "iteration": self._primitive(getattr(status, "iteration", None)),
                 "stop_reason": self._primitive(getattr(status, "stop_reason", None)),
                 "error": self._primitive(getattr(status, "error", None)),

@@ -69,6 +69,7 @@ class TestSubagentStatus:
             started_at=time.monotonic(),
         )
         assert s.phase == "queued"
+        assert s.activity == "waiting_for_capacity"
         assert s.iteration == 0
         assert s.tool_events == []
         assert s.usage == {}
@@ -246,6 +247,35 @@ class TestRunSubagent:
 
         assert captured[0].fail_on_tool_error is False
         assert captured[0].finalize_on_max_iterations is True
+
+    @pytest.mark.asyncio
+    async def test_provider_retry_wait_is_inspectable(self, tmp_path):
+        sm = _manager(tmp_path)
+        status = SubagentStatus(
+            task_id="t1",
+            label="label",
+            task_description="do task",
+            started_at=time.monotonic(),
+        )
+
+        async def capture(spec):
+            await spec.retry_wait_callback("retrying")
+            assert status.phase == "waiting"
+            assert status.activity == "provider_retry"
+            return AgentRunResult(
+                final_content="done",
+                messages=[],
+                stop_reason="completed",
+            )
+
+        sm.runner.run = capture
+        with patch.object(sm, "_announce_result", new_callable=AsyncMock):
+            await sm._run_subagent(
+                "t1", "do task", "label",
+                {"channel": "cli", "chat_id": "direct"}, status,
+            )
+
+        assert status.phase == "completed"
 
     @pytest.mark.asyncio
     async def test_successful_run(self, tmp_path):

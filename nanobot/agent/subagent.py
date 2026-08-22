@@ -40,6 +40,7 @@ class SubagentStatus:
     task_description: str
     started_at: float          # time.monotonic()
     phase: str = "queued"
+    activity: str = "waiting_for_capacity"
     iteration: int = 0
     tool_events: list = field(default_factory=list)   # [{name, status, detail}, ...]
     usage: dict = field(default_factory=dict)          # token usage
@@ -57,6 +58,9 @@ class _SubagentHook(AgentHook):
         self._status = status
 
     async def before_execute_tools(self, context: AgentHookContext) -> None:
+        if self._status is not None:
+            self._status.phase = "running"
+            self._status.activity = "executing_tools"
         for tool_call in context.tool_calls:
             args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
             logger.debug(
@@ -242,6 +246,7 @@ class SubagentManager:
         def _cleanup(finished: asyncio.Task) -> None:
             if finished.cancelled() and status.phase != "cancelled":
                 status.phase = "cancelled"
+                status.activity = "terminal"
                 status.stop_reason = "cancelled"
                 cancelled_result = "Task was cancelled before execution started."
                 self._write_run_record(
@@ -310,6 +315,7 @@ class SubagentManager:
         except asyncio.CancelledError:
             if status.phase != "cancelled":
                 status.phase = "cancelled"
+                status.activity = "terminal"
                 status.stop_reason = "cancelled"
                 result = "Task was cancelled while queued."
                 await self._announce_result(
@@ -369,11 +375,16 @@ class SubagentManager:
     ) -> None:
         """Execute the subagent task and announce the result."""
         status.phase = "running"
+        status.activity = "requesting_model"
         logger.info("Subagent [{}] starting task: {}", task_id, label)
 
         async def _on_checkpoint(payload: dict) -> None:
-            status.phase = payload.get("phase", status.phase)
+            status.activity = payload.get("phase", status.activity)
             status.iteration = payload.get("iteration", status.iteration)
+
+        async def _on_retry_wait(_message: str) -> None:
+            status.phase = "waiting"
+            status.activity = "provider_retry"
 
         record_result = ""  # set in every terminal branch; pre-bound for cancel safety
         # Pre-bound so the outer finally's _write_run_record can't UnboundLocalError
@@ -426,6 +437,7 @@ class SubagentManager:
                     error_message=None,
                     fail_on_tool_error=False,
                     checkpoint_callback=_on_checkpoint,
+                    retry_wait_callback=_on_retry_wait,
                     session_key=sess_key,
                     workspace=root,
                     llm_timeout_s=llm_timeout,
@@ -435,6 +447,7 @@ class SubagentManager:
                     reset_workspace_scope(token)
             status.stop_reason = result.stop_reason
             status.tool_events = list(result.tool_events)
+            status.activity = "terminal"
             # result.usage is the authoritative token count for the run; mirror
             # it onto status so _write_run_record captures it even when the
             # after_iteration hook never fired (e.g. single-pass completion).
@@ -489,6 +502,7 @@ class SubagentManager:
 
         except asyncio.CancelledError:
             status.phase = "cancelled"
+            status.activity = "terminal"
             status.stop_reason = "cancelled"
             record_result = "Task was cancelled before completion."
             await self._announce_result(
@@ -498,6 +512,7 @@ class SubagentManager:
             raise
         except Exception as e:
             status.phase = "failed"
+            status.activity = "terminal"
             status.stop_reason = "error"
             status.error = str(e)
             record_result = f"Error: {e}"
@@ -694,6 +709,7 @@ class SubagentManager:
             "iterations": int(status.iteration),
             "stop_reason": status.stop_reason,
             "phase": status.phase,
+            "activity": status.activity,
             "error": status.error,
             "usage": build_usage_block(
                 status.usage,
