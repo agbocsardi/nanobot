@@ -16,6 +16,7 @@ from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.agent.tools.context import ToolContext
 from nanobot.agent.tools.file_state import FileStates
 from nanobot.agent.tools.loader import ToolLoader
+from nanobot.agent.tools.policy import ToolPolicy
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
@@ -145,6 +146,7 @@ class SubagentManager:
             exec=self.tools_config.exec,
             web=self.tools_config.web,
             file=self.tools_config.file,
+            policies=list(self.tools_config.policies),
             restrict_to_workspace=self.restrict_to_workspace,
         )
 
@@ -152,11 +154,20 @@ class SubagentManager:
         self,
         workspace: Path | None = None,
         tools_config: ToolsConfig | None = None,
+        policy_model: str | None = None,
+        policy_preset: str | None = None,
     ) -> ToolRegistry:
         """Build an isolated subagent tool registry via ToolLoader."""
         root = self.workspace if workspace is None else workspace
-        registry = ToolRegistry()
         cfg = tools_config if tools_config is not None else self._subagent_tools_config()
+        registry = ToolRegistry(policy=ToolPolicy(
+            cfg.policies,
+            default_context=lambda: {
+                "mode": "delegated",
+                "model": policy_model or self.run_model or self.model,
+                "preset": policy_preset,
+            },
+        ))
         ctx = ToolContext(
             config=cfg,
             workspace=str(root.resolve()),
@@ -406,7 +417,11 @@ class SubagentManager:
             if workspace_scope is not None:
                 cfg = self._subagent_tools_config()
                 cfg.restrict_to_workspace = workspace_scope.restrict_to_workspace
-            tools = self._build_tools(workspace=root, tools_config=cfg)
+            tools = self._build_tools(
+                workspace=root,
+                tools_config=cfg,
+                policy_model=run_model,
+            )
             system_prompt = self._build_subagent_prompt(workspace=root)
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},

@@ -1168,6 +1168,34 @@ class AgentRunner:
             return prep_error + hint, event, (
                 RuntimeError(prep_error) if spec.fail_on_tool_error else None
             )
+        evaluate_policy = getattr(spec.tools, "evaluate_policy", None)
+        if tool is not None and callable(evaluate_policy):
+            decision = evaluate_policy(tool, params)
+            if decision.outcome != "allow":
+                action = "requires explicit approval" if decision.outcome == "ask" else "was denied"
+                reason = f": {decision.reason}" if decision.reason else ""
+                message = (
+                    f"Policy {action} for tool '{tool_call.name}'"
+                    f" (rule: {decision.rule_id or 'unnamed'}){reason}"
+                )
+                outcome = ToolResult.policy_block(
+                    message,
+                    data={
+                        "decision": decision.outcome,
+                        "rule_id": decision.rule_id,
+                        "resource": decision.resource,
+                    },
+                    evidence=[{
+                        "kind": "tool_policy",
+                        "decision": decision.outcome,
+                        "rule_id": decision.rule_id,
+                    }],
+                )
+                return str(outcome), self._tool_event(
+                    tool_call.name,
+                    outcome,
+                    execution_succeeded=False,
+                ), None
         emit_file_edit_events = (
             spec.progress_callback is not None
             and on_progress_accepts_file_edit_events(spec.progress_callback)

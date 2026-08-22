@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from nanobot.agent.tools.base import Tool
+from nanobot.agent.tools.policy import PolicyDecision, ToolPolicy
 
 
 class ToolRegistry:
@@ -13,9 +14,10 @@ class ToolRegistry:
     Allows dynamic registration and execution of tools.
     """
 
-    def __init__(self):
+    def __init__(self, policy: ToolPolicy | None = None):
         self._tools: dict[str, Tool] = {}
         self._cached_definitions: list[dict[str, Any]] | None = None
+        self.policy = policy or ToolPolicy()
 
     def register(self, tool: Tool) -> None:
         """Register a tool."""
@@ -169,6 +171,14 @@ class ToolRegistry:
             return result
         except Exception as e:
             return f"Error executing {name}: {str(e)}" + hint
+
+    def evaluate_policy(
+        self,
+        tool: Tool,
+        params: dict[str, Any],
+    ) -> PolicyDecision:
+        """Evaluate configured policy after validation and before execution."""
+        return self.policy.evaluate(tool.name, params, read_only=tool.read_only)
 
     @property
     def tool_names(self) -> list[str]:

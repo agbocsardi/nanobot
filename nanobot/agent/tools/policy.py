@@ -60,6 +60,8 @@ class ToolPolicy:
         mode = str(
             metadata.get("interaction_mode")
             or metadata.get("run_type")
+            or ("heartbeat" if metadata.get("heartbeat") else None)
+            or ("cron" if metadata.get("cron_job_id") else None)
             or defaults.get("mode")
             or "foreground"
         )
