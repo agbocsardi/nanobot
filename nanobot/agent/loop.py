@@ -994,7 +994,7 @@ class AgentLoop:
             if on_stream and on_stream_end and should_stream:
                 await on_stream(result.final_content or "")
                 await on_stream_end(resuming=False)
-        elif result.stop_reason == "error":
+        elif result.stop_reason in {"error", "provider_error"}:
             logger.error("LLM returned error: {}", (result.final_content or "")[:200])
         return result.final_content, result.tools_used, result.messages, result.stop_reason, result.had_injections
 

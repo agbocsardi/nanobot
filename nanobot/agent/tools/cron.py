@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Any
 
 from nanobot.agent import model_presets as preset_helpers
-from nanobot.agent.tools.base import Tool, tool_parameters
+from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
 from nanobot.agent.tools.context import ContextAware, RequestContext
 from nanobot.agent.tools.schema import (
     BooleanSchema,
@@ -193,7 +193,7 @@ class CronTool(Tool, ContextAware):
             return self._list_jobs()
         elif action == "remove":
             return self._remove_job(job_id)
-        return f"Unknown action: {action}"
+        return ToolResult.retryable_error(f"Unknown action: {action}")
 
     def _add_job(
         self,
@@ -279,7 +279,13 @@ class CronTool(Tool, ContextAware):
             model_preset=preset_name,
             isolated=isolated,
         )
-        return f"Created job '{job.name}' (id: {job.id})"
+        return ToolResult(
+            f"Created job '{job.name}' (id: {job.id})",
+            data={"job_id": job.id, "job_name": job.name},
+            evidence=[{"kind": "cron_state", "job_id": job.id, "present": True}],
+            side_effects=[{"kind": "cron_job_created", "job_id": job.id}],
+            postcondition="checked",
+        )
 
     def _format_timing(self, schedule: CronSchedule) -> str:
         """Format schedule as a human-readable timing string."""
@@ -341,17 +347,23 @@ class CronTool(Tool, ContextAware):
             return "Error: job_id is required for remove"
         result = self._cron.remove_job(job_id)
         if result == "removed":
-            return f"Removed job {job_id}"
+            return ToolResult(
+                f"Removed job {job_id}",
+                data={"job_id": job_id},
+                evidence=[{"kind": "cron_state", "job_id": job_id, "present": False}],
+                side_effects=[{"kind": "cron_job_removed", "job_id": job_id}],
+                postcondition="checked",
+            )
         if result == "protected":
             job = self._cron.get_job(job_id)
             if job and job.name == "dream":
-                return (
+                return ToolResult.policy_block(
                     "Cannot remove job `dream`.\n"
                     "This is a system-managed Dream memory consolidation job for long-term memory.\n"
                     "It remains visible so you can inspect it, but it cannot be removed."
                 )
-            return (
+            return ToolResult.policy_block(
                 f"Cannot remove job `{job_id}`.\n"
                 "This is a protected system-managed cron job."
             )
-        return f"Job {job_id} not found"
+        return ToolResult.retryable_error(f"Job {job_id} not found")

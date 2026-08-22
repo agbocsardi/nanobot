@@ -100,6 +100,40 @@ class TestSubagentRunRecord:
         assert rec["tool_events"] == events
 
     @pytest.mark.asyncio
+    async def test_partial_outcome_is_persisted_and_not_announced_as_success(self, tmp_path):
+        sm = _manager(tmp_path)
+        events = [{
+            "name": "exec",
+            "status": "retryable_error",
+            "detail": "not found",
+            "execution_succeeded": True,
+            "operational_success": False,
+            "verified": False,
+            "retryable": True,
+            "postcondition": None,
+            "exit_code": 127,
+        }]
+        sm.runner.run = AsyncMock(return_value=AgentRunResult(
+            final_content="Incomplete: command failed.",
+            messages=[],
+            stop_reason="partial_completion",
+            tool_events=events,
+        ))
+        status = _status()
+
+        with patch.object(sm, "_announce_result", new_callable=AsyncMock) as announce:
+            await sm._run_subagent(
+                "t1", "do task", "label",
+                {"channel": "cli", "chat_id": "direct"}, status,
+            )
+
+        assert announce.call_args.args[-2] == "error"
+        rec = _read_record(tmp_path, "t1")
+        assert rec["stop_reason"] == "partial_completion"
+        assert rec["tool_events"] == events
+        assert rec["result"] == "Incomplete: command failed."
+
+    @pytest.mark.asyncio
     async def test_exception_records_error(self, tmp_path):
         sm = _manager(tmp_path)
         sm.runner.run = AsyncMock(side_effect=RuntimeError("LLM down"))

@@ -322,6 +322,7 @@ class SubagentManager:
                     reset_workspace_scope(token)
             status.phase = "done"
             status.stop_reason = result.stop_reason
+            status.tool_events = list(result.tool_events)
             # result.usage is the authoritative token count for the run; mirror
             # it onto status so _write_run_record captures it even when the
             # after_iteration hook never fired (e.g. single-pass completion).
@@ -329,15 +330,26 @@ class SubagentManager:
                 status.usage = dict(result.usage)
 
             if result.stop_reason == "tool_error":
-                status.tool_events = list(result.tool_events)
                 record_result = self._format_partial_progress(result)
                 await self._announce_result(
                     task_id, label, task,
                     record_result,
                     origin, "error", origin_message_id,
                 )
-            elif result.stop_reason == "error":
+            elif result.stop_reason in {"error", "provider_error"}:
                 record_result = result.error or "Error: subagent execution failed."
+                await self._announce_result(
+                    task_id, label, task,
+                    record_result,
+                    origin, "error", origin_message_id,
+                )
+            elif result.stop_reason in {"partial_completion", "policy_block"}:
+                record_result = result.final_content or "Task ended without verified completion."
+                logger.info(
+                    "Subagent [{}] ended with {}",
+                    task_id,
+                    result.stop_reason,
+                )
                 await self._announce_result(
                     task_id, label, task,
                     record_result,

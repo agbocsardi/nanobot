@@ -159,7 +159,7 @@ async def test_runner_goal_continue_not_limited_by_injection_cycle_cap():
 
 @pytest.mark.asyncio
 async def test_runner_does_not_force_continue_on_error():
-    """Even with active goal, an LLM error should exit with stop_reason="error"."""
+    """Even with active goal, an LLM error should exit as a provider error."""
     from nanobot.agent.runner import AgentRunner, AgentRunSpec
 
     provider = MagicMock(spec=LLMProvider)
@@ -180,7 +180,7 @@ async def test_runner_does_not_force_continue_on_error():
         goal_active_predicate=lambda: True,
     ))
 
-    assert result.stop_reason == "error"
+    assert result.stop_reason == "provider_error"
 
 
 @pytest.mark.asyncio

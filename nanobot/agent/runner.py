@@ -76,6 +76,10 @@ _COMPACTABLE_TOOLS = frozenset({
 # read_file is the recovery path for persisted results; exempting it prevents persist->read->persist loops.
 _TOOL_RESULT_OFFLOAD_EXEMPT_TOOLS = frozenset({"read_file"})
 _BACKFILL_CONTENT = "[Tool result unavailable — call was interrupted or lost]"
+_PARTIAL_COMPLETION_PREFIX = (
+    "Incomplete: one or more tool operations failed or could not be verified."
+)
+_POLICY_BLOCK_PREFIX = "Incomplete: one or more required operations were blocked by policy."
 
 # Backward-compatible module attribute for tests/extensions that monkeypatch
 # the former single-file tracker hook. Runtime uses prepare_file_edit_trackers.
@@ -595,7 +599,7 @@ class AgentRunner:
                     final_content = _ARREARAGE_ERROR_MESSAGE
                 else:
                     final_content = clean or spec.error_message or _DEFAULT_ERROR_MESSAGE
-                stop_reason = "error"
+                stop_reason = "provider_error"
                 error = final_content
                 self._append_model_error_placeholder(messages)
                 context.final_content = final_content
@@ -628,6 +632,15 @@ class AgentRunner:
                     continue
                 break
 
+            terminal_tool_reason = self._terminal_tool_stop_reason(tool_events)
+            if terminal_tool_reason is not None:
+                stop_reason = terminal_tool_reason
+                clean = self._suppress_false_success(clean, stop_reason)
+                assistant_message = build_assistant_message(
+                    clean,
+                    reasoning_content=response.reasoning_content,
+                    thinking_blocks=response.thinking_blocks,
+                )
             messages.append(assistant_message or build_assistant_message(
                 clean,
                 reasoning_content=response.reasoning_content,
@@ -684,6 +697,30 @@ class AgentRunner:
             tool_events=tool_events,
             had_injections=had_injections,
         )
+
+    @staticmethod
+    def _terminal_tool_stop_reason(tool_events: list[dict[str, Any]]) -> str | None:
+        latest_by_tool: dict[str, str] = {}
+        for event in tool_events:
+            name = str(event.get("name") or "")
+            status = str(event.get("status") or "")
+            if name and status:
+                latest_by_tool[name] = status
+        statuses = set(latest_by_tool.values())
+        if "policy_block" in statuses:
+            return "policy_block"
+        if statuses & {"partial", "retryable_error"}:
+            return "partial_completion"
+        return None
+
+    @staticmethod
+    def _suppress_false_success(content: str, stop_reason: str) -> str:
+        prefix = (
+            _POLICY_BLOCK_PREFIX
+            if stop_reason == "policy_block"
+            else _PARTIAL_COMPLETION_PREFIX
+        )
+        return f"{prefix}\n\n{content}" if content else prefix
 
     def _build_request_kwargs(
         self,

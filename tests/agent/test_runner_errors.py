@@ -77,7 +77,7 @@ async def test_llm_error_not_appended_to_session_messages():
         max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
     ))
 
-    assert result.stop_reason == "error"
+    assert result.stop_reason == "provider_error"
     assert result.final_content == "429 rate limit exceeded"
     assistant_msgs = [m for m in result.messages if m.get("role") == "assistant"]
     assert all("429" not in (m.get("content") or "") for m in assistant_msgs), \
@@ -106,7 +106,7 @@ async def test_llm_arrearage_error_surfaces_clear_message():
         max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
     ))
 
-    assert result.stop_reason == "error"
+    assert result.stop_reason == "provider_error"
     assert result.final_content == _ARREARAGE_ERROR_MESSAGE
 
 

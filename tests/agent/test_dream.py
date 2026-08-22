@@ -255,7 +255,7 @@ class TestEphemeralDirect:
         )
 
         assert resp is not None
-        assert resp.metadata["_stop_reason"] == "error"
+        assert resp.metadata["_stop_reason"] == "provider_error"
         assert MemoryStore.dream_run_completed(resp) is False
 
     async def test_direct_run_accepts_dream_runtime_limits(self, tmp_path, _make_loop):

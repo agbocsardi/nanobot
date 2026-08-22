@@ -55,9 +55,17 @@ async def test_runner_preserves_reasoning_fields_and_tool_results():
 
     assert result.final_content == "done"
     assert result.tools_used == ["list_dir"]
-    assert result.tool_events == [
-        {"name": "list_dir", "status": "ok", "detail": "tool result"}
-    ]
+    assert result.tool_events == [{
+        "name": "list_dir",
+        "status": "success",
+        "detail": "tool result",
+        "execution_succeeded": True,
+        "operational_success": True,
+        "verified": True,
+        "retryable": False,
+        "postcondition": None,
+        "data": "tool result",
+    }]
 
     assistant_messages = [
         msg for msg in captured_second_call
@@ -183,7 +191,7 @@ async def test_runner_times_out_hung_llm_request():
     ))
 
     assert (time.monotonic() - started) < 1.0
-    assert result.stop_reason == "error"
+    assert result.stop_reason == "provider_error"
     assert "timed out" in (result.final_content or "").lower()
 
 

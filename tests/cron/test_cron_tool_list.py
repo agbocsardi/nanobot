@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from nanobot.agent.tools.base import ToolResult
 from nanobot.agent.tools.context import RequestContext
 from nanobot.agent.tools.cron import CronTool
 from nanobot.cron.service import CronService
@@ -310,6 +311,10 @@ def test_add_cron_job_defaults_to_tool_timezone(tmp_path) -> None:
     result = tool._add_job(None, "Morning standup", None, "0 8 * * *", None, None)
 
     assert result.startswith("Created job")
+    assert isinstance(result, ToolResult)
+    assert result.status == "success"
+    assert result.postcondition == "checked"
+    assert result.verified is True
     job = tool._cron.list_jobs()[0]
     assert job.schedule.tz == "Asia/Shanghai"
 

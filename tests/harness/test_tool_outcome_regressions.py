@@ -47,6 +47,9 @@ async def test_exit_127_cannot_be_recorded_as_success() -> None:
     assert event["stdout"] == "plausible output\n"
     assert event["stderr"] == "not found\n"
     assert result.tools_used == []
+    assert result.stop_reason == "partial_completion"
+    assert result.final_content.startswith("Incomplete:")
+    assert result.final_content.endswith("done")
 
 
 @pytest.mark.asyncio
@@ -69,6 +72,8 @@ async def test_unchecked_side_effect_is_recorded_as_partial() -> None:
     assert event["verified"] is False
     assert event["side_effects"] == [{"kind": "message", "recipient": "user-1"}]
     assert result.tools_used == []
+    assert result.stop_reason == "partial_completion"
+    assert result.final_content != "done"
 
 
 @pytest.mark.asyncio
@@ -88,3 +93,5 @@ async def test_policy_block_stays_distinct_from_operational_failure() -> None:
     assert event["status"] == "policy_block"
     assert event["retryable"] is False
     assert event["evidence"] == [{"kind": "policy", "rule": "deny"}]
+    assert result.stop_reason == "policy_block"
+    assert result.final_content.startswith("Incomplete:")

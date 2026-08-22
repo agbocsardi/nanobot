@@ -219,7 +219,8 @@ async def test_runner_rejects_near_miss_tool_name_without_executing():
         max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
     ))
 
-    assert result.final_content == "done"
+    assert result.stop_reason == "partial_completion"
+    assert result.final_content.endswith("done")
     assert result.tools_used == []
     assert shared_events == []
     assistant_message = [
@@ -264,7 +265,8 @@ async def test_runner_rejects_openai_compat_invalid_arguments_without_executing(
 
     result, shared_events = await _run_optional_tool_response(parsed)
 
-    assert result.final_content == "done"
+    assert result.stop_reason == "partial_completion"
+    assert result.final_content.endswith("done")
     assert parsed.tool_calls[0].arguments == arguments
     assert result.tools_used == []
     assert shared_events == []
@@ -288,7 +290,8 @@ async def test_runner_rejects_openai_responses_malformed_arguments_without_execu
 
     result, shared_events = await _run_optional_tool_response(parsed)
 
-    assert result.final_content == "done"
+    assert result.stop_reason == "partial_completion"
+    assert result.final_content.endswith("done")
     assert parsed.tool_calls[0].arguments == "{bad"
     assert result.tools_used == []
     assert shared_events == []
@@ -312,7 +315,8 @@ async def test_runner_rejects_openai_responses_array_arguments_without_executing
 
     result, shared_events = await _run_optional_tool_response(parsed)
 
-    assert result.final_content == "done"
+    assert result.stop_reason == "partial_completion"
+    assert result.final_content.endswith("done")
     assert parsed.tool_calls[0].arguments == []
     assert result.tools_used == []
     assert shared_events == []
@@ -351,7 +355,8 @@ async def test_runner_blocks_repeated_external_fetches():
         max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
     ))
 
-    assert result.final_content == "done"
+    assert result.stop_reason == "policy_block"
+    assert result.final_content.endswith("done")
     assert tools.execute.await_count == 2
     blocked_tool_message = [
         msg for msg in captured_final_call
