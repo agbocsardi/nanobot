@@ -231,6 +231,7 @@ class AgentLoop:
         discord_runtime_handle: Any | None = None,
         loaded_config_path: Path | None = None,
         loaded_config_fingerprint: str | None = None,
+        context_retrieval: Any | None = None,
     ):
         from nanobot.config.schema import ToolsConfig
 
@@ -291,7 +292,12 @@ class AgentLoop:
         self._last_usage: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
 
-        self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
+        self.context = ContextBuilder(
+            workspace,
+            timezone=timezone,
+            disabled_skills=disabled_skills,
+            context_retrieval=context_retrieval,
+        )
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry(policy=ToolPolicy(
             _tc.policies,
@@ -440,6 +446,7 @@ class AgentLoop:
             "loaded_config_fingerprint",
             fingerprint_file(loaded_config_path),
         )
+        context_retrieval = extra.pop("context_retrieval", defaults.context_retrieval)
         return cls(
             bus=bus,
             provider=provider,
@@ -460,6 +467,7 @@ class AgentLoop:
             disabled_skills=defaults.disabled_skills,
             loaded_config_path=loaded_config_path,
             loaded_config_fingerprint=loaded_config_fingerprint,
+            context_retrieval=context_retrieval,
             session_ttl_minutes=defaults.session_ttl_minutes,
             consolidation_ratio=defaults.consolidation_ratio,
             max_messages=defaults.max_messages,
@@ -1354,6 +1362,7 @@ class AgentLoop:
             unified_session=self._unified_session,
             input_token_budget=self._replay_token_budget(),
         )
+        context_report = dict(self.context.last_context_report)
         t_wall = time.time()
         final_content, _, all_msgs, stop_reason, _ = await self._run_agent_loop(
             messages, session=session, channel=channel, chat_id=chat_id,
@@ -1365,6 +1374,7 @@ class AgentLoop:
         wall_done = time.time()
         latency_ms = max(0, int((wall_done - t_wall) * 1000))
         self._save_turn(session, all_msgs, 1 + len(history), turn_latency_ms=latency_ms)
+        session.metadata["context_report"] = context_report
         self._runtime_events().record_turn_latency(key, latency_ms)
         session.enforce_file_cap(
             on_archive=partial(self.context.memory.raw_archive, session_key=key)
@@ -1378,7 +1388,7 @@ class AgentLoop:
             )
         )
         content = final_content or "Background task completed."
-        outbound_metadata: dict[str, Any] = {}
+        outbound_metadata: dict[str, Any] = {"_context_report": context_report}
         if channel == "slack" and key.startswith("slack:") and key.count(":") >= 2:
             outbound_metadata["slack"] = {"thread_ts": key.split(":", 2)[2]}
         if origin_message_id := msg.metadata.get("origin_message_id"):

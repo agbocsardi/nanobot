@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from nanobot.agent.context import ContextBuilder
+from nanobot.config.schema import ContextRetrievalConfig
 from nanobot.session.goal_state import GOAL_STATE_KEY
 
 from .conftest import archive_summary
@@ -301,6 +302,49 @@ class TestBuildSystemPrompt:
         result = builder.build_system_prompt()
         assert "## AGENTS.md" not in result
         assert "[Archived Context Summary]" not in result
+
+    def test_manifest_mode_retrieves_only_task_relevant_context(self, tmp_path):
+        import json
+
+        (tmp_path / "AGENTS.md").write_text("critical rule", encoding="utf-8")
+        (tmp_path / "now.md").write_text("active state", encoding="utf-8")
+        (tmp_path / "grocery.md").write_text("list procedure", encoding="utf-8")
+        (tmp_path / "coros.md").write_text("biometrics procedure", encoding="utf-8")
+        (tmp_path / "context-manifest.json").write_text(json.dumps({
+            "constitutional": ["AGENTS.md"],
+            "current": ["now.md"],
+            "retrieved": [
+                {"path": "grocery.md", "owners": ["topic:grocery"]},
+                {"path": "coros.md", "keywords": ["COROS"]},
+            ],
+        }), encoding="utf-8")
+        builder = _builder(
+            tmp_path,
+            context_retrieval=ContextRetrievalConfig(mode="manifest"),
+        )
+
+        messages = builder.build_messages([], "add milk to my grocery list")
+        prompt = messages[0]["content"]
+
+        assert "critical rule" in prompt
+        assert "active state" in prompt
+        assert "list procedure" in prompt
+        assert "biometrics procedure" not in prompt
+        assert "# Context Provenance" in prompt
+        report = builder.last_context_report
+        assert report["mode"] == "manifest"
+        selected = [source["path"] for source in report["sources"] if source["selected"]]
+        assert selected == ["AGENTS.md", "now.md", "grocery.md"]
+
+    def test_all_pinned_compatibility_mode_remains_default(self, tmp_path):
+        (tmp_path / "USER.md").write_text("all user facts", encoding="utf-8")
+        builder = _builder(tmp_path)
+
+        prompt = builder.build_system_prompt(retrieval_query="unrelated")
+
+        assert "all user facts" in prompt
+        assert builder.last_context_report["mode"] == "all_pinned"
+        assert "# Context Provenance" not in prompt
 
 
 # ---------------------------------------------------------------------------
