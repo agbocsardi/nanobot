@@ -15,7 +15,7 @@ _MAX_TOOL_RESULT_CHARS = AgentDefaults().max_tool_result_chars
 
 @pytest.mark.asyncio
 async def test_runner_returns_structured_tool_error():
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
 
     provider = MagicMock(spec=LLMProvider)
     provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
@@ -39,9 +39,16 @@ async def test_runner_returns_structured_tool_error():
 
     assert result.stop_reason == "tool_error"
     assert result.error == "Error: RuntimeError: boom"
-    assert result.tool_events == [
-        {"name": "list_dir", "status": "error", "detail": "boom"}
-    ]
+    assert result.tool_events == [{
+        "name": "list_dir",
+        "status": "fatal_error",
+        "detail": "boom",
+        "execution_succeeded": False,
+        "operational_success": False,
+        "verified": False,
+        "retryable": False,
+        "postcondition": None,
+    }]
 
 
 @pytest.mark.asyncio
@@ -49,9 +56,9 @@ async def test_llm_error_not_appended_to_session_messages():
     """When LLM returns finish_reason='error', the error content must NOT be
     appended to the messages list (prevents polluting session history)."""
     from nanobot.agent.runner import (
-        AgentRunSpec,
-        AgentRunner,
         _PERSISTED_MODEL_ERROR_PLACEHOLDER,
+        AgentRunner,
+        AgentRunSpec,
     )
 
     provider = MagicMock(spec=LLMProvider)
@@ -70,7 +77,7 @@ async def test_llm_error_not_appended_to_session_messages():
         max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
     ))
 
-    assert result.stop_reason == "error"
+    assert result.stop_reason == "provider_error"
     assert result.final_content == "429 rate limit exceeded"
     assistant_msgs = [m for m in result.messages if m.get("role") == "assistant"]
     assert all("429" not in (m.get("content") or "") for m in assistant_msgs), \
@@ -81,7 +88,7 @@ async def test_llm_error_not_appended_to_session_messages():
 @pytest.mark.asyncio
 async def test_llm_arrearage_error_surfaces_clear_message():
     """Arrearage errors yield a clear user-facing message, not a raw dump (#3006)."""
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner, _ARREARAGE_ERROR_MESSAGE
+    from nanobot.agent.runner import _ARREARAGE_ERROR_MESSAGE, AgentRunner, AgentRunSpec
 
     provider = MagicMock(spec=LLMProvider)
     provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
@@ -99,13 +106,13 @@ async def test_llm_arrearage_error_surfaces_clear_message():
         max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
     ))
 
-    assert result.stop_reason == "error"
+    assert result.stop_reason == "provider_error"
     assert result.final_content == _ARREARAGE_ERROR_MESSAGE
 
 
 @pytest.mark.asyncio
 async def test_runner_tool_error_sets_final_content():
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
 
     provider = MagicMock(spec=LLMProvider)
 
@@ -139,7 +146,7 @@ async def test_runner_tool_error_sets_final_content():
 async def test_runner_tool_error_preserves_tool_results_in_messages():
     """When a tool raises a fatal error, its results must still be appended
     to messages so the session never contains orphan tool_calls (#2943)."""
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
 
     provider = MagicMock(spec=LLMProvider)
 

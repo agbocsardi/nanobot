@@ -6,13 +6,13 @@ from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
-from nanobot.agent.tools.base import Tool, tool_parameters
+from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
 from nanobot.agent.tools.context import ContextAware, RequestContext
 from nanobot.agent.tools.path_utils import resolve_workspace_path
 from nanobot.agent.tools.schema import ArraySchema, StringSchema, tool_parameters_schema
-from nanobot.security.workspace_access import current_tool_workspace
 from nanobot.bus.events import OutboundMessage
 from nanobot.config.paths import get_workspace_path
+from nanobot.security.workspace_access import current_tool_workspace
 
 
 @tool_parameters(
@@ -257,7 +257,10 @@ class MessageTool(Tool, ContextAware):
 
         if self._suppress_delivery_var.get():
             logger.debug("MessageTool: delivery suppressed during internal check")
-            return f"Message acknowledged for {channel}:{chat_id} (not delivered)"
+            return ToolResult(
+                f"Message acknowledged for {channel}:{chat_id} (not delivered)",
+                data={"channel": channel, "chat_id": chat_id, "delivered": False},
+            )
 
         try:
             await self._send_callback(msg)
@@ -268,6 +271,21 @@ class MessageTool(Tool, ContextAware):
                     self._turn_delivered_media_var.set(prev + tuple(str(p) for p in media))
             media_info = f" with {len(media)} attachments" if media else ""
             button_info = f" with {sum(len(row) for row in buttons)} button(s)" if buttons else ""
-            return f"Message sent to {channel}:{chat_id}{media_info}{button_info}"
+            return ToolResult(
+                f"Message sent to {channel}:{chat_id}{media_info}{button_info}",
+                data={
+                    "channel": channel,
+                    "chat_id": chat_id,
+                    "media": list(media or []),
+                    "button_count": sum(len(row) for row in buttons or []),
+                },
+                evidence=[{"kind": "queue_acceptance", "accepted": True}],
+                side_effects=[{
+                    "kind": "message_delivery",
+                    "channel": channel,
+                    "chat_id": chat_id,
+                }],
+                postcondition="unchecked",
+            )
         except Exception as e:
-            return f"Error sending message: {str(e)}"
+            return ToolResult.retryable_error(f"Error sending message: {str(e)}")

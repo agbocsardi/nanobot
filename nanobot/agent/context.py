@@ -1,11 +1,13 @@
 """Context builder for assembling agent prompts."""
 
 import base64
+import json
 import mimetypes
 import platform
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from nanobot.agent.context_manifest import ContextManifestAssembler
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
 from nanobot.agent.tools import mcp as mcp_tools
@@ -61,9 +63,21 @@ class ContextBuilder:
     _ARCHIVED_SUMMARY_BUDGET_FRACTION = 0.25
     _RUNTIME_CONTEXT_END = "[/Runtime Context]"
 
-    def __init__(self, workspace: Path, timezone: str | None = None, disabled_skills: list[str] | None = None):
+    def __init__(
+        self,
+        workspace: Path,
+        timezone: str | None = None,
+        disabled_skills: list[str] | None = None,
+        context_retrieval: Any | None = None,
+    ):
         self.workspace = workspace
         self.timezone = timezone
+        self.context_retrieval = context_retrieval
+        self.last_context_report: dict[str, Any] = {
+            "mode": "all_pinned",
+            "sources": [],
+            "totals": {},
+        }
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace, disabled_skills=set(disabled_skills) if disabled_skills else None)
 
@@ -76,28 +90,63 @@ class ContextBuilder:
         session_key: str | None = None,
         unified_session: bool = False,
         input_token_budget: int | None = None,
+        retrieval_query: str = "",
+        context_owners: set[str] | None = None,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         root = workspace or self.workspace
         parts = [self._get_identity(channel=channel, workspace=root)]
 
-        bootstrap = self._load_bootstrap_files(root)
-        if bootstrap:
-            parts.append(bootstrap)
+        manifest_mode = (
+            self.context_retrieval is not None
+            and getattr(self.context_retrieval, "mode", "all_pinned") == "manifest"
+        )
+        if manifest_mode:
+            owners = set(context_owners or set())
+            owners.update(f"skill:{name}" for name in skill_names or [])
+            owners.add(f"repo:{root.name}")
+            assembler = ContextManifestAssembler(
+                root,
+                manifest_path=self.context_retrieval.manifest_path,
+                constitutional_budget_chars=(
+                    self.context_retrieval.constitutional_budget_chars
+                ),
+                current_budget_chars=self.context_retrieval.current_budget_chars,
+                retrieved_budget_chars=self.context_retrieval.retrieved_budget_chars,
+            )
+            assembly = assembler.assemble(retrieval_query, owners=owners)
+            report = assembly.report()
+            self.last_context_report = {"mode": "manifest", **report}
+            if assembly.constitutional:
+                parts.append(f"# Constitutional Context\n\n{assembly.constitutional}")
+            if assembly.current:
+                parts.append(f"# Current Context\n\n{assembly.current}")
+            if assembly.retrieved:
+                parts.append(f"# Retrieved Context\n\n{assembly.retrieved}")
+        else:
+            self.last_context_report = {
+                "mode": "all_pinned",
+                "sources": [],
+                "totals": {},
+            }
+            bootstrap = self._load_bootstrap_files(root)
+            if bootstrap:
+                parts.append(bootstrap)
 
         parts.append(render_template("agent/tool_contract.md"))
 
-        memory = self.memory.get_memory_context()
-        legacy_template_only = (
-            memory.startswith("## Long-term Memory")
-            and self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md")
-        )
-        if memory and not legacy_template_only:
-            parts.append(f"# Memory\n\n{memory}")
+        if not manifest_mode:
+            memory = self.memory.get_memory_context()
+            legacy_template_only = (
+                memory.startswith("## Long-term Memory")
+                and self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md")
+            )
+            if memory and not legacy_template_only:
+                parts.append(f"# Memory\n\n{memory}")
 
-        memory_tree = self.memory.get_memory_tree_context()
-        if memory_tree:
-            parts.append(memory_tree)
+            memory_tree = self.memory.get_memory_tree_context()
+            if memory_tree:
+                parts.append(memory_tree)
 
         always_skills = self.skills.get_always_skills()
         if always_skills:
@@ -126,6 +175,12 @@ class ContextBuilder:
                     input_token_budget=input_token_budget,
                 )
                 parts.append(f"[Archived Context Summary]\n\n{text}")
+
+        if manifest_mode:
+            parts.append(
+                "# Context Provenance\n\n"
+                + json.dumps(self.last_context_report, sort_keys=True, ensure_ascii=True)
+            )
 
         return "\n\n---\n\n".join(parts)
 
@@ -269,6 +324,8 @@ class ContextBuilder:
                     session_key=session_key,
                     unified_session=unified_session,
                     input_token_budget=input_token_budget,
+                    retrieval_query=current_message,
+                    context_owners={f"skill:{name}" for name in skill_names or []},
                 ),
             },
             *history,

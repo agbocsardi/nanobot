@@ -97,6 +97,16 @@ class VisionHandoffConfig(Base):
     prompt: str | None = None  # override the describer system prompt
 
 
+class ContextRetrievalConfig(Base):
+    """Three-tier context assembly with an all-pinned compatibility mode."""
+
+    mode: Literal["all_pinned", "manifest"] = "all_pinned"
+    manifest_path: str = "context-manifest.json"
+    constitutional_budget_chars: int = Field(default=24_000, ge=1_000)
+    current_budget_chars: int = Field(default=8_000, ge=1_000)
+    retrieved_budget_chars: int = Field(default=24_000, ge=1_000)
+
+
 class InlineFallbackConfig(Base):
     """One inline fallback model configuration."""
 
@@ -167,6 +177,7 @@ class AgentDefaults(Base):
     bot_icon: str = "🐈"  # Short icon (emoji or text) shown next to the bot name in CLI; "" to omit
     unified_session: bool = False  # Share one session across all channels (single-user multi-device)
     disabled_skills: list[str] = Field(default_factory=list)  # Skill names to exclude from loading (e.g. ["summarize", "skill-creator"])
+    context_retrieval: ContextRetrievalConfig = Field(default_factory=ContextRetrievalConfig)
     session_ttl_minutes: int = Field(
         default=0,
         ge=0,
@@ -294,6 +305,20 @@ class MCPServerConfig(Base):
     oauth_scopes: str = "openid mcp.tools offline_access"  # OAuth scopes; `offline_access` yields a refresh token so the gateway can auto-refresh
 
 
+class ToolPolicyRuleConfig(Base):
+    """One ordered tool policy rule; later matching rules take precedence."""
+
+    id: str = Field(min_length=1)
+    outcome: Literal["allow", "deny", "ask"]
+    mode: str = "*"
+    tool: str = "*"
+    resource: str = "*"
+    mutation: Literal["read", "write", "*"] = "*"
+    model: str = "*"
+    preset: str = "*"
+    reason: str = ""
+
+
 def _lazy_default(module_path: str, class_name: str) -> Any:
     """Deferred import helper for ToolsConfig default factories."""
     import importlib
@@ -320,6 +345,7 @@ class ToolsConfig(Base):
     restrict_to_workspace: bool = False  # policy intent: keep tool access inside workspace when possible
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
     ssrf_whitelist: list[str] = Field(default_factory=list)  # CIDR ranges to exempt from SSRF blocking (e.g. ["100.64.0.0/10"] for Tailscale)
+    policies: list[ToolPolicyRuleConfig] = Field(default_factory=list)
 
 
 class Config(BaseSettings):

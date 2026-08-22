@@ -77,10 +77,20 @@ async def test_runner_calls_hooks_in_order():
         ("before_execute_tools", 0, ["list_dir"]),
         (
             "after_iteration",
-            0,
-            None,
-            ["tool result"],
-            [{"name": "list_dir", "status": "ok", "detail": "tool result"}],
+                0,
+                None,
+                ["tool result"],
+                [{
+                    "name": "list_dir",
+                    "status": "success",
+                    "detail": "tool result",
+                    "execution_succeeded": True,
+                    "operational_success": True,
+                    "verified": True,
+                    "retryable": False,
+                    "postcondition": None,
+                    "data": "tool result",
+                }],
             None,
         ),
         ("before_iteration", 1),
@@ -335,9 +345,17 @@ async def test_runner_run_level_context_is_detached_snapshot():
     assert request_messages[0][0]["content"] == "hi"
     assert result.messages[0]["content"] == "hi"
     assert result.tools_used == ["list_dir"]
-    assert result.tool_events == [
-        {"name": "list_dir", "status": "ok", "detail": "tool result"}
-    ]
+    assert result.tool_events == [{
+        "name": "list_dir",
+        "status": "success",
+        "detail": "tool result",
+        "execution_succeeded": True,
+        "operational_success": True,
+        "verified": True,
+        "retryable": False,
+        "postcondition": None,
+        "data": "tool result",
+    }]
 
 
 @pytest.mark.asyncio
@@ -378,13 +396,13 @@ async def test_runner_calls_on_error_for_model_error_result():
         hook=ErrorHook(),
     ))
 
-    assert result.stop_reason == "error"
+    assert result.stop_reason == "provider_error"
     assert result.error == "model failed"
     assert events == [
         ("before_run", None),
-        ("on_error", "error", "model failed", None),
-        ("after_run", "error", "model failed"),
-        ("on_finally", "error", "model failed"),
+        ("on_error", "provider_error", "model failed", None),
+        ("after_run", "provider_error", "model failed"),
+        ("on_finally", "provider_error", "model failed"),
     ]
 
 

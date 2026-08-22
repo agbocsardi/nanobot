@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Any
 
 from nanobot.agent import model_presets as preset_helpers
-from nanobot.agent.tools.base import Tool, tool_parameters
+from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
 from nanobot.agent.tools.context import ContextAware, RequestContext
 from nanobot.agent.tools.schema import (
     BooleanSchema,
@@ -193,7 +193,7 @@ class CronTool(Tool, ContextAware):
             return self._list_jobs()
         elif action == "remove":
             return self._remove_job(job_id)
-        return f"Unknown action: {action}"
+        return ToolResult.retryable_error(f"Unknown action: {action}")
 
     def _add_job(
         self,
@@ -279,7 +279,13 @@ class CronTool(Tool, ContextAware):
             model_preset=preset_name,
             isolated=isolated,
         )
-        return f"Created job '{job.name}' (id: {job.id})"
+        return ToolResult(
+            f"Created job '{job.name}' (id: {job.id})",
+            data={"job_id": job.id, "job_name": job.name},
+            evidence=[{"kind": "cron_state", "job_id": job.id, "present": True}],
+            side_effects=[{"kind": "cron_job_created", "job_id": job.id}],
+            postcondition="checked",
+        )
 
     def _format_timing(self, schedule: CronSchedule) -> str:
         """Format schedule as a human-readable timing string."""
@@ -321,37 +327,65 @@ class CronTool(Tool, ContextAware):
             return "Dream memory consolidation for long-term memory."
         return "System-managed internal job."
 
-    def _list_jobs(self) -> str:
-        jobs = self._cron.list_jobs()
+    def _list_jobs(self) -> ToolResult:
+        try:
+            jobs = self._cron.list_jobs()
+        except Exception as exc:
+            return ToolResult.retryable_error(
+                f"Could not list scheduled jobs: {type(exc).__name__}: {exc}"
+            )
         if not jobs:
-            return "No scheduled jobs."
+            return ToolResult("No scheduled jobs.", data={"jobs": [], "errors": []})
         lines = []
+        listed_jobs = []
+        errors = []
         for j in jobs:
-            timing = self._format_timing(j.schedule)
-            parts = [f"- {j.name} (id: {j.id}, {timing})"]
-            if j.payload.kind == "system_event":
-                parts.append(f"  Purpose: {self._system_job_purpose(j)}")
-                parts.append("  Protected: visible for inspection, but cannot be removed.")
-            parts.extend(self._format_state(j.state, j.schedule))
-            lines.append("\n".join(parts))
-        return "Scheduled jobs:\n" + "\n".join(lines)
+            try:
+                timing = self._format_timing(j.schedule)
+                parts = [f"- {j.name} (id: {j.id}, {timing})"]
+                if j.payload.kind == "system_event":
+                    parts.append(f"  Purpose: {self._system_job_purpose(j)}")
+                    parts.append("  Protected: visible for inspection, but cannot be removed.")
+                parts.extend(self._format_state(j.state, j.schedule))
+                if j.state.last_delivery_status:
+                    delivery = f"  Last delivery: {j.state.last_delivery_status}"
+                    if j.state.last_delivery_error:
+                        delivery += f" ({j.state.last_delivery_error})"
+                    parts.append(delivery)
+                lines.append("\n".join(parts))
+                listed_jobs.append({"id": j.id, "name": j.name})
+            except Exception as exc:
+                job_id = str(getattr(j, "id", "unknown"))
+                message = f"{type(exc).__name__}: {exc}"
+                lines.append(f"- unavailable job (id: {job_id}): {message}")
+                errors.append({"job_id": job_id, "error": message})
+        content = "Scheduled jobs:\n" + "\n".join(lines)
+        if errors:
+            return ToolResult.partial(content, data={"jobs": listed_jobs, "errors": errors})
+        return ToolResult(content, data={"jobs": listed_jobs, "errors": []})
 
     def _remove_job(self, job_id: str | None) -> str:
         if not job_id:
             return "Error: job_id is required for remove"
         result = self._cron.remove_job(job_id)
         if result == "removed":
-            return f"Removed job {job_id}"
+            return ToolResult(
+                f"Removed job {job_id}",
+                data={"job_id": job_id},
+                evidence=[{"kind": "cron_state", "job_id": job_id, "present": False}],
+                side_effects=[{"kind": "cron_job_removed", "job_id": job_id}],
+                postcondition="checked",
+            )
         if result == "protected":
             job = self._cron.get_job(job_id)
             if job and job.name == "dream":
-                return (
+                return ToolResult.policy_block(
                     "Cannot remove job `dream`.\n"
                     "This is a system-managed Dream memory consolidation job for long-term memory.\n"
                     "It remains visible so you can inspect it, but it cannot be removed."
                 )
-            return (
+            return ToolResult.policy_block(
                 f"Cannot remove job `{job_id}`.\n"
                 "This is a protected system-managed cron job."
             )
-        return f"Job {job_id} not found"
+        return ToolResult.retryable_error(f"Job {job_id} not found")

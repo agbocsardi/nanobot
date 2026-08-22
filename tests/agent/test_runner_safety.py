@@ -20,7 +20,7 @@ async def test_runner_does_not_abort_on_workspace_violation_anymore():
     we now hand the error back to the LLM as a recoverable tool result and
     rely on ``repeated_workspace_violation_error`` to throttle bypass loops.
     """
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
 
     provider = MagicMock()
     provider.chat_with_retry = AsyncMock(side_effect=[
@@ -55,8 +55,9 @@ async def test_runner_does_not_abort_on_workspace_violation_anymore():
     )
     assert result.stop_reason != "tool_error"
     assert result.error is None
-    assert result.final_content == "ok, telling the user instead"
-    assert result.tool_events and result.tool_events[0]["status"] == "error"
+    assert result.stop_reason == "policy_block"
+    assert result.final_content.endswith("ok, telling the user instead")
+    assert result.tool_events and result.tool_events[0]["status"] == "policy_block"
     # Detail still carries the workspace_violation breadcrumb for telemetry,
     # but the runner did not raise.
     assert "workspace_violation" in result.tool_events[0]["detail"]
@@ -88,7 +89,7 @@ def test_is_ssrf_violation_recognizes_private_url_blocks():
 @pytest.mark.asyncio
 async def test_runner_returns_non_retryable_hint_on_ssrf_violation():
     """SSRF stays blocked, but the runtime gives the LLM a final chance to recover."""
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
 
     provider = MagicMock()
     provider.chat_with_retry = AsyncMock(side_effect=[
@@ -121,9 +122,11 @@ async def test_runner_returns_non_retryable_hint_on_ssrf_violation():
     ))
 
     assert provider.chat_with_retry.await_count == 2
-    assert result.stop_reason == "completed"
+    assert result.stop_reason == "policy_block"
     assert result.error is None
-    assert result.final_content == "I cannot access that private URL. Please share local files."
+    assert result.final_content.endswith(
+        "I cannot access that private URL. Please share local files."
+    )
     assert result.tool_events and result.tool_events[0]["detail"].startswith("ssrf_violation:")
     tool_messages = [m for m in result.messages if m.get("role") == "tool"]
     assert tool_messages
@@ -141,7 +144,7 @@ async def test_runner_lets_llm_recover_from_shell_guard_path_outside():
     turn (silent hang on Telegram per #3605); now the LLM gets the soft
     error back and can finalize on the next iteration.
     """
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
 
     provider = MagicMock()
     captured_second_call: list[dict] = []
@@ -180,8 +183,9 @@ async def test_runner_lets_llm_recover_from_shell_guard_path_outside():
     )
     assert result.stop_reason != "tool_error"
     assert result.error is None
-    assert result.final_content == "recovered final answer"
-    assert result.tool_events and result.tool_events[0]["status"] == "error"
+    assert result.stop_reason == "policy_block"
+    assert result.final_content.endswith("recovered final answer")
+    assert result.tool_events and result.tool_events[0]["status"] == "policy_block"
     # v2: detail keeps the breadcrumb but the runner did not raise.
     assert "workspace_violation" in result.tool_events[0]["detail"]
 
@@ -195,7 +199,7 @@ async def test_runner_throttles_repeated_workspace_bypass_attempts():
     the runner replaces the tool result with a hard "stop trying" message
     so the model finally gives up and surfaces the boundary to the user.
     """
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
 
     bypass_attempts = [
         ToolCallRequest(
@@ -231,11 +235,12 @@ async def test_runner_throttles_repeated_workspace_bypass_attempts():
     # runner finally completes once the LLM stops asking.
     assert result.stop_reason != "tool_error"
     assert result.error is None
-    assert result.final_content == "ok telling user"
+    assert result.stop_reason == "policy_block"
+    assert result.final_content.endswith("ok telling user")
     # The third+ attempts must have been escalated -- look at the events.
     escalated = [
         ev for ev in result.tool_events
-        if ev["status"] == "error"
+        if ev["status"] == "policy_block"
         and ev["detail"].startswith("workspace_violation_escalated:")
     ]
     assert escalated, (

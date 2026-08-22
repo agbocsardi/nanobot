@@ -348,6 +348,7 @@ class TestSubagentCancellation:
             workspace=tmp_path,
             bus=bus,
             max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+            max_iterations=2,
         )
         mgr._announce_result = AsyncMock()
 
@@ -367,11 +368,10 @@ class TestSubagentCancellation:
 
         mgr._announce_result.assert_awaited_once()
         args = mgr._announce_result.await_args.args
-        assert "Completed steps:" in args[3]
-        assert "- list_dir: first result" in args[3]
-        assert "Failure:" in args[3]
-        assert "- list_dir: boom" in args[3]
+        assert args[3] == "Task ended without a verified final synthesis."
         assert args[5] == "error"
+        assert status.phase == "incomplete"
+        assert status.stop_reason == "max_iterations"
 
     @pytest.mark.asyncio
     async def test_cancel_by_session_cancels_running_subagent_tool(self, monkeypatch, tmp_path):
@@ -423,7 +423,9 @@ class TestSubagentCancellation:
         assert count == 1
         assert cancelled.is_set()
         assert task.cancelled()
-        mgr._announce_result.assert_not_awaited()
+        mgr._announce_result.assert_awaited_once()
+        assert mgr._announce_result.await_args.args[3] == "Task was cancelled before completion."
+        assert mgr._announce_result.await_args.kwargs["stop_reason"] == "cancelled"
 
 
 class TestSubagentAnnounceSessionKey:

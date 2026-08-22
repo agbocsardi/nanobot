@@ -7,6 +7,7 @@ that ran, token usage, iterations, and tool events — everything previously
 lost when a subagent finished.
 """
 
+import asyncio
 import json
 import time
 from pathlib import Path
@@ -21,6 +22,7 @@ from nanobot.agent.subagent import (
     SubagentStatus,
 )
 from nanobot.bus.queue import MessageBus
+from nanobot.config.schema import ContextRetrievalConfig
 from nanobot.providers.base import LLMProvider
 
 
@@ -100,6 +102,40 @@ class TestSubagentRunRecord:
         assert rec["tool_events"] == events
 
     @pytest.mark.asyncio
+    async def test_partial_outcome_is_persisted_and_not_announced_as_success(self, tmp_path):
+        sm = _manager(tmp_path)
+        events = [{
+            "name": "exec",
+            "status": "retryable_error",
+            "detail": "not found",
+            "execution_succeeded": True,
+            "operational_success": False,
+            "verified": False,
+            "retryable": True,
+            "postcondition": None,
+            "exit_code": 127,
+        }]
+        sm.runner.run = AsyncMock(return_value=AgentRunResult(
+            final_content="Incomplete: command failed.",
+            messages=[],
+            stop_reason="partial_completion",
+            tool_events=events,
+        ))
+        status = _status()
+
+        with patch.object(sm, "_announce_result", new_callable=AsyncMock) as announce:
+            await sm._run_subagent(
+                "t1", "do task", "label",
+                {"channel": "cli", "chat_id": "direct"}, status,
+            )
+
+        assert announce.call_args.args[-2] == "error"
+        rec = _read_record(tmp_path, "t1")
+        assert rec["stop_reason"] == "partial_completion"
+        assert rec["tool_events"] == events
+        assert rec["result"] == "Incomplete: command failed."
+
+    @pytest.mark.asyncio
     async def test_exception_records_error(self, tmp_path):
         sm = _manager(tmp_path)
         sm.runner.run = AsyncMock(side_effect=RuntimeError("LLM down"))
@@ -111,7 +147,7 @@ class TestSubagentRunRecord:
             )
 
         rec = _read_record(tmp_path, "t1")
-        assert rec["phase"] == "error"
+        assert rec["phase"] == "failed"
         assert "LLM down" in rec["error"]
         assert "LLM down" in rec["result"]
 
@@ -148,6 +184,61 @@ class TestSubagentRunRecord:
         assert rec["params"]["max_iterations"] == sm.max_iterations
 
     @pytest.mark.asyncio
+    async def test_record_uses_effective_per_spawn_budgets(self, tmp_path):
+        sm = _manager(tmp_path)
+        sm.runner.run = AsyncMock(return_value=AgentRunResult(
+            final_content="ok", messages=[], stop_reason="completed",
+        ))
+
+        with patch.object(sm, "_announce_result", new_callable=AsyncMock):
+            await sm._run_subagent(
+                "t1", "do task", "label",
+                {"channel": "cli", "chat_id": "direct"},
+                _status(),
+                max_iterations=7,
+                context_window_tokens=32_000,
+                model_preset="careful",
+            )
+
+        rec = _read_record(tmp_path, "t1")
+        assert rec["params"]["max_iterations"] == 7
+        assert rec["params"]["context_window_tokens"] == 32_000
+        assert rec["params"]["max_tool_result_chars"] == 16_000
+        assert rec["params"]["model_preset"] == "careful"
+        assert rec["model_preset"] == "careful"
+
+    @pytest.mark.asyncio
+    async def test_record_persists_task_relevant_context_decisions(self, tmp_path):
+        (tmp_path / "rules.md").write_text("nanobot repository rules", encoding="utf-8")
+        (tmp_path / "context-manifest.json").write_text(
+            '{"retrieved":[{"path":"rules.md","owners":["repo:nanobot"]}]}',
+            encoding="utf-8",
+        )
+        sm = _manager(
+            tmp_path,
+            context_retrieval=ContextRetrievalConfig(mode="manifest"),
+        )
+        sm.runner.run = AsyncMock(return_value=AgentRunResult(
+            final_content="ok", messages=[], stop_reason="completed",
+        ))
+
+        with patch.object(sm, "_announce_result", new_callable=AsyncMock):
+            await sm._run_subagent(
+                "t1", "fix the nanobot repository", "label",
+                {"channel": "cli", "chat_id": "direct"},
+                _status(),
+            )
+
+        rec = _read_record(tmp_path, "t1")
+        assert rec["context"]["mode"] == "manifest"
+        selected = [
+            source["path"]
+            for source in rec["context"]["sources"]
+            if source["selected"]
+        ]
+        assert selected == ["rules.md"]
+
+    @pytest.mark.asyncio
     async def test_record_write_failure_does_not_break_run(self, tmp_path):
         """Observability must never break the announce path."""
         sm = _manager(tmp_path)
@@ -163,3 +254,40 @@ class TestSubagentRunRecord:
                 {"channel": "cli", "chat_id": "direct"}, _status(),
             )
             announce.assert_called_once()  # announce still happened
+
+    @pytest.mark.asyncio
+    async def test_spawned_cancellation_persists_real_terminal_record(self, tmp_path):
+        sm = _manager(tmp_path)
+        started = asyncio.Event()
+
+        async def block(_spec):
+            started.set()
+            await asyncio.sleep(60)
+
+        sm.runner.run = block
+        response = await sm.spawn("cancel me", session_key="cli:cancel")
+        task_id = response.split("id: ", 1)[1].split(")", 1)[0]
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        assert await sm.cancel_by_session("cli:cancel") == 1
+        await asyncio.sleep(0)
+
+        record = _read_record(tmp_path, task_id)
+        assert record["phase"] == "cancelled"
+        assert record["stop_reason"] == "cancelled"
+        assert record["result"] == "Task was cancelled before completion."
+        assert sm.runtime_statuses()[task_id].phase == "cancelled"
+
+    @pytest.mark.asyncio
+    async def test_immediate_cancellation_awaits_fallback_announcement(self, tmp_path):
+        sm = _manager(tmp_path)
+        response = await sm.spawn("cancel before start", session_key="cli:immediate")
+        task_id = response.split("id: ", 1)[1].split(")", 1)[0]
+
+        assert await sm.cancel_by_session("cli:immediate") == 1
+
+        announcement = await asyncio.wait_for(sm.bus.consume_inbound(), timeout=1)
+        record = _read_record(tmp_path, task_id)
+        assert announcement.metadata["subagent_result"]["stop_reason"] == "cancelled"
+        assert record["phase"] == "cancelled"
+        assert sm._finalizer_tasks == set()

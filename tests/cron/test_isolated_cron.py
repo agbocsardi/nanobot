@@ -144,6 +144,7 @@ async def test_isolated_runs_via_process_direct_and_delivers_when_not_silent() -
     assert ok["isolated"] is True
     assert ok["silent"] is False
     assert ok["response"] == "biometrics ok"
+    assert ok["delivery"] == {"status": "delivered", "error": None}
     assert ok["usage"]["provider"]
 
 
@@ -159,6 +160,28 @@ async def test_isolated_silent_job_does_not_deliver() -> None:
     assert delivered == []  # silent swallows the final reply
     assert recorder.records[-1][1]["silent"] is True
     assert recorder.records[-1][1]["status"] == "ok"
+    assert recorder.records[-1][1]["delivery"]["status"] == "suppressed"
+
+
+@pytest.mark.asyncio
+async def test_isolated_delivery_failure_is_recorded_and_reraised() -> None:
+    agent = _FakeAgent(content="important result")
+    recorder = _FakeRecorder()
+    job = _job()
+
+    async def fail_delivery(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("channel unavailable")
+
+    with pytest.raises(RuntimeError, match="channel unavailable"):
+        await run_isolated_cron_job(job, agent=agent, cron=recorder, deliver=fail_delivery)
+
+    assert [record["status"] for _, record in recorder.records] == ["queued", "error"]
+    assert recorder.records[-1][1]["delivery"] == {
+        "status": "failed",
+        "error": "channel unavailable",
+    }
+    assert job.state.last_delivery_status == "failed"
+    assert job.state.last_delivery_error == "channel unavailable"
 
 
 @pytest.mark.asyncio

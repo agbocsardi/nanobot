@@ -15,7 +15,7 @@ from typing import Any
 from loguru import logger
 from pydantic import Field
 
-from nanobot.agent.tools.base import Tool, tool_parameters
+from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
 from nanobot.agent.tools.context import current_request_session_key
 from nanobot.agent.tools.exec_session import (
     DEFAULT_EXEC_SESSION_MANAGER,
@@ -250,7 +250,7 @@ class ExecTool(Tool):
         command = command or cmd
         working_dir = working_dir or workdir
         if not command:
-            return "Error: Missing command. Provide command or cmd."
+            return ToolResult.retryable_error("Error: Missing command. Provide command or cmd.")
         if max_output_chars is None:
             max_output_chars = max_output_tokens
 
@@ -277,7 +277,9 @@ class ExecTool(Tool):
                 )
             except asyncio.TimeoutError:
                 await self._kill_process(process)
-                return f"Error: Command timed out after {prepared.timeout} seconds"
+                return ToolResult.retryable_error(
+                    f"Error: Command timed out after {prepared.timeout} seconds"
+                )
             except asyncio.CancelledError:
                 await self._kill_process(process)
                 raise
@@ -305,10 +307,23 @@ class ExecTool(Tool):
                     + result[-half:]
                 )
 
-            return result
+            stdout_text = stdout.decode("utf-8", errors="replace")
+            stderr_text = stderr.decode("utf-8", errors="replace")
+            return ToolResult(
+                result,
+                status="success" if process.returncode == 0 else "retryable_error",
+                data={
+                    "exit_code": process.returncode,
+                    "stdout": stdout_text,
+                    "stderr": stderr_text,
+                },
+                exit_code=process.returncode,
+                stdout=stdout_text,
+                stderr=stderr_text,
+            )
 
         except Exception as e:
-            return f"Error executing command: {str(e)}"
+            return ToolResult.retryable_error(f"Error executing command: {str(e)}")
 
     async def _execute_session(
         self,

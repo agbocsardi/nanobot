@@ -221,12 +221,16 @@ class CronService:
                             last_run_at_ms=j.get("state", {}).get("lastRunAtMs"),
                             last_status=j.get("state", {}).get("lastStatus"),
                             last_error=j.get("state", {}).get("lastError"),
+                            last_delivery_status=j.get("state", {}).get("lastDeliveryStatus"),
+                            last_delivery_error=j.get("state", {}).get("lastDeliveryError"),
                             run_history=[
                                 CronRunRecord(
                                     run_at_ms=r["runAtMs"],
                                     status=r["status"],
                                     duration_ms=r.get("durationMs", 0),
                                     error=r.get("error"),
+                                    delivery_status=r.get("deliveryStatus"),
+                                    delivery_error=r.get("deliveryError"),
                                 )
                                 for r in j.get("state", {}).get("runHistory", [])
                             ],
@@ -360,12 +364,16 @@ class CronService:
                         "lastRunAtMs": j.state.last_run_at_ms,
                         "lastStatus": j.state.last_status,
                         "lastError": j.state.last_error,
+                        "lastDeliveryStatus": j.state.last_delivery_status,
+                        "lastDeliveryError": j.state.last_delivery_error,
                         "runHistory": [
                             {
                                 "runAtMs": r.run_at_ms,
                                 "status": r.status,
                                 "durationMs": r.duration_ms,
                                 "error": r.error,
+                                "deliveryStatus": r.delivery_status,
+                                "deliveryError": r.delivery_error,
                             }
                             for r in j.state.run_history
                         ],
@@ -553,6 +561,8 @@ class CronService:
             status=job.state.last_status,
             duration_ms=end_ms - start_ms,
             error=job.state.last_error,
+            delivery_status=job.state.last_delivery_status,
+            delivery_error=job.state.last_delivery_error,
         ))
         job.state.run_history = job.state.run_history[-self._MAX_RUN_HISTORY:]
 

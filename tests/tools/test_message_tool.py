@@ -2,6 +2,7 @@ import os
 
 import pytest
 
+from nanobot.agent.tools.base import ToolResult
 from nanobot.agent.tools.message import MessageTool
 from nanobot.bus.events import OutboundMessage
 from nanobot.config.paths import get_workspace_path
@@ -78,6 +79,24 @@ async def test_message_tool_marks_channel_delivery_only_when_enabled() -> None:
 
     assert sent[0].metadata == {}
     assert sent[1].metadata == {"_record_channel_delivery": True}
+
+
+@pytest.mark.asyncio
+async def test_message_queue_acceptance_is_not_verified_delivery() -> None:
+    async def _send(msg: OutboundMessage) -> None:
+        pass
+
+    result = await MessageTool(send_callback=_send).execute(
+        content="hello",
+        channel="telegram",
+        chat_id="1",
+    )
+
+    assert isinstance(result, ToolResult)
+    assert result.status == "partial"
+    assert result.postcondition == "unchecked"
+    assert result.verified is False
+    assert result.evidence == [{"kind": "queue_acceptance", "accepted": True}]
 
 
 @pytest.mark.asyncio

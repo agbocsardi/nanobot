@@ -173,12 +173,15 @@ async def run_bound_cron_job(
         )
     except (Exception, asyncio.CancelledError) as exc:
         error_text = str(exc) or exc.__class__.__name__
+        job.state.last_delivery_status = "not_attempted"
+        job.state.last_delivery_error = error_text
         cron.write_run_record(
             run_id,
             {
                 **run_record_base,
                 "status": "error",
                 "error": error_text,
+                "delivery": {"status": "not_attempted", "error": error_text},
             },
         )
         raise
@@ -187,6 +190,9 @@ async def run_bound_cron_job(
             cron_tool.reset_cron_context(cron_token)
 
     response = resp.content if resp else ""
+    delivery_status = "empty" if not response else "suppressed" if job.payload.silent else "delivered"
+    job.state.last_delivery_status = delivery_status
+    job.state.last_delivery_error = None
     # What actually ran + what it cost. provider/model come from the loop's
     # active runtime for this turn (cron turns do not currently override the
     # provider). usage is the delta captured by _last_usage for this turn.
@@ -203,6 +209,7 @@ async def run_bound_cron_job(
             "status": "ok",
             "response": response,
             "usage": usage_block,
+            "delivery": {"status": delivery_status, "error": None},
         },
     )
     return response
@@ -288,9 +295,16 @@ async def run_isolated_cron_job(
         )
     except (Exception, asyncio.CancelledError) as exc:
         error_text = str(exc) or exc.__class__.__name__
+        job.state.last_delivery_status = "not_attempted"
+        job.state.last_delivery_error = error_text
         cron.write_run_record(
             run_id,
-            {**run_record_base, "status": "error", "error": error_text},
+            {
+                **run_record_base,
+                "status": "error",
+                "error": error_text,
+                "delivery": {"status": "not_attempted", "error": error_text},
+            },
         )
         raise
     finally:
@@ -298,11 +312,34 @@ async def run_isolated_cron_job(
             cron_tool.reset_cron_context(cron_token)
 
     response = resp.content if resp else ""
-    if response and not job.payload.silent:
-        await deliver(
-            OutboundMessage(channel=channel, chat_id=chat_id, content=response),
-            record=True,
-        )
+    delivery_status = "empty" if not response else "suppressed" if job.payload.silent else "pending"
+    delivery_error = None
+    if delivery_status == "pending":
+        try:
+            await deliver(
+                OutboundMessage(channel=channel, chat_id=chat_id, content=response),
+                record=True,
+            )
+            delivery_status = "delivered"
+        except (Exception, asyncio.CancelledError) as exc:
+            delivery_status = "failed"
+            delivery_error = str(exc) or exc.__class__.__name__
+            job.state.last_delivery_status = delivery_status
+            job.state.last_delivery_error = delivery_error
+            cron.write_run_record(
+                run_id,
+                {
+                    **run_record_base,
+                    "status": "error",
+                    "error": f"delivery failed: {delivery_error}",
+                    "response": response,
+                    "delivery": {"status": delivery_status, "error": delivery_error},
+                },
+            )
+            raise
+
+    job.state.last_delivery_status = delivery_status
+    job.state.last_delivery_error = delivery_error
 
     provider_name = _agent_provider_name(agent)
     usage_block = build_usage_block(
@@ -312,6 +349,12 @@ async def run_isolated_cron_job(
     )
     cron.write_run_record(
         run_id,
-        {**run_record_base, "status": "ok", "response": response, "usage": usage_block},
+        {
+            **run_record_base,
+            "status": "ok",
+            "response": response,
+            "usage": usage_block,
+            "delivery": {"status": delivery_status, "error": delivery_error},
+        },
     )
     return response

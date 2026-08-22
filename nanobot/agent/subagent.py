@@ -16,6 +16,7 @@ from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.agent.tools.context import ToolContext
 from nanobot.agent.tools.file_state import FileStates
 from nanobot.agent.tools.loader import ToolLoader
+from nanobot.agent.tools.policy import ToolPolicy
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
@@ -39,12 +40,16 @@ class SubagentStatus:
     label: str
     task_description: str
     started_at: float          # time.monotonic()
-    phase: str = "initializing"  # initializing | awaiting_tools | tools_completed | final_response | done | error
+    phase: str = "queued"
+    activity: str = "waiting_for_capacity"
     iteration: int = 0
     tool_events: list = field(default_factory=list)   # [{name, status, detail}, ...]
     usage: dict = field(default_factory=dict)          # token usage
     stop_reason: str | None = None
     error: str | None = None
+    effective_budgets: dict[str, Any] = field(default_factory=dict)
+    context_report: dict[str, Any] = field(default_factory=dict)
+    holds_capacity: bool = False
 
 
 class _SubagentHook(AgentHook):
@@ -56,6 +61,9 @@ class _SubagentHook(AgentHook):
         self._status = status
 
     async def before_execute_tools(self, context: AgentHookContext) -> None:
+        if self._status is not None:
+            self._status.phase = "running"
+            self._status.activity = "executing_tools"
         for tool_call in context.tool_calls:
             args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
             logger.debug(
@@ -88,11 +96,13 @@ class SubagentManager:
         disabled_skills: list[str] | None = None,
         max_iterations: int | None = None,
         max_concurrent_subagents: int | None = None,
+        max_queued_subagents: int | None = None,
         llm_wall_timeout_for_session: Callable[[str | None], float | None] | None = None,
         run_provider: LLMProvider | None = None,
         run_model: str | None = None,
         preset_snapshot_loader: Callable[[str], Any] | None = None,
         presets: dict[str, Any] | None = None,
+        context_retrieval: Any | None = None,
     ):
         defaults = AgentDefaults()
         self.provider = provider
@@ -113,18 +123,27 @@ class SubagentManager:
             if max_concurrent_subagents is not None
             else defaults.max_concurrent_subagents
         )
+        self.max_queued_subagents = (
+            max_queued_subagents
+            if max_queued_subagents is not None
+            else max(4, self.max_concurrent_subagents * 4)
+        )
+        self._execution_slots = asyncio.Semaphore(self.max_concurrent_subagents)
         self.runner = AgentRunner(provider)
         self.run_provider = run_provider
         self.run_model = run_model
         self._preset_snapshot_loader = preset_snapshot_loader
         self._presets = presets
         self._llm_wall_timeout_for_session = llm_wall_timeout_for_session
+        self.context_retrieval = context_retrieval
         # Per-run observability records: prompt, params, model/provider, usage,
         # status. Source of truth for "which model ran this subagent + what did
         # it cost". Defaults to <workspace>/subagents/.
         self.records_dir = workspace / "subagents"
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
+        self._finalizer_tasks: set[asyncio.Task[None]] = set()
         self._task_statuses: dict[str, SubagentStatus] = {}
+        self._terminal_statuses: dict[str, SubagentStatus] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
 
     def _subagent_tools_config(self) -> ToolsConfig:
@@ -133,6 +152,7 @@ class SubagentManager:
             exec=self.tools_config.exec,
             web=self.tools_config.web,
             file=self.tools_config.file,
+            policies=list(self.tools_config.policies),
             restrict_to_workspace=self.restrict_to_workspace,
         )
 
@@ -140,11 +160,20 @@ class SubagentManager:
         self,
         workspace: Path | None = None,
         tools_config: ToolsConfig | None = None,
+        policy_model: str | None = None,
+        policy_preset: str | None = None,
     ) -> ToolRegistry:
         """Build an isolated subagent tool registry via ToolLoader."""
         root = self.workspace if workspace is None else workspace
-        registry = ToolRegistry()
         cfg = tools_config if tools_config is not None else self._subagent_tools_config()
+        registry = ToolRegistry(policy=ToolPolicy(
+            cfg.policies,
+            default_context=lambda: {
+                "mode": "delegated",
+                "model": policy_model or self.run_model or self.model,
+                "preset": policy_preset,
+            },
+        ))
         ctx = ToolContext(
             config=cfg,
             workspace=str(root.resolve()),
@@ -177,27 +206,47 @@ class SubagentManager:
         workspace_scope: WorkspaceScope | None = None,
     ) -> str:
         """Spawn a subagent to execute a task in the background."""
+        if self.get_queued_count() >= self.max_queued_subagents:
+            raise RuntimeError(
+                f"delegated queue is full ({self.get_queued_count()}/"
+                f"{self.max_queued_subagents} queued)"
+            )
         task_id = str(uuid.uuid4())[:8]
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
         origin = {"channel": origin_channel, "chat_id": origin_chat_id, "session_key": session_key}
-
-        status = SubagentStatus(
-            task_id=task_id,
-            label=display_label,
-            task_description=task,
-            started_at=time.monotonic(),
-        )
-        self._task_statuses[task_id] = status
 
         provider_override: LLMProvider | None = None
         model_override: str | None = None
         preset_ctx: int | None = None
         if model_preset:
             provider_override, model_override, preset_ctx = self._resolve_preset_override(model_preset)
-        effective_ctx = context_window_tokens or preset_ctx
+        effective_provider = provider_override or self.run_provider or self.provider
+        effective_model = model_override or self.run_model or self.model
+        effective_ctx = context_window_tokens if context_window_tokens is not None else preset_ctx
+        effective_max_iterations = (
+            max_iterations if max_iterations is not None else self.max_iterations
+        )
+        effective_max_tool_result_chars = self.max_tool_result_chars
+
+        queued = self.get_running_count() >= self.max_concurrent_subagents
+        status = SubagentStatus(
+            task_id=task_id,
+            label=display_label,
+            task_description=task,
+            started_at=time.monotonic(),
+            effective_budgets={
+                "max_iterations": effective_max_iterations,
+                "context_window_tokens": effective_ctx,
+                "max_tool_result_chars": effective_max_tool_result_chars,
+                "model": effective_model,
+                "model_preset": model_preset,
+            },
+            phase="queued" if queued else "running",
+        )
+        self._task_statuses[task_id] = status
 
         bg_task = asyncio.create_task(
-            self._run_subagent(
+            self._run_scheduled_subagent(
                 task_id,
                 task,
                 display_label,
@@ -206,19 +255,54 @@ class SubagentManager:
                 origin_message_id,
                 temperature,
                 workspace_scope,
-                provider_override=provider_override,
-                model_override=model_override,
+                provider_override=effective_provider,
+                model_override=effective_model,
+                model_preset=model_preset,
                 context_window_tokens=effective_ctx,
-                max_iterations=max_iterations,
+                max_iterations=effective_max_iterations,
+                max_tool_result_chars=effective_max_tool_result_chars,
             )
         )
         self._running_tasks[task_id] = bg_task
         if session_key:
             self._session_tasks.setdefault(session_key, set()).add(task_id)
 
-        def _cleanup(_: asyncio.Task) -> None:
+        def _cleanup(finished: asyncio.Task) -> None:
+            if finished.cancelled() and status.phase != "cancelled":
+                status.phase = "cancelled"
+                status.activity = "terminal"
+                status.stop_reason = "cancelled"
+                cancelled_result = "Task was cancelled before execution started."
+                self._write_run_record(
+                    task_id,
+                    task,
+                    display_label,
+                    origin,
+                    temperature,
+                    workspace_scope,
+                    cancelled_result,
+                    status,
+                    provider=effective_provider,
+                    model=effective_model,
+                )
+                finalizer = asyncio.create_task(self._announce_result(
+                    task_id,
+                    display_label,
+                    task,
+                    cancelled_result,
+                    origin,
+                    "error",
+                    origin_message_id,
+                    stop_reason="cancelled",
+                ))
+                self._finalizer_tasks.add(finalizer)
+                finalizer.add_done_callback(self._finalizer_tasks.discard)
             self._running_tasks.pop(task_id, None)
-            self._task_statuses.pop(task_id, None)
+            terminal_status = self._task_statuses.pop(task_id, None)
+            if terminal_status is not None:
+                self._terminal_statuses[task_id] = terminal_status
+                while len(self._terminal_statuses) > 100:
+                    self._terminal_statuses.pop(next(iter(self._terminal_statuses)))
             if session_key and (ids := self._session_tasks.get(session_key)):
                 ids.discard(task_id)
                 if not ids:
@@ -227,7 +311,70 @@ class SubagentManager:
         bg_task.add_done_callback(_cleanup)
 
         logger.info("Spawned subagent [{}]: {}", task_id, display_label)
-        return f"Subagent [{display_label}] started (id: {task_id}). I'll notify you when it completes."
+        state = "queued" if queued else "started"
+        return (
+            f"Subagent [{display_label}] {state} (id: {task_id}). "
+            "I'll notify you when it completes."
+        )
+
+    async def _run_scheduled_subagent(
+        self,
+        task_id: str,
+        task: str,
+        label: str,
+        origin: dict[str, str],
+        status: SubagentStatus,
+        origin_message_id: str | None = None,
+        temperature: float | None = None,
+        workspace_scope: WorkspaceScope | None = None,
+        **run_kwargs: Any,
+    ) -> None:
+        try:
+            async with self._execution_slots:
+                status.holds_capacity = True
+                try:
+                    await self._run_subagent(
+                        task_id,
+                        task,
+                        label,
+                        origin,
+                        status,
+                        origin_message_id,
+                        temperature,
+                        workspace_scope,
+                        **run_kwargs,
+                    )
+                finally:
+                    status.holds_capacity = False
+        except asyncio.CancelledError:
+            if status.phase != "cancelled":
+                status.phase = "cancelled"
+                status.activity = "terminal"
+                status.stop_reason = "cancelled"
+                result = "Task was cancelled while queued."
+                await self._announce_result(
+                    task_id,
+                    label,
+                    task,
+                    result,
+                    origin,
+                    "error",
+                    origin_message_id,
+                    stop_reason="cancelled",
+                )
+                self._write_run_record(
+                    task_id,
+                    task,
+                    label,
+                    origin,
+                    temperature,
+                    workspace_scope,
+                    result,
+                    status,
+                    provider=run_kwargs.get("provider_override"),
+                    model=run_kwargs.get("model_override"),
+                )
+            raise
 
     def _resolve_preset_override(
         self, model_preset: str
@@ -257,15 +404,23 @@ class SubagentManager:
         workspace_scope: WorkspaceScope | None = None,
         provider_override: LLMProvider | None = None,
         model_override: str | None = None,
+        model_preset: str | None = None,
         context_window_tokens: int | None = None,
         max_iterations: int | None = None,
+        max_tool_result_chars: int | None = None,
     ) -> None:
         """Execute the subagent task and announce the result."""
+        status.phase = "running"
+        status.activity = "requesting_model"
         logger.info("Subagent [{}] starting task: {}", task_id, label)
 
         async def _on_checkpoint(payload: dict) -> None:
-            status.phase = payload.get("phase", status.phase)
+            status.activity = payload.get("phase", status.activity)
             status.iteration = payload.get("iteration", status.iteration)
+
+        async def _on_retry_wait(_message: str) -> None:
+            status.phase = "waiting"
+            status.activity = "provider_retry"
 
         record_result = ""  # set in every terminal branch; pre-bound for cancel safety
         # Pre-bound so the outer finally's _write_run_record can't UnboundLocalError
@@ -273,14 +428,37 @@ class SubagentManager:
         # raises before the inner try resolves them.
         run_provider = provider_override or self.run_provider or self.provider
         run_model = model_override or self.run_model or self.model
+        eff_max_iterations = max_iterations if max_iterations is not None else self.max_iterations
+        eff_max_tool_result_chars = (
+            max_tool_result_chars
+            if max_tool_result_chars is not None
+            else self.max_tool_result_chars
+        )
+        if not status.effective_budgets:
+            status.effective_budgets = {
+                "max_iterations": eff_max_iterations,
+                "context_window_tokens": context_window_tokens,
+                "max_tool_result_chars": eff_max_tool_result_chars,
+                "model": run_model,
+                "model_preset": model_preset,
+            }
         try:
             root = workspace_scope.project_path if workspace_scope is not None else self.workspace
             cfg = None
             if workspace_scope is not None:
                 cfg = self._subagent_tools_config()
                 cfg.restrict_to_workspace = workspace_scope.restrict_to_workspace
-            tools = self._build_tools(workspace=root, tools_config=cfg)
-            system_prompt = self._build_subagent_prompt(workspace=root)
+            tools = self._build_tools(
+                workspace=root,
+                tools_config=cfg,
+                policy_model=run_model,
+                policy_preset=model_preset,
+            )
+            system_prompt = self._build_subagent_prompt(
+                workspace=root,
+                task=task,
+                status=status,
+            )
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": task},
@@ -294,10 +472,10 @@ class SubagentManager:
             )
             token = bind_workspace_scope(workspace_scope) if workspace_scope is not None else None
             try:
-                eff_max_iterations = (
-                    max_iterations if max_iterations is not None else self.max_iterations
+                dedicated = (
+                    provider_override is not None
+                    and provider_override is not self.runner.provider
                 )
-                dedicated = provider_override is not None or self.run_provider is not None
                 runner = AgentRunner(run_provider) if dedicated else self.runner
                 result = await runner.run(AgentRunSpec(
                     initial_messages=messages,
@@ -305,14 +483,15 @@ class SubagentManager:
                     model=run_model,
                     temperature=temperature,
                     max_iterations=eff_max_iterations,
-                    max_tool_result_chars=self.max_tool_result_chars,
+                    max_tool_result_chars=eff_max_tool_result_chars,
                     context_window_tokens=context_window_tokens,
                     hook=_SubagentHook(task_id, status),
-                    max_iterations_message="Task completed but no final response was generated.",
-                    finalize_on_max_iterations=False,
+                    max_iterations_message="Task ended without a verified final synthesis.",
+                    finalize_on_max_iterations=True,
                     error_message=None,
-                    fail_on_tool_error=True,
+                    fail_on_tool_error=False,
                     checkpoint_callback=_on_checkpoint,
+                    retry_wait_callback=_on_retry_wait,
                     session_key=sess_key,
                     workspace=root,
                     llm_timeout_s=llm_timeout,
@@ -320,8 +499,9 @@ class SubagentManager:
             finally:
                 if token is not None:
                     reset_workspace_scope(token)
-            status.phase = "done"
             status.stop_reason = result.stop_reason
+            status.tool_events = list(result.tool_events)
+            status.activity = "terminal"
             # result.usage is the authoritative token count for the run; mirror
             # it onto status so _write_run_record captures it even when the
             # after_iteration hook never fired (e.g. single-pass completion).
@@ -329,31 +509,72 @@ class SubagentManager:
                 status.usage = dict(result.usage)
 
             if result.stop_reason == "tool_error":
-                status.tool_events = list(result.tool_events)
+                status.phase = "failed"
                 record_result = self._format_partial_progress(result)
                 await self._announce_result(
                     task_id, label, task,
                     record_result,
                     origin, "error", origin_message_id,
+                    stop_reason=result.stop_reason,
                 )
-            elif result.stop_reason == "error":
+            elif result.stop_reason in {"error", "provider_error"}:
+                status.phase = "failed"
                 record_result = result.error or "Error: subagent execution failed."
                 await self._announce_result(
                     task_id, label, task,
                     record_result,
                     origin, "error", origin_message_id,
+                    stop_reason=result.stop_reason,
+                )
+            elif result.stop_reason in {
+                "partial_completion",
+                "policy_block",
+                "max_iterations",
+                "empty_final_response",
+            }:
+                status.phase = "incomplete"
+                record_result = result.final_content or "Task ended without verified completion."
+                logger.info(
+                    "Subagent [{}] ended with {}",
+                    task_id,
+                    result.stop_reason,
+                )
+                await self._announce_result(
+                    task_id, label, task,
+                    record_result,
+                    origin, "error", origin_message_id,
+                    stop_reason=result.stop_reason,
                 )
             else:
+                status.phase = "completed"
                 record_result = result.final_content or "Task completed but no final response was generated."
                 logger.info("Subagent [{}] completed successfully", task_id)
-                await self._announce_result(task_id, label, task, record_result, origin, "ok", origin_message_id)
+                await self._announce_result(
+                    task_id, label, task, record_result, origin, "ok", origin_message_id,
+                    stop_reason=result.stop_reason,
+                )
 
+        except asyncio.CancelledError:
+            status.phase = "cancelled"
+            status.activity = "terminal"
+            status.stop_reason = "cancelled"
+            record_result = "Task was cancelled before completion."
+            await self._announce_result(
+                task_id, label, task, record_result, origin, "error", origin_message_id,
+                stop_reason="cancelled",
+            )
+            raise
         except Exception as e:
-            status.phase = "error"
+            status.phase = "failed"
+            status.activity = "terminal"
+            status.stop_reason = "error"
             status.error = str(e)
             record_result = f"Error: {e}"
             logger.exception("Subagent [{}] failed", task_id)
-            await self._announce_result(task_id, label, task, record_result, origin, "error", origin_message_id)
+            await self._announce_result(
+                task_id, label, task, record_result, origin, "error", origin_message_id,
+                stop_reason="error",
+            )
         finally:
             # One record per run, all outcomes (success/tool_error/error/exception).
             # Same writer + schema as cron run records; the kind field distinguishes.
@@ -373,6 +594,7 @@ class SubagentManager:
         origin: dict[str, str],
         status: str,
         origin_message_id: str | None = None,
+        stop_reason: str | None = None,
     ) -> None:
         """Announce the subagent result to the main agent via the message bus."""
         status_text = "completed successfully" if status == "ok" else "failed"
@@ -394,6 +616,13 @@ class SubagentManager:
         metadata: dict[str, Any] = {
             "injected_event": "subagent_result",
             "subagent_task_id": task_id,
+            "delivery_policy": "parent",
+            "subagent_result": {
+                "task_id": task_id,
+                "status": status,
+                "stop_reason": stop_reason,
+                "result": result,
+            },
         }
         if origin_message_id:
             metadata["origin_message_id"] = origin_message_id
@@ -411,8 +640,15 @@ class SubagentManager:
 
     @staticmethod
     def _format_partial_progress(result) -> str:
-        completed = [e for e in result.tool_events if e["status"] == "ok"]
-        failure = next((e for e in reversed(result.tool_events) if e["status"] == "error"), None)
+        completed = [e for e in result.tool_events if e["status"] in {"success", "ok"}]
+        failure = next(
+            (
+                e
+                for e in reversed(result.tool_events)
+                if e["status"] not in {"success", "ok"}
+            ),
+            None,
+        )
         lines: list[str] = []
         if completed:
             lines.append("Completed steps:")
@@ -430,7 +666,13 @@ class SubagentManager:
             lines.append(f"- {result.error}")
         return "\n".join(lines) or (result.error or "Error: subagent execution failed.")
 
-    def _build_subagent_prompt(self, workspace: Path | None = None) -> str:
+    def _build_subagent_prompt(
+        self,
+        workspace: Path | None = None,
+        *,
+        task: str = "",
+        status: SubagentStatus | None = None,
+    ) -> str:
         """Build a focused system prompt for the subagent."""
         from nanobot.agent.context import ContextBuilder
         from nanobot.agent.skills import SkillsLoader
@@ -441,12 +683,35 @@ class SubagentManager:
             root,
             disabled_skills=self.disabled_skills,
         ).build_skills_summary()
-        return render_template(
+        prompt = render_template(
             "agent/subagent_system.md",
             time_ctx=time_ctx,
             workspace=str(root),
             skills_summary=skills_summary or "",
         )
+        if (
+            self.context_retrieval is not None
+            and getattr(self.context_retrieval, "mode", "all_pinned") == "manifest"
+        ):
+            builder = ContextBuilder(
+                root,
+                disabled_skills=list(self.disabled_skills),
+                context_retrieval=self.context_retrieval,
+            )
+            retrieved = builder.build_system_prompt(
+                include_memory_recent_history=False,
+                retrieval_query=task,
+            )
+            if status is not None:
+                status.context_report = dict(builder.last_context_report)
+            prompt = f"{prompt}\n\n---\n\n{retrieved}"
+        elif status is not None:
+            status.context_report = {
+                "mode": "all_pinned",
+                "sources": [],
+                "totals": {},
+            }
+        return prompt
 
     async def cancel_by_session(self, session_key: str) -> int:
         """Cancel all subagents for the given session. Returns count cancelled."""
@@ -456,11 +721,22 @@ class SubagentManager:
             t.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.sleep(0)
+            if self._finalizer_tasks:
+                await asyncio.gather(*list(self._finalizer_tasks), return_exceptions=True)
         return len(tasks)
 
     def get_running_count(self) -> int:
-        """Return the number of currently running subagents."""
-        return len(self._running_tasks)
+        """Return active delegated tasks, including queued work."""
+        return sum(not task.done() for task in self._running_tasks.values())
+
+    def get_executing_count(self) -> int:
+        """Return tasks that currently hold execution capacity."""
+        return sum(status.holds_capacity for status in self._task_statuses.values())
+
+    def get_queued_count(self) -> int:
+        """Return delegated tasks waiting for execution capacity."""
+        return sum(status.phase == "queued" for status in self._task_statuses.values())
 
     def get_running_count_by_session(self, session_key: str) -> int:
         """Return the number of currently running subagents for a session."""
@@ -469,6 +745,10 @@ class SubagentManager:
             1 for tid in tids
             if tid in self._running_tasks and not self._running_tasks[tid].done()
         )
+
+    def runtime_statuses(self) -> dict[str, SubagentStatus]:
+        """Return a detached task-status mapping for read-only inspection."""
+        return {**self._terminal_statuses, **self._task_statuses}
 
     def _provider_name(self, provider: LLMProvider | None = None) -> str:
         provider = provider or self.provider
@@ -505,16 +785,18 @@ class SubagentManager:
             "workspace": str(workspace_scope.project_path) if workspace_scope else str(self.workspace),
             "params": {
                 "temperature": temperature,
-                "max_iterations": self.max_iterations,
+                **status.effective_budgets,
                 "restrict_to_workspace": bool(
                     workspace_scope.restrict_to_workspace if workspace_scope else self.restrict_to_workspace
                 ),
             },
             "model": model or self.model,
+            "model_preset": status.effective_budgets.get("model_preset"),
             "provider": self._provider_name(provider),
             "iterations": int(status.iteration),
             "stop_reason": status.stop_reason,
             "phase": status.phase,
+            "activity": status.activity,
             "error": status.error,
             "usage": build_usage_block(
                 status.usage,
@@ -522,6 +804,7 @@ class SubagentManager:
                 model=model or self.model,
             ),
             "tool_events": list(status.tool_events),
+            "context": dict(status.context_report),
             "result": result_text,
         }
         try:

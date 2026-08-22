@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from nanobot.agent.tools.base import Tool
+from nanobot.agent.tools.base import Tool, ToolResult
 from nanobot.agent.tools.filesystem import ReadFileTool
+from nanobot.agent.tools.policy import ToolPolicy
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.config.schema import ToolPolicyRuleConfig
 
 
 class _FakeTool(Tool):
@@ -255,6 +257,41 @@ async def test_registry_rejects_unknown_builtin_tool_parameters(tmp_path) -> Non
     assert "Invalid parameters" in result
     assert "unexpected parameter line_limit" in result
     assert "one" not in result
+
+
+async def test_registry_execute_enforces_policy_before_tool_execution() -> None:
+    tool = _FakeTool("write_file")
+    registry = ToolRegistry(policy=ToolPolicy([
+        ToolPolicyRuleConfig(id="deny-write", outcome="deny", tool="write_file"),
+    ]))
+    registry.register(tool)
+
+    result = await registry.execute("write_file", {})
+
+    assert isinstance(result, ToolResult)
+    assert result.status == "policy_block"
+    assert result.data["rule_id"] == "deny-write"
+
+
+async def test_registry_execute_preserves_structured_failure_metadata() -> None:
+    class StructuredTool(_FakeTool):
+        async def execute(self, **kwargs: Any) -> Any:
+            return ToolResult.retryable_error(
+                "Error: unavailable",
+                exit_code=75,
+                evidence=[{"kind": "attempt", "count": 1}],
+            )
+
+    registry = ToolRegistry()
+    registry.register(StructuredTool("probe"))
+
+    result = await registry.execute("probe", {})
+
+    assert isinstance(result, ToolResult)
+    assert result.status == "retryable_error"
+    assert result.exit_code == 75
+    assert result.evidence == [{"kind": "attempt", "count": 1}]
+    assert "Analyze the error" in result
 
 
 def test_get_definitions_returns_cached_result() -> None:

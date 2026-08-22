@@ -3,7 +3,8 @@
 import json
 from typing import Any
 
-from nanobot.agent.tools.base import Tool
+from nanobot.agent.tools.base import Tool, ToolResult, adapt_legacy_tool_result
+from nanobot.agent.tools.policy import PolicyDecision, ToolPolicy
 
 
 class ToolRegistry:
@@ -13,9 +14,10 @@ class ToolRegistry:
     Allows dynamic registration and execution of tools.
     """
 
-    def __init__(self):
+    def __init__(self, policy: ToolPolicy | None = None):
         self._tools: dict[str, Tool] = {}
         self._cached_definitions: list[dict[str, Any]] | None = None
+        self.policy = policy or ToolPolicy()
 
     def register(self, tool: Tool) -> None:
         """Register a tool."""
@@ -159,16 +161,61 @@ class ToolRegistry:
         hint = "\n\n[Analyze the error above and try a different approach.]"
         tool, params, error = self.prepare_call(name, params)
         if error:
-            return error + hint
+            return ToolResult.retryable_error(error + hint)
+
+        assert tool is not None  # guarded by prepare_call()
+        decision = self.evaluate_policy(tool, params)
+        if decision.outcome != "allow":
+            action = "requires explicit approval" if decision.outcome == "ask" else "was denied"
+            reason = f": {decision.reason}" if decision.reason else ""
+            message = (
+                f"Policy {action} for tool '{name}' "
+                f"(rule: {decision.rule_id or 'unnamed'}){reason}"
+            )
+            return ToolResult.policy_block(
+                message,
+                data={
+                    "decision": decision.outcome,
+                    "rule_id": decision.rule_id,
+                    "resource": decision.resource,
+                },
+                evidence=[{
+                    "kind": "tool_policy",
+                    "decision": decision.outcome,
+                    "rule_id": decision.rule_id,
+                }],
+            )
 
         try:
-            assert tool is not None  # guarded by prepare_call()
-            result = await tool.execute(**params)
-            if isinstance(result, str) and result.startswith("Error"):
-                return result + hint
-            return result
+            outcome = adapt_legacy_tool_result(await tool.execute(**params))
+            if outcome.retryable and str(outcome).startswith("Error"):
+                return self._replace_content(outcome, str(outcome) + hint)
+            return outcome
         except Exception as e:
-            return f"Error executing {name}: {str(e)}" + hint
+            return ToolResult.retryable_error(f"Error executing {name}: {str(e)}" + hint)
+
+    @staticmethod
+    def _replace_content(outcome: ToolResult, content: str) -> ToolResult:
+        return ToolResult(
+            content,
+            status=outcome.status,
+            data=outcome.data,
+            evidence=outcome.evidence,
+            side_effects=outcome.side_effects,
+            postcondition=outcome.postcondition,
+            retryable=outcome.retryable,
+            exit_code=outcome.exit_code,
+            stdout=outcome.stdout,
+            stderr=outcome.stderr,
+        )
+
+    def evaluate_policy(
+        self,
+        tool: Tool,
+        params: dict[str, Any],
+    ) -> PolicyDecision:
+        """Evaluate configured policy after validation and before execution."""
+        return self.policy.evaluate(tool.name, params, read_only=tool.read_only)
 
     @property
     def tool_names(self) -> list[str]:

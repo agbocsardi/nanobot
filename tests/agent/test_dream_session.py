@@ -66,3 +66,17 @@ class TestPruneDreamSessions:
         sessions_dir.mkdir()
         MemoryStore.prune_dream_sessions(sessions_dir, keep=10)
         assert list(sessions_dir.iterdir()) == []
+
+    def test_malformed_metadata_falls_back_to_filename_timestamp(self, tmp_path):
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        for timestamp in ("100000", "100001", "100002"):
+            (sessions_dir / f"dream_20260528-{timestamp}.jsonl").write_text(
+                "not-json\n",
+                encoding="utf-8",
+            )
+
+        MemoryStore.prune_dream_sessions(sessions_dir, keep=2)
+
+        remaining = sorted(path.stem for path in sessions_dir.iterdir())
+        assert remaining == ["dream_20260528-100001", "dream_20260528-100002"]

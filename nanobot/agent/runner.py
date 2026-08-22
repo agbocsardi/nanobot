@@ -14,6 +14,7 @@ from typing import Any, Callable
 from loguru import logger
 
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
+from nanobot.agent.tools.base import ToolResult, adapt_legacy_tool_result
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.utils.file_edit_events import (
@@ -75,6 +76,10 @@ _COMPACTABLE_TOOLS = frozenset({
 # read_file is the recovery path for persisted results; exempting it prevents persist->read->persist loops.
 _TOOL_RESULT_OFFLOAD_EXEMPT_TOOLS = frozenset({"read_file"})
 _BACKFILL_CONTENT = "[Tool result unavailable — call was interrupted or lost]"
+_PARTIAL_COMPLETION_PREFIX = (
+    "Incomplete: one or more tool operations failed or could not be verified."
+)
+_POLICY_BLOCK_PREFIX = "Incomplete: one or more required operations were blocked by policy."
 
 # Backward-compatible module attribute for tests/extensions that monkeypatch
 # the former single-file tracker hook. Runtime uses prepare_file_edit_trackers.
@@ -125,7 +130,7 @@ class AgentRunResult:
     usage: dict[str, int] = field(default_factory=dict)
     stop_reason: str = "completed"
     error: str | None = None
-    tool_events: list[dict[str, str]] = field(default_factory=list)
+    tool_events: list[dict[str, Any]] = field(default_factory=list)
     had_injections: bool = False
 
 
@@ -348,7 +353,7 @@ class AgentRunner:
         usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0}
         error: str | None = None
         stop_reason = "completed"
-        tool_events: list[dict[str, str]] = []
+        tool_events: list[dict[str, Any]] = []
         external_lookup_counts: dict[str, int] = {}
         # Per-turn throttle for repeated attempts against the same outside target.
         workspace_violation_counts: dict[str, int] = {}
@@ -442,7 +447,7 @@ class AgentRunner:
                 tools_used.extend(
                     tool_call.name
                     for tool_call, event in zip(response.tool_calls, new_events)
-                    if event.get("status") == "ok"
+                    if event.get("status") == "success"
                 )
                 context.tool_results = list(results)
                 context.tool_events = list(new_events)
@@ -594,7 +599,7 @@ class AgentRunner:
                     final_content = _ARREARAGE_ERROR_MESSAGE
                 else:
                     final_content = clean or spec.error_message or _DEFAULT_ERROR_MESSAGE
-                stop_reason = "error"
+                stop_reason = "provider_error"
                 error = final_content
                 self._append_model_error_placeholder(messages)
                 context.final_content = final_content
@@ -627,6 +632,15 @@ class AgentRunner:
                     continue
                 break
 
+            terminal_tool_reason = self._terminal_tool_stop_reason(tool_events)
+            if terminal_tool_reason is not None:
+                stop_reason = terminal_tool_reason
+                clean = self._suppress_false_success(clean, stop_reason)
+                assistant_message = build_assistant_message(
+                    clean,
+                    reasoning_content=response.reasoning_content,
+                    thinking_blocks=response.thinking_blocks,
+                )
             messages.append(assistant_message or build_assistant_message(
                 clean,
                 reasoning_content=response.reasoning_content,
@@ -683,6 +697,32 @@ class AgentRunner:
             tool_events=tool_events,
             had_injections=had_injections,
         )
+
+    @staticmethod
+    def _terminal_tool_stop_reason(tool_events: list[dict[str, Any]]) -> str | None:
+        latest_by_tool: dict[str, str] = {}
+        for event in tool_events:
+            name = str(event.get("name") or "")
+            status = str(event.get("status") or "")
+            if name and status:
+                latest_by_tool[name] = status
+        statuses = set(latest_by_tool.values())
+        if "policy_block" in statuses:
+            return "policy_block"
+        if "partial" in statuses:
+            return "partial_completion"
+        if "retryable_error" in statuses:
+            return "partial_completion"
+        return None
+
+    @staticmethod
+    def _suppress_false_success(content: str, stop_reason: str) -> str:
+        prefix = (
+            _POLICY_BLOCK_PREFIX
+            if stop_reason == "policy_block"
+            else _PARTIAL_COMPLETION_PREFIX
+        )
+        return f"{prefix}\n\n{content}" if content else prefix
 
     def _build_request_kwargs(
         self,
@@ -1032,9 +1072,9 @@ class AgentRunner:
         tool_calls: list[ToolCallRequest],
         external_lookup_counts: dict[str, int],
         workspace_violation_counts: dict[str, int],
-    ) -> tuple[list[Any], list[dict[str, str]], BaseException | None]:
+    ) -> tuple[list[Any], list[dict[str, Any]], BaseException | None]:
         batches = self._partition_tool_batches(spec, tool_calls)
-        tool_results: list[tuple[Any, dict[str, str], BaseException | None]] = []
+        tool_results: list[tuple[Any, dict[str, Any], BaseException | None]] = []
         for batch in batches:
             if spec.concurrent_tools and len(batch) > 1:
                 batch_results = await asyncio.gather(*(
@@ -1054,7 +1094,7 @@ class AgentRunner:
                     batch_results.append(result)
 
         results: list[Any] = []
-        events: list[dict[str, str]] = []
+        events: list[dict[str, Any]] = []
         fatal_error: BaseException | None = None
         for result, event, error in tool_results:
             results.append(result)
@@ -1069,7 +1109,7 @@ class AgentRunner:
         tool_call: ToolCallRequest,
         external_lookup_counts: dict[str, int],
         workspace_violation_counts: dict[str, int],
-    ) -> tuple[Any, dict[str, str], BaseException | None]:
+    ) -> tuple[Any, dict[str, Any], BaseException | None]:
         hint = "\n\n[Analyze the error above and try a different approach.]"
         lookup_error = repeated_external_lookup_error(
             tool_call.name,
@@ -1077,11 +1117,15 @@ class AgentRunner:
             external_lookup_counts,
         )
         if lookup_error:
-            event = {
-                "name": tool_call.name,
-                "status": "error",
-                "detail": "repeated external lookup blocked",
-            }
+            outcome = ToolResult.policy_block(
+                lookup_error,
+                evidence=[{"kind": "policy", "rule": "repeated_external_lookup"}],
+            )
+            event = self._tool_event(
+                tool_call.name,
+                outcome,
+                detail="repeated external lookup blocked",
+            )
             if spec.fail_on_tool_error:
                 return lookup_error + hint, event, RuntimeError(lookup_error)
             return lookup_error + hint, event, None
@@ -1093,11 +1137,13 @@ class AgentRunner:
                 if isinstance(prepared, tuple) and len(prepared) == 3:
                     tool, params, prep_error = prepared
         if prep_error:
-            event = {
-                "name": tool_call.name,
-                "status": "error",
-                "detail": prep_error.split(": ", 1)[-1][:120],
-            }
+            outcome = ToolResult.retryable_error(prep_error)
+            event = self._tool_event(
+                tool_call.name,
+                outcome,
+                detail=prep_error.split(": ", 1)[-1][:120],
+                execution_succeeded=False,
+            )
             handled = self._classify_violation(
                 raw_text=prep_error,
                 soft_payload=prep_error + hint,
@@ -1110,6 +1156,34 @@ class AgentRunner:
             return prep_error + hint, event, (
                 RuntimeError(prep_error) if spec.fail_on_tool_error else None
             )
+        evaluate_policy = getattr(spec.tools, "evaluate_policy", None)
+        if tool is not None and callable(evaluate_policy):
+            decision = evaluate_policy(tool, params)
+            if decision.outcome != "allow":
+                action = "requires explicit approval" if decision.outcome == "ask" else "was denied"
+                reason = f": {decision.reason}" if decision.reason else ""
+                message = (
+                    f"Policy {action} for tool '{tool_call.name}'"
+                    f" (rule: {decision.rule_id or 'unnamed'}){reason}"
+                )
+                outcome = ToolResult.policy_block(
+                    message,
+                    data={
+                        "decision": decision.outcome,
+                        "rule_id": decision.rule_id,
+                        "resource": decision.resource,
+                    },
+                    evidence=[{
+                        "kind": "tool_policy",
+                        "decision": decision.outcome,
+                        "rule_id": decision.rule_id,
+                    }],
+                )
+                return str(outcome), self._tool_event(
+                    tool_call.name,
+                    outcome,
+                    execution_succeeded=False,
+                ), None
         emit_file_edit_events = (
             spec.progress_callback is not None
             and on_progress_accepts_file_edit_events(spec.progress_callback)
@@ -1150,12 +1224,17 @@ class AgentRunner:
                         for file_edit_tracker in file_edit_trackers
                     ],
                 )
-            event = {
-                "name": tool_call.name,
-                "status": "error",
-                "detail": str(exc),
-            }
             payload = f"Error: {type(exc).__name__}: {exc}"
+            outcome = ToolResult(
+                payload,
+                status="fatal_error" if spec.fail_on_tool_error else "retryable_error",
+            )
+            event = self._tool_event(
+                tool_call.name,
+                outcome,
+                detail=str(exc),
+                execution_succeeded=False,
+            )
             handled = self._classify_violation(
                 raw_text=str(exc),
                 # Preserve legacy exception payloads without the retry hint.
@@ -1170,32 +1249,31 @@ class AgentRunner:
                 return payload, event, exc
             return payload, event, None
 
-        if isinstance(result, str) and result.startswith("Error"):
+        outcome = adapt_legacy_tool_result(result)
+        if outcome.status != "success":
             if file_edit_trackers and progress_callback is not None:
                 await invoke_file_edit_progress(
                     progress_callback,
                     [
-                        build_file_edit_error_event(file_edit_tracker, result)
+                        build_file_edit_error_event(file_edit_tracker, str(outcome))
                         for file_edit_tracker in file_edit_trackers
                     ],
                 )
-            event = {
-                "name": tool_call.name,
-                "status": "error",
-                "detail": result.replace("\n", " ").strip()[:120],
-            }
+            event = self._tool_event(tool_call.name, outcome)
             handled = self._classify_violation(
-                raw_text=result,
-                soft_payload=result + hint,
+                raw_text=str(outcome),
+                soft_payload=str(outcome) + hint,
                 event=event,
                 tool_call=tool_call,
                 workspace_violation_counts=workspace_violation_counts,
             )
             if handled is not None:
                 return handled
-            if spec.fail_on_tool_error:
-                return result + hint, event, RuntimeError(result)
-            return result + hint, event, None
+            payload = str(outcome)
+            if outcome.retryable:
+                payload += hint
+            fatal = outcome.status == "fatal_error" or spec.fail_on_tool_error
+            return payload, event, RuntimeError(str(outcome)) if fatal else None
 
         if file_edit_trackers and progress_callback is not None:
             await invoke_file_edit_progress(
@@ -1206,13 +1284,46 @@ class AgentRunner:
                 ) for file_edit_tracker in file_edit_trackers],
             )
 
-        detail = "" if result is None else str(result)
-        detail = detail.replace("\n", " ").strip()
-        if not detail:
-            detail = "(empty)"
-        elif len(detail) > 120:
-            detail = detail[:120] + "..."
-        return result, {"name": tool_call.name, "status": "ok", "detail": detail}, None
+        payload = str(outcome) if isinstance(result, ToolResult) else result
+        return payload, self._tool_event(tool_call.name, outcome), None
+
+    @staticmethod
+    def _tool_event(
+        name: str,
+        outcome: ToolResult,
+        *,
+        detail: str | None = None,
+        execution_succeeded: bool = True,
+    ) -> dict[str, Any]:
+        rendered = detail if detail is not None else str(outcome)
+        rendered = rendered.replace("\n", " ").strip()
+        if not rendered:
+            rendered = "(empty)"
+        elif len(rendered) > 120:
+            rendered = rendered[:120] + "..."
+        event: dict[str, Any] = {
+            "name": name,
+            "status": outcome.status,
+            "detail": rendered,
+            "execution_succeeded": execution_succeeded,
+            "operational_success": outcome.operational_success,
+            "verified": outcome.verified,
+            "retryable": outcome.retryable,
+            "postcondition": outcome.postcondition,
+        }
+        if outcome.data is not None:
+            event["data"] = outcome.data
+        if outcome.evidence:
+            event["evidence"] = outcome.evidence
+        if outcome.side_effects:
+            event["side_effects"] = outcome.side_effects
+        if outcome.exit_code is not None:
+            event["exit_code"] = outcome.exit_code
+        if outcome.stdout is not None:
+            event["stdout"] = outcome.stdout
+        if outcome.stderr is not None:
+            event["stderr"] = outcome.stderr
+        return event
 
     # SSRF is a hard security block at the tool boundary, but the agent turn
     # should recover conversationally instead of aborting the runtime.
@@ -1262,10 +1373,10 @@ class AgentRunner:
         *,
         raw_text: str,
         soft_payload: str,
-        event: dict[str, str],
+        event: dict[str, Any],
         tool_call: ToolCallRequest,
         workspace_violation_counts: dict[str, int],
-    ) -> tuple[Any, dict[str, str], BaseException | None] | None:
+    ) -> tuple[Any, dict[str, Any], BaseException | None] | None:
         """Classify safety-boundary failures, or return ``None`` to pass through."""
         if self._is_ssrf_violation(raw_text):
             logger.warning(
@@ -1274,6 +1385,7 @@ class AgentRunner:
                 raw_text.replace("\n", " ").strip()[:200],
             )
             event["detail"] = self._event_detail("ssrf_violation: ", raw_text)
+            event.update({"status": "policy_block", "retryable": False})
             return self._ssrf_soft_payload(raw_text), event, None
 
         if self._is_workspace_violation(raw_text):
@@ -1283,6 +1395,7 @@ class AgentRunner:
                 workspace_violation_counts,
             )
             event["detail"] = self._event_detail("workspace_violation: ", raw_text)
+            event.update({"status": "policy_block", "retryable": False})
             if escalation is not None:
                 logger.warning(
                     "Tool {} hit workspace boundary repeatedly; escalating hint",

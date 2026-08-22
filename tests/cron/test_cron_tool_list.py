@@ -1,9 +1,11 @@
 """Tests for CronTool._list_jobs() output formatting."""
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 
+from nanobot.agent.tools.base import ToolResult
 from nanobot.agent.tools.context import RequestContext
 from nanobot.agent.tools.cron import CronTool
 from nanobot.cron.service import CronService
@@ -138,6 +140,25 @@ def test_format_state_unknown_status(tmp_path) -> None:
 def test_list_empty(tmp_path) -> None:
     tool = _make_tool(tmp_path)
     assert tool._list_jobs() == "No scheduled jobs."
+
+
+def test_list_preserves_valid_jobs_when_one_job_is_malformed(tmp_path) -> None:
+    tool = _make_tool(tmp_path)
+    good = CronJob(
+        id="good",
+        name="Good job",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+    )
+    malformed = SimpleNamespace(id="bad", name="Bad job")
+    tool._cron.list_jobs = lambda: [good, malformed]
+
+    result = tool._list_jobs()
+
+    assert isinstance(result, ToolResult)
+    assert result.status == "partial"
+    assert "Good job" in result
+    assert "unavailable job (id: bad)" in result
+    assert result.data["errors"][0]["job_id"] == "bad"
 
 
 def test_list_cron_job_shows_expression_and_timezone(tmp_path) -> None:
@@ -310,6 +331,10 @@ def test_add_cron_job_defaults_to_tool_timezone(tmp_path) -> None:
     result = tool._add_job(None, "Morning standup", None, "0 8 * * *", None, None)
 
     assert result.startswith("Created job")
+    assert isinstance(result, ToolResult)
+    assert result.status == "success"
+    assert result.postcondition == "checked"
+    assert result.verified is True
     job = tool._cron.list_jobs()[0]
     assert job.schedule.tz == "Asia/Shanghai"
 

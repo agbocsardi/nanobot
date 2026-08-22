@@ -28,6 +28,7 @@ from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.context import RequestContext, bind_request_context, reset_request_context
 from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, reset_file_states
 from nanobot.agent.tools.message import MessageTool
+from nanobot.agent.tools.policy import ToolPolicy
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.self import MyTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
@@ -228,6 +229,9 @@ class AgentLoop:
         runtime_model_publisher: Callable[[str, str | None], None] | None = None,
         vision_handoff: Any = None,
         discord_runtime_handle: Any | None = None,
+        loaded_config_path: Path | None = None,
+        loaded_config_fingerprint: str | None = None,
+        context_retrieval: Any | None = None,
     ):
         from nanobot.config.schema import ToolsConfig
 
@@ -240,6 +244,8 @@ class AgentLoop:
         self.provider = provider
         self.vision_handoff = vision_handoff
         self._discord_runtime_handle = discord_runtime_handle
+        self._loaded_config_path = loaded_config_path
+        self._loaded_config_fingerprint = loaded_config_fingerprint
         self._provider_snapshot_loader = provider_snapshot_loader
         self._preset_snapshot_loader = preset_snapshot_loader
         self._runtime_model_publisher = runtime_model_publisher
@@ -286,9 +292,21 @@ class AgentLoop:
         self._last_usage: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
 
-        self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
+        self.context = ContextBuilder(
+            workspace,
+            timezone=timezone,
+            disabled_skills=disabled_skills,
+            context_retrieval=context_retrieval,
+        )
         self.sessions = session_manager or SessionManager(workspace)
-        self.tools = ToolRegistry()
+        self.tools = ToolRegistry(policy=ToolPolicy(
+            _tc.policies,
+            default_context=lambda: {
+                "mode": "foreground",
+                "model": self.model,
+                "preset": self.model_preset,
+            },
+        ))
         # One file-read/write tracker per logical session. The tool registry is
         # shared by this loop, so tools resolve the active state via contextvars.
         self._file_state_store = FileStateStore()
@@ -309,6 +327,7 @@ class AgentLoop:
             run_model=(subagent_run_snapshot.model if subagent_run_snapshot else None),
             preset_snapshot_loader=self._preset_snapshot_loader,
             presets=model_presets,
+            context_retrieval=context_retrieval,
         )
         self._unified_session = unified_session
         self._max_messages = max_messages if max_messages > 0 else 120
@@ -419,6 +438,16 @@ class AgentLoop:
         from nanobot.agent.vision_handoff import build_from_config
 
         vision_handoff = extra.pop("vision_handoff", None) or build_from_config(config)
+        from nanobot.agent.tools.runtime_inspector import fingerprint_file
+        from nanobot.config.loader import get_config_path
+
+        config_path = get_config_path()
+        loaded_config_path = extra.pop("loaded_config_path", config_path)
+        loaded_config_fingerprint = extra.pop(
+            "loaded_config_fingerprint",
+            fingerprint_file(loaded_config_path),
+        )
+        context_retrieval = extra.pop("context_retrieval", defaults.context_retrieval)
         return cls(
             bus=bus,
             provider=provider,
@@ -437,6 +466,9 @@ class AgentLoop:
             timezone=defaults.timezone,
             unified_session=defaults.unified_session,
             disabled_skills=defaults.disabled_skills,
+            loaded_config_path=loaded_config_path,
+            loaded_config_fingerprint=loaded_config_fingerprint,
+            context_retrieval=context_retrieval,
             session_ttl_minutes=defaults.session_ttl_minutes,
             consolidation_ratio=defaults.consolidation_ratio,
             max_messages=defaults.max_messages,
@@ -994,7 +1026,7 @@ class AgentLoop:
             if on_stream and on_stream_end and should_stream:
                 await on_stream(result.final_content or "")
                 await on_stream_end(resuming=False)
-        elif result.stop_reason == "error":
+        elif result.stop_reason in {"error", "provider_error"}:
             logger.error("LLM returned error: {}", (result.final_content or "")[:200])
         return result.final_content, result.tools_used, result.messages, result.stop_reason, result.had_injections
 
@@ -1331,6 +1363,7 @@ class AgentLoop:
             unified_session=self._unified_session,
             input_token_budget=self._replay_token_budget(),
         )
+        context_report = dict(self.context.last_context_report)
         t_wall = time.time()
         final_content, _, all_msgs, stop_reason, _ = await self._run_agent_loop(
             messages, session=session, channel=channel, chat_id=chat_id,
@@ -1342,6 +1375,7 @@ class AgentLoop:
         wall_done = time.time()
         latency_ms = max(0, int((wall_done - t_wall) * 1000))
         self._save_turn(session, all_msgs, 1 + len(history), turn_latency_ms=latency_ms)
+        session.metadata["context_report"] = context_report
         self._runtime_events().record_turn_latency(key, latency_ms)
         session.enforce_file_cap(
             on_archive=partial(self.context.memory.raw_archive, session_key=key)
@@ -1355,7 +1389,7 @@ class AgentLoop:
             )
         )
         content = final_content or "Background task completed."
-        outbound_metadata: dict[str, Any] = {}
+        outbound_metadata: dict[str, Any] = {"_context_report": context_report}
         if channel == "slack" and key.startswith("slack:") and key.count(":") >= 2:
             outbound_metadata["slack"] = {"thread_ts": key.split(":", 2)[2]}
         if origin_message_id := msg.metadata.get("origin_message_id"):
@@ -1504,7 +1538,11 @@ class AgentLoop:
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         meta = dict(msg.metadata or {})
-        if on_stream is not None and stop_reason not in {"error", "tool_error"}:
+        if on_stream is not None and stop_reason not in {
+            "error",
+            "provider_error",
+            "tool_error",
+        }:
             meta["_streamed"] = True
         if turn_latency_ms is not None:
             meta["latency_ms"] = int(turn_latency_ms)

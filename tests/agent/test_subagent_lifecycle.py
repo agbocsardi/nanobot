@@ -15,6 +15,7 @@ from nanobot.agent.subagent import (
     _SubagentHook,
 )
 from nanobot.bus.queue import MessageBus
+from nanobot.config.schema import ToolPolicyRuleConfig, ToolsConfig
 from nanobot.providers.base import LLMProvider
 
 # ---------------------------------------------------------------------------
@@ -68,7 +69,8 @@ class TestSubagentStatus:
             task_id="abc", label="test", task_description="do stuff",
             started_at=time.monotonic(),
         )
-        assert s.phase == "initializing"
+        assert s.phase == "queued"
+        assert s.activity == "waiting_for_capacity"
         assert s.iteration == 0
         assert s.tool_events == []
         assert s.usage == {}
@@ -211,6 +213,80 @@ class TestSpawn:
         assert len(sm._task_statuses) == 0
         assert len(sm._session_tasks) == 0
 
+    @pytest.mark.asyncio
+    async def test_queued_run_uses_spawn_time_model_and_budgets(self, tmp_path):
+        sm = _manager(tmp_path, max_concurrent_subagents=1)
+        initial_max_iterations = sm.max_iterations
+        initial_max_tool_result_chars = sm.max_tool_result_chars
+        first_started = asyncio.Event()
+        release = asyncio.Event()
+        specs = []
+
+        async def capture(spec):
+            specs.append(spec)
+            if len(specs) == 1:
+                first_started.set()
+                await release.wait()
+            return AgentRunResult(final_content="done", messages=[], stop_reason="completed")
+
+        sm.runner.run = capture
+        await sm.spawn("first")
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+        await sm.spawn("queued")
+
+        sm.model = "changed-model"
+        sm.run_model = "changed-run-model"
+        sm.max_iterations = 99
+        sm.max_tool_result_chars = 99
+        release.set()
+        await _drain_subagent_tasks(sm)
+
+        assert [spec.model for spec in specs] == ["test-model", "test-model"]
+        assert [spec.max_iterations for spec in specs] == [
+            initial_max_iterations,
+            initial_max_iterations,
+        ]
+        assert [spec.max_tool_result_chars for spec in specs] == [
+            initial_max_tool_result_chars,
+            initial_max_tool_result_chars,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_terminal_status_remains_inspectable(self, tmp_path):
+        sm = _manager(tmp_path)
+        sm.runner.run = AsyncMock(return_value=AgentRunResult(
+            final_content="done", messages=[], stop_reason="completed",
+        ))
+
+        response = await sm.spawn("task")
+        task_id = response.split("id: ", 1)[1].split(")", 1)[0]
+        await _drain_subagent_tasks(sm)
+
+        status = sm.runtime_statuses()[task_id]
+        assert status.phase == "completed"
+        assert status.effective_budgets["model"] == "test-model"
+
+    @pytest.mark.asyncio
+    async def test_retry_wait_still_holds_execution_capacity(self, tmp_path):
+        sm = _manager(tmp_path, max_concurrent_subagents=1)
+        waiting = asyncio.Event()
+        release = asyncio.Event()
+
+        async def capture(spec):
+            await spec.retry_wait_callback("retrying")
+            waiting.set()
+            await release.wait()
+            return AgentRunResult(final_content="done", messages=[], stop_reason="completed")
+
+        sm.runner.run = capture
+        await sm.spawn("task")
+        await asyncio.wait_for(waiting.wait(), timeout=1)
+
+        assert next(iter(sm._task_statuses.values())).phase == "waiting"
+        assert sm.get_executing_count() == 1
+        release.set()
+        await _drain_subagent_tasks(sm)
+
 
 # ---------------------------------------------------------------------------
 # _run_subagent
@@ -218,6 +294,100 @@ class TestSpawn:
 
 
 class TestRunSubagent:
+    @pytest.mark.asyncio
+    async def test_run_reserves_finalization_and_allows_tool_recovery(self, tmp_path):
+        sm = _manager(tmp_path)
+        captured = []
+
+        async def capture(spec):
+            captured.append(spec)
+            return AgentRunResult(
+                final_content="done",
+                messages=[],
+                stop_reason="completed",
+            )
+
+        sm.runner.run = capture
+        with patch.object(sm, "_announce_result", new_callable=AsyncMock):
+            await sm._run_subagent(
+                "t1", "do task", "label",
+                {"channel": "cli", "chat_id": "direct"},
+                SubagentStatus(
+                    task_id="t1",
+                    label="label",
+                    task_description="do task",
+                    started_at=time.monotonic(),
+                ),
+            )
+
+        assert captured[0].fail_on_tool_error is False
+        assert captured[0].finalize_on_max_iterations is True
+
+    @pytest.mark.asyncio
+    async def test_provider_retry_wait_is_inspectable(self, tmp_path):
+        sm = _manager(tmp_path)
+        status = SubagentStatus(
+            task_id="t1",
+            label="label",
+            task_description="do task",
+            started_at=time.monotonic(),
+        )
+
+        async def capture(spec):
+            await spec.retry_wait_callback("retrying")
+            assert status.phase == "waiting"
+            assert status.activity == "provider_retry"
+            return AgentRunResult(
+                final_content="done",
+                messages=[],
+                stop_reason="completed",
+            )
+
+        sm.runner.run = capture
+        with patch.object(sm, "_announce_result", new_callable=AsyncMock):
+            await sm._run_subagent(
+                "t1", "do task", "label",
+                {"channel": "cli", "chat_id": "direct"}, status,
+            )
+
+        assert status.phase == "completed"
+
+    @pytest.mark.asyncio
+    async def test_model_preset_is_available_to_tool_policy(self, tmp_path):
+        tools_config = ToolsConfig(policies=[ToolPolicyRuleConfig(
+            id="deny-expensive-preset",
+            outcome="deny",
+            tool="write_file",
+            preset="expensive",
+        )])
+        sm = _manager(tmp_path, tools_config=tools_config)
+        decisions = []
+
+        async def capture(spec):
+            tool = spec.tools.get("write_file")
+            decisions.append(spec.tools.evaluate_policy(tool, {"path": "result.txt"}))
+            return AgentRunResult(final_content="done", messages=[], stop_reason="completed")
+
+        sm.runner.run = capture
+        with patch.object(sm, "_announce_result", new_callable=AsyncMock):
+            await sm._run_subagent(
+                "t1",
+                "do task",
+                "label",
+                {"channel": "cli", "chat_id": "direct"},
+                SubagentStatus(
+                    task_id="t1",
+                    label="label",
+                    task_description="do task",
+                    started_at=time.monotonic(),
+                ),
+                model_override="preset-model",
+                model_preset="expensive",
+            )
+
+        assert decisions[0].outcome == "deny"
+        assert decisions[0].rule_id == "deny-expensive-preset"
+
     @pytest.mark.asyncio
     async def test_successful_run(self, tmp_path):
         sm = _manager(tmp_path)
@@ -258,7 +428,7 @@ class TestRunSubagent:
                 "t1", "do task", "label",
                 {"channel": "cli", "chat_id": "direct"}, status,
             )
-            assert status.phase == "error"
+            assert status.phase == "failed"
             assert "LLM down" in status.error
             assert mock_announce.call_args.args[-2] == "error"
 
@@ -274,8 +444,37 @@ class TestRunSubagent:
                 "t1", "do task", "label",
                 {"channel": "cli", "chat_id": "direct"}, status,
             )
-            assert status.phase == "done"
+            assert status.phase == "completed"
             assert status.stop_reason == "completed"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stop_reason", ["max_iterations", "empty_final_response"])
+    async def test_missing_or_budget_exhausted_final_is_incomplete(
+        self,
+        tmp_path,
+        stop_reason,
+    ):
+        sm = _manager(tmp_path)
+        sm.runner.run = AsyncMock(return_value=AgentRunResult(
+            final_content="Task ended without a verified final synthesis.",
+            messages=[],
+            stop_reason=stop_reason,
+        ))
+        status = SubagentStatus(
+            task_id="t1",
+            label="label",
+            task_description="do task",
+            started_at=time.monotonic(),
+        )
+
+        with patch.object(sm, "_announce_result", new_callable=AsyncMock) as announce:
+            await sm._run_subagent(
+                "t1", "do task", "label",
+                {"channel": "cli", "chat_id": "direct"}, status,
+            )
+
+        assert status.phase == "incomplete"
+        assert announce.call_args.args[-2] == "error"
 
 
 # ---------------------------------------------------------------------------
@@ -301,6 +500,13 @@ class TestAnnounceResult:
         assert msg.sender_id == "subagent"
         assert msg.metadata["injected_event"] == "subagent_result"
         assert msg.metadata["subagent_task_id"] == "t1"
+        assert msg.metadata["delivery_policy"] == "parent"
+        assert msg.metadata["subagent_result"] == {
+            "task_id": "t1",
+            "status": "ok",
+            "stop_reason": None,
+            "result": "result text",
+        }
 
     @pytest.mark.asyncio
     async def test_session_key_override(self, tmp_path):
@@ -477,6 +683,35 @@ class TestCancelBySession:
 
         count = await sm.cancel_by_session("s1")
         assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_queued_and_running_cancellation_persist_terminal_state(self, tmp_path):
+        sm = _manager(
+            tmp_path,
+            max_concurrent_subagents=1,
+            max_queued_subagents=1,
+        )
+        release = asyncio.Event()
+
+        async def _slow_run(spec):
+            await release.wait()
+            return AgentRunResult(final_content="done", messages=[], stop_reason="completed")
+
+        sm.runner.run = _slow_run
+        sm._announce_result = AsyncMock()
+        with patch.object(sm, "_write_run_record") as write_record:
+            await sm.spawn("running", session_key="s1")
+            await sm.spawn("queued", session_key="s1")
+            await asyncio.sleep(0)
+
+            assert sm.get_executing_count() == 1
+            assert sm.get_queued_count() == 1
+            assert await sm.cancel_by_session("s1") == 2
+
+        recorded_statuses = [call.args[7] for call in write_record.call_args_list]
+        assert len(recorded_statuses) == 2
+        assert all(status.phase == "cancelled" for status in recorded_statuses)
+        assert all(status.stop_reason == "cancelled" for status in recorded_statuses)
 
 
 # ---------------------------------------------------------------------------
