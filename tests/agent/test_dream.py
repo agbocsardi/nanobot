@@ -114,6 +114,21 @@ class TestBuildDreamPrompt:
         assert "[correction]: replace the older conflicting fact" in prompt
         assert "Always strip these bracketed tags from saved memory content" in prompt
 
+    def test_dream_prompt_requires_prompt_gardening(self):
+        prompt = render_template(
+            "agent/dream.md",
+            strip=True,
+            skill_creator_path="skills/skill-creator/SKILL.md",
+        )
+
+        assert "## Prompt gardening" in prompt
+        assert "memory/system/corrections.md" in prompt
+        assert "memory/system/procedures.md" in prompt
+        assert "memory/system/now.md" in prompt
+        assert "Before deleting unique durable context" in prompt
+        assert "small constitutional core plus discoverable topic memory" in prompt
+        assert "prune it" in prompt
+
 
 class TestDreamTools:
     def test_dream_tools_are_restricted_to_file_edits(self, store):

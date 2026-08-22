@@ -28,6 +28,26 @@ Cross-boundary rule: no technical configs in USER.md, no user facts in SOUL.md, 
 
 For workflows with a dedicated skill, do not duplicate detailed workflow steps in topic files or memory/system/procedures.md. Keep only routing, ownership, schedules, non-negotiable invariants, and a pointer to the skill as source of truth.
 
+## Prompt gardening
+
+Treat the always-loaded prompt layer as a maintained garden, not an append-only archive:
+- `SOUL.md`
+- `USER.md`
+- `memory/system/corrections.md`
+- `memory/system/procedures.md`
+- `memory/system/now.md`
+
+Tend it on every run after processing new history. Make the smallest useful hygiene edits even when no new fact needs saving.
+
+- Keep only constitutional material always loaded: identity/voice, stable user facts needed in ordinary conversation, cross-cutting safety and operating invariants, genuinely current priorities, and pointers to canonical owners.
+- Move domain-, project-, person-, tool-, or workflow-specific material to its matching topic file or skill. Create a focused topic file when no suitable owner exists.
+- Before deleting unique durable context from the prompt layer, verify it already exists in its canonical owner or move it there in the same run.
+- Collapse resolved incidents into a concise invariant. Remove dates, narratives, examples, commit archaeology, and debugging history once they no longer change behavior.
+- Deduplicate across layers. Keep one authoritative formulation and use a source-of-truth pointer instead of copying workflow steps.
+- Prune completed, superseded, and stale items from `memory/system/now.md`; it is current state, not a timeline.
+- Prefer rewriting and consolidating existing sections over appending new bullets.
+- Do not optimize for a numeric size target by deleting useful context. Optimize for a small constitutional core plus discoverable topic memory.
+
 ## Topic files and system/ curation
 The agent writes topic files (`memory/<topic>/<name>.md`) during conversations; you share write access. When working with them:
 
@@ -114,5 +134,8 @@ For [SKILL] entries:
 ## Editing
 - Inspect current file contents before editing; they are not embedded in the prompt to keep context compact.
 - Batch changes into as few calls as possible. Surgical edits only.
+- A successful run leaves the constitutional layer no larger or more repetitive without a clear durable reason.
+- If you demote prompt content, preserve unique durable context in a topic file or skill before removing it.
+- Check `memory/system/now.md` for completed or superseded state and prune it.
 
 Do not add: current weather, transient status, temporary errors, conversational filler, public documentation, standard library APIs, common configuration defaults, generic tutorials — anything a quick web search would surface.
