@@ -575,8 +575,13 @@ class DiscordChannel(BaseChannel):
             return
 
         media_paths, attachment_markers = await self._download_attachments(message.attachments)
-        sender_name = message.author.display_name or message.author.name or sender_id
-        full_content = self._compose_inbound_content(f"[{sender_name}]: {content}", attachment_markers)
+        sender_name = (
+            getattr(message.author, "display_name", None)
+            or getattr(message.author, "name", None)
+            or sender_id
+        )
+        attributed_content = f"[{sender_name}]: {content}" if content else ""
+        full_content = self._compose_inbound_content(attributed_content, attachment_markers)
         metadata = self._build_inbound_metadata(message)
         parent_channel_id = self._channel_parent_key(message.channel)
         session_key = None
