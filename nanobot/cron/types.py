@@ -69,6 +69,8 @@ class CronRunRecord:
     status: Literal["ok", "error", "skipped"]
     duration_ms: int = 0
     error: str | None = None
+    delivery_status: str | None = None
+    delivery_error: str | None = None
 
 
 @dataclass
@@ -78,6 +80,8 @@ class CronJobState:
     last_run_at_ms: int | None = None
     last_status: Literal["ok", "error", "skipped"] | None = None
     last_error: str | None = None
+    last_delivery_status: str | None = None
+    last_delivery_error: str | None = None
     run_history: list[CronRunRecord] = field(default_factory=list)
 
 

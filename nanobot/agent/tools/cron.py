@@ -327,20 +327,42 @@ class CronTool(Tool, ContextAware):
             return "Dream memory consolidation for long-term memory."
         return "System-managed internal job."
 
-    def _list_jobs(self) -> str:
-        jobs = self._cron.list_jobs()
+    def _list_jobs(self) -> ToolResult:
+        try:
+            jobs = self._cron.list_jobs()
+        except Exception as exc:
+            return ToolResult.retryable_error(
+                f"Could not list scheduled jobs: {type(exc).__name__}: {exc}"
+            )
         if not jobs:
-            return "No scheduled jobs."
+            return ToolResult("No scheduled jobs.", data={"jobs": [], "errors": []})
         lines = []
+        listed_jobs = []
+        errors = []
         for j in jobs:
-            timing = self._format_timing(j.schedule)
-            parts = [f"- {j.name} (id: {j.id}, {timing})"]
-            if j.payload.kind == "system_event":
-                parts.append(f"  Purpose: {self._system_job_purpose(j)}")
-                parts.append("  Protected: visible for inspection, but cannot be removed.")
-            parts.extend(self._format_state(j.state, j.schedule))
-            lines.append("\n".join(parts))
-        return "Scheduled jobs:\n" + "\n".join(lines)
+            try:
+                timing = self._format_timing(j.schedule)
+                parts = [f"- {j.name} (id: {j.id}, {timing})"]
+                if j.payload.kind == "system_event":
+                    parts.append(f"  Purpose: {self._system_job_purpose(j)}")
+                    parts.append("  Protected: visible for inspection, but cannot be removed.")
+                parts.extend(self._format_state(j.state, j.schedule))
+                if j.state.last_delivery_status:
+                    delivery = f"  Last delivery: {j.state.last_delivery_status}"
+                    if j.state.last_delivery_error:
+                        delivery += f" ({j.state.last_delivery_error})"
+                    parts.append(delivery)
+                lines.append("\n".join(parts))
+                listed_jobs.append({"id": j.id, "name": j.name})
+            except Exception as exc:
+                job_id = str(getattr(j, "id", "unknown"))
+                message = f"{type(exc).__name__}: {exc}"
+                lines.append(f"- unavailable job (id: {job_id}): {message}")
+                errors.append({"job_id": job_id, "error": message})
+        content = "Scheduled jobs:\n" + "\n".join(lines)
+        if errors:
+            return ToolResult.partial(content, data={"jobs": listed_jobs, "errors": errors})
+        return ToolResult(content, data={"jobs": listed_jobs, "errors": []})
 
     def _remove_job(self, job_id: str | None) -> str:
         if not job_id:

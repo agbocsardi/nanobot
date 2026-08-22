@@ -127,8 +127,8 @@ class RuntimeInspector:
                 "stop_reason": self._primitive(getattr(status, "stop_reason", None)),
                 "error": self._primitive(getattr(status, "error", None)),
                 "effective_budgets": {
-                    "available": False,
-                    "reason": "per-run budgets are not recorded in runtime status",
+                    "available": bool(getattr(status, "effective_budgets", None)),
+                    **dict(getattr(status, "effective_budgets", None) or {}),
                 },
             })
         return {
@@ -145,6 +145,17 @@ class RuntimeInspector:
                     getattr(manager, "max_queued_subagents", None)
                 ),
             },
+            "execution_capacity": {
+                "available": manager is not None,
+                "in_use": (
+                    manager.get_executing_count()
+                    if manager is not None and hasattr(manager, "get_executing_count")
+                    else None
+                ),
+                "capacity": self._primitive(
+                    getattr(manager, "max_concurrent_subagents", None)
+                ),
+            },
             "manager_budgets": {
                 "max_iterations": self._primitive(getattr(manager, "max_iterations", None)),
                 "max_concurrent": self._primitive(
@@ -159,46 +170,64 @@ class RuntimeInspector:
     def _cron(self) -> dict[str, Any]:
         service = getattr(self.runtime, "cron_service", None)
         jobs: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
         if service is not None:
             try:
                 for job in service.list_jobs():
-                    state = getattr(job, "state", None)
-                    history = list(getattr(state, "run_history", None) or [])
-                    recent = history[-1] if history else None
-                    jobs.append({
-                        "id": self._primitive(getattr(job, "id", None)),
-                        "name": self._primitive(getattr(job, "name", None)),
-                        "enabled": self._primitive(getattr(job, "enabled", None)),
-                        "last_status": self._primitive(getattr(state, "last_status", None)),
-                        "last_error": self._primitive(getattr(state, "last_error", None)),
-                        "last_run_at_ms": self._primitive(
-                            getattr(state, "last_run_at_ms", None)
-                        ),
-                        "next_run_at_ms": self._primitive(
-                            getattr(state, "next_run_at_ms", None)
-                        ),
-                        "recent_terminal": (
-                            {
-                                "run_at_ms": self._primitive(
-                                    getattr(recent, "run_at_ms", None)
+                    try:
+                        state = getattr(job, "state", None)
+                        history = list(getattr(state, "run_history", None) or [])
+                        recent = history[-1] if history else None
+                        jobs.append({
+                            "id": self._primitive(getattr(job, "id", None)),
+                            "name": self._primitive(getattr(job, "name", None)),
+                            "enabled": self._primitive(getattr(job, "enabled", None)),
+                            "last_status": self._primitive(
+                                getattr(state, "last_status", None)
+                            ),
+                            "last_error": self._primitive(getattr(state, "last_error", None)),
+                            "last_run_at_ms": self._primitive(
+                                getattr(state, "last_run_at_ms", None)
+                            ),
+                            "next_run_at_ms": self._primitive(
+                                getattr(state, "next_run_at_ms", None)
+                            ),
+                            "recent_terminal": (
+                                {
+                                    "run_at_ms": self._primitive(
+                                        getattr(recent, "run_at_ms", None)
+                                    ),
+                                    "status": self._primitive(
+                                        getattr(recent, "status", None)
+                                    ),
+                                    "duration_ms": self._primitive(
+                                        getattr(recent, "duration_ms", None)
+                                    ),
+                                    "error": self._primitive(
+                                        getattr(recent, "error", None)
+                                    ),
+                                }
+                                if recent is not None
+                                else None
+                            ),
+                            "delivery": {
+                                "available": True,
+                                "status": self._primitive(
+                                    getattr(state, "last_delivery_status", None)
                                 ),
-                                "status": self._primitive(getattr(recent, "status", None)),
-                                "duration_ms": self._primitive(
-                                    getattr(recent, "duration_ms", None)
+                                "error": self._primitive(
+                                    getattr(state, "last_delivery_error", None)
                                 ),
-                                "error": self._primitive(getattr(recent, "error", None)),
-                            }
-                            if recent is not None
-                            else None
-                        ),
-                        "delivery": {
-                            "available": False,
-                            "reason": "cron state does not record delivery postconditions",
-                        },
-                    })
-            except Exception:
-                jobs = []
-        return {"available": service is not None, "jobs": jobs}
+                            },
+                        })
+                    except Exception as exc:
+                        errors.append({
+                            "job_id": self._primitive(getattr(job, "id", None)),
+                            "error": f"{type(exc).__name__}: {exc}",
+                        })
+            except Exception as exc:
+                errors.append({"job_id": None, "error": f"{type(exc).__name__}: {exc}"})
+        return {"available": service is not None, "jobs": jobs, "errors": errors}
 
     def _environment(self) -> dict[str, Any]:
         exec_config = getattr(self.runtime, "exec_config", None)

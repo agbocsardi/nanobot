@@ -79,7 +79,7 @@ def test_snapshot_represents_absent_subsystems_and_repository_identity(tmp_path)
     assert snapshot["config"]["restart_required"] is False
     assert snapshot["delegated_work"]["available"] is False
     assert snapshot["delegated_work"]["queue"]["available"] is False
-    assert snapshot["cron"] == {"available": False, "jobs": []}
+    assert snapshot["cron"] == {"available": False, "jobs": [], "errors": []}
     assert snapshot["repository"] == {
         "available": True,
         "path": str(tmp_path),
@@ -148,6 +148,7 @@ def test_snapshot_uses_live_goal_delegated_and_cron_state(tmp_path) -> None:
     runtime.subagents = SimpleNamespace(
         runtime_statuses=lambda: {"task-1": status},
         get_queued_count=lambda: 1,
+        get_executing_count=lambda: 2,
         max_iterations=20,
         max_concurrent_subagents=2,
         max_queued_subagents=8,
@@ -185,9 +186,14 @@ def test_snapshot_uses_live_goal_delegated_and_cron_state(tmp_path) -> None:
     assert delegated["runs"][0]["effective_budgets"]["available"] is False
     assert delegated["manager_budgets"]["max_concurrent"] == 2
     assert delegated["queue"] == {"available": True, "queued": 1, "capacity": 8}
+    assert delegated["execution_capacity"] == {
+        "available": True,
+        "in_use": 2,
+        "capacity": 2,
+    }
     cron = snapshot["cron"]["jobs"][0]
     assert cron["recent_terminal"]["status"] == "error"
-    assert cron["delivery"]["available"] is False
+    assert cron["delivery"] == {"available": True, "status": None, "error": None}
 
 
 @pytest.mark.asyncio

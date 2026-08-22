@@ -1,6 +1,7 @@
 """Tests for CronTool._list_jobs() output formatting."""
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -139,6 +140,25 @@ def test_format_state_unknown_status(tmp_path) -> None:
 def test_list_empty(tmp_path) -> None:
     tool = _make_tool(tmp_path)
     assert tool._list_jobs() == "No scheduled jobs."
+
+
+def test_list_preserves_valid_jobs_when_one_job_is_malformed(tmp_path) -> None:
+    tool = _make_tool(tmp_path)
+    good = CronJob(
+        id="good",
+        name="Good job",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+    )
+    malformed = SimpleNamespace(id="bad", name="Bad job")
+    tool._cron.list_jobs = lambda: [good, malformed]
+
+    result = tool._list_jobs()
+
+    assert isinstance(result, ToolResult)
+    assert result.status == "partial"
+    assert "Good job" in result
+    assert "unavailable job (id: bad)" in result
+    assert result.data["errors"][0]["job_id"] == "bad"
 
 
 def test_list_cron_job_shows_expression_and_timezone(tmp_path) -> None:
