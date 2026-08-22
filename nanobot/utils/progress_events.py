@@ -84,7 +84,7 @@ def build_tool_event_finish_payloads(context: AgentHookContext) -> list[dict[str
         result = context.tool_results[idx]
         event = context.tool_events[idx] if isinstance(context.tool_events[idx], dict) else {}
         status = event.get("status")
-        phase = "end" if status == "ok" else "error"
+        phase = "end" if status == "success" else "error"
         files, embeds = tool_event_result_extras(result)
         payload = {
             "version": 1,

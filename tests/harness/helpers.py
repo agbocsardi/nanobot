@@ -7,6 +7,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 from nanobot.agent.runner import AgentRunner, AgentRunSpec
+from nanobot.agent.tools.base import Tool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.config.schema import AgentDefaults
 from nanobot.providers.base import LLMResponse
@@ -24,6 +25,29 @@ class ScriptedProvider:
         if not self.responses:
             raise AssertionError("Scripted provider received an unexpected request")
         return self.responses.pop(0)
+
+
+class StaticTool(Tool):
+    """Return one fixed value while satisfying the real registry contract."""
+
+    def __init__(self, name: str, result: Any):
+        self._name = name
+        self.result = result
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def description(self) -> str:
+        return f"Fixture tool: {self._name}"
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {"type": "object", "properties": {}}
+
+    async def execute(self, **kwargs: Any) -> Any:
+        return self.result
 
 
 async def run_script(

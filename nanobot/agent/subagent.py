@@ -411,8 +411,15 @@ class SubagentManager:
 
     @staticmethod
     def _format_partial_progress(result) -> str:
-        completed = [e for e in result.tool_events if e["status"] == "ok"]
-        failure = next((e for e in reversed(result.tool_events) if e["status"] == "error"), None)
+        completed = [e for e in result.tool_events if e["status"] in {"success", "ok"}]
+        failure = next(
+            (
+                e
+                for e in reversed(result.tool_events)
+                if e["status"] not in {"success", "ok"}
+            ),
+            None,
+        )
         lines: list[str] = []
         if completed:
             lines.append("Completed steps:")
