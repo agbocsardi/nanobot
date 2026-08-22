@@ -132,3 +132,26 @@ async def test_retryable_error_can_recover_with_later_success() -> None:
     ]
     assert result.stop_reason == "completed"
     assert result.final_content == "done with evidence"
+
+
+@pytest.mark.asyncio
+async def test_unrelated_success_does_not_recover_retryable_error() -> None:
+    tools = ToolRegistry()
+    tools.register(StaticTool("inspect", ToolResult.retryable_error("missing file")))
+    tools.register(StaticTool("unrelated", ToolResult("listed directory")))
+    responses = [
+        LLMResponse(
+            content="trying",
+            tool_calls=[ToolCallRequest(id="call_1", name="inspect", arguments={})],
+        ),
+        LLMResponse(
+            content="doing something else",
+            tool_calls=[ToolCallRequest(id="call_2", name="unrelated", arguments={})],
+        ),
+        LLMResponse(content="done"),
+    ]
+
+    result, _ = await run_script(responses, tools=tools)
+
+    assert result.stop_reason == "partial_completion"
+    assert result.final_content.startswith("Incomplete:")

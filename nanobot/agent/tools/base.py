@@ -61,7 +61,9 @@ class ToolResult(str):
         stderr: str | None = None,
     ) -> ToolResult:
         effects = list(side_effects or [])
-        if status == "success" and effects and postcondition != "checked":
+        if status == "success" and (
+            postcondition == "failed" or (effects and postcondition != "checked")
+        ):
             status = "partial"
         obj = str.__new__(cls, content)
         obj.status = status
@@ -81,7 +83,7 @@ class ToolResult(str):
 
     @property
     def verified(self) -> bool:
-        return self.operational_success and (
+        return self.operational_success and self.postcondition != "failed" and (
             not self.side_effects or self.postcondition == "checked"
         )
 

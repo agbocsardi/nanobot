@@ -30,6 +30,14 @@ def test_unchecked_side_effect_cannot_be_verified_success() -> None:
     assert result.verified is False
 
 
+def test_failed_postcondition_cannot_be_verified_without_side_effect_metadata() -> None:
+    result = ToolResult("verification failed", postcondition="failed")
+
+    assert result.status == "partial"
+    assert result.operational_success is False
+    assert result.verified is False
+
+
 @pytest.mark.asyncio
 async def test_exec_exposes_exit_code_127_as_structured_failure() -> None:
     process = AsyncMock()
