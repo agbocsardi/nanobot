@@ -5,7 +5,7 @@ import typing
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from copy import deepcopy
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 if typing.TYPE_CHECKING:
     from pydantic import BaseModel
@@ -13,6 +13,14 @@ if typing.TYPE_CHECKING:
     from nanobot.agent.tools.context import ToolContext
 
 _ToolT = TypeVar("_ToolT", bound="Tool")
+ToolOutcomeStatus = Literal[
+    "success",
+    "partial",
+    "retryable_error",
+    "policy_block",
+    "fatal_error",
+]
+PostconditionStatus = Literal["checked", "unchecked", "failed"]
 
 # Matches :meth:`Tool._cast_value` / :meth:`Schema.validate_json_schema_value` behavior
 _JSON_TYPE_MAP: dict[str, type | tuple[type, ...]] = {
@@ -23,6 +31,85 @@ _JSON_TYPE_MAP: dict[str, type | tuple[type, ...]] = {
     "array": list,
     "object": dict,
 }
+
+
+class ToolResult(str):
+    """String-compatible tool output with structured operational metadata."""
+
+    status: ToolOutcomeStatus
+    data: Any
+    evidence: list[dict[str, Any]]
+    side_effects: list[dict[str, Any]]
+    postcondition: PostconditionStatus | None
+    retryable: bool
+    exit_code: int | None
+    stdout: str | None
+    stderr: str | None
+
+    def __new__(
+        cls,
+        content: str,
+        *,
+        status: ToolOutcomeStatus = "success",
+        data: Any = None,
+        evidence: list[dict[str, Any]] | None = None,
+        side_effects: list[dict[str, Any]] | None = None,
+        postcondition: PostconditionStatus | None = None,
+        retryable: bool | None = None,
+        exit_code: int | None = None,
+        stdout: str | None = None,
+        stderr: str | None = None,
+    ) -> ToolResult:
+        effects = list(side_effects or [])
+        if status == "success" and effects and postcondition != "checked":
+            status = "partial"
+        obj = str.__new__(cls, content)
+        obj.status = status
+        obj.data = data
+        obj.evidence = list(evidence or [])
+        obj.side_effects = effects
+        obj.postcondition = postcondition
+        obj.retryable = status == "retryable_error" if retryable is None else retryable
+        obj.exit_code = exit_code
+        obj.stdout = stdout
+        obj.stderr = stderr
+        return obj
+
+    @property
+    def operational_success(self) -> bool:
+        return self.status == "success"
+
+    @property
+    def verified(self) -> bool:
+        return self.operational_success and (
+            not self.side_effects or self.postcondition == "checked"
+        )
+
+    @classmethod
+    def partial(cls, content: str, **metadata: Any) -> ToolResult:
+        return cls(content, status="partial", **metadata)
+
+    @classmethod
+    def retryable_error(cls, content: str, **metadata: Any) -> ToolResult:
+        return cls(content, status="retryable_error", **metadata)
+
+    @classmethod
+    def policy_block(cls, content: str, **metadata: Any) -> ToolResult:
+        return cls(content, status="policy_block", retryable=False, **metadata)
+
+    @classmethod
+    def fatal_error(cls, content: str, **metadata: Any) -> ToolResult:
+        return cls(content, status="fatal_error", retryable=False, **metadata)
+
+
+def adapt_legacy_tool_result(result: Any) -> ToolResult:
+    """Wrap an untyped tool return without changing its display representation."""
+    if isinstance(result, ToolResult):
+        return result
+    content = "" if result is None else str(result)
+    if isinstance(result, str) and result.startswith("Error"):
+        return ToolResult.retryable_error(content)
+    return ToolResult(content, data=result)
 
 
 class Schema(ABC):
@@ -193,7 +280,7 @@ class Tool(ABC):
 
     @abstractmethod
     async def execute(self, **kwargs: Any) -> Any:
-        """Run the tool; returns a string or list of content blocks."""
+        """Run the tool; typed results are preferred, while legacy returns remain valid."""
         ...
 
     def _cast_object(self, obj: Any, schema: dict[str, Any]) -> dict[str, Any]:
