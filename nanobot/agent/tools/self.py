@@ -7,8 +7,9 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from nanobot.agent.tools.base import Tool
+from nanobot.agent.tools.base import Tool, ToolResult
 from nanobot.agent.tools.context import ContextAware, RequestContext
+from nanobot.agent.tools.runtime_inspector import RuntimeInspector, render_snapshot
 from nanobot.agent.tools.runtime_state import RuntimeState
 from nanobot.config_base import Base
 
@@ -113,6 +114,7 @@ class MyTool(Tool, ContextAware):
         self._modify_allowed = modify_allowed
         self._channel = ""
         self._chat_id = ""
+        self._session_key: str | None = None
 
     def __deepcopy__(self, memo: dict[int, Any]) -> MyTool:
         cls = self.__class__
@@ -122,11 +124,13 @@ class MyTool(Tool, ContextAware):
         result._modify_allowed = self._modify_allowed
         result._channel = self._channel
         result._chat_id = self._chat_id
+        result._session_key = self._session_key
         return result
 
     def set_context(self, ctx: RequestContext) -> None:
         self._channel = ctx.channel
         self._chat_id = ctx.chat_id
+        self._session_key = ctx.session_key
 
     @property
     def name(self) -> str:
@@ -136,7 +140,8 @@ class MyTool(Tool, ContextAware):
     def description(self) -> str:
         base = (
             "Check and set your own runtime state.\n"
-            "Actions: check, set.\n"
+            "Actions: status, check, set.\n"
+            "- status: authoritative read-only effective-runtime snapshot.\n"
             "- check (no key): full config overview — start here.\n"
             "- check (key): drill into a value. Dot-paths allowed "
             "(e.g. '_last_usage.prompt_tokens', 'web_config.enable').\n"
@@ -169,7 +174,7 @@ class MyTool(Tool, ContextAware):
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["check", "set"],
+                    "enum": ["status", "check", "set"],
                     "description": "Action to perform",
                 },
                 "key": {
@@ -317,6 +322,11 @@ class MyTool(Tool, ContextAware):
         value: Any = None,
         **_kwargs: Any,
     ) -> str:
+        if action == "status":
+            snapshot = RuntimeInspector(self._runtime_state).snapshot(
+                session_key=self._session_key,
+            )
+            return ToolResult(render_snapshot(snapshot), data=snapshot)
         if action in ("inspect", "check"):
             return self._inspect(key)
         if not self._modify_allowed:

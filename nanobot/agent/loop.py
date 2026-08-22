@@ -228,6 +228,8 @@ class AgentLoop:
         runtime_model_publisher: Callable[[str, str | None], None] | None = None,
         vision_handoff: Any = None,
         discord_runtime_handle: Any | None = None,
+        loaded_config_path: Path | None = None,
+        loaded_config_fingerprint: str | None = None,
     ):
         from nanobot.config.schema import ToolsConfig
 
@@ -240,6 +242,8 @@ class AgentLoop:
         self.provider = provider
         self.vision_handoff = vision_handoff
         self._discord_runtime_handle = discord_runtime_handle
+        self._loaded_config_path = loaded_config_path
+        self._loaded_config_fingerprint = loaded_config_fingerprint
         self._provider_snapshot_loader = provider_snapshot_loader
         self._preset_snapshot_loader = preset_snapshot_loader
         self._runtime_model_publisher = runtime_model_publisher
@@ -419,6 +423,10 @@ class AgentLoop:
         from nanobot.agent.vision_handoff import build_from_config
 
         vision_handoff = extra.pop("vision_handoff", None) or build_from_config(config)
+        from nanobot.agent.tools.runtime_inspector import fingerprint_file
+        from nanobot.config.loader import get_config_path
+
+        config_path = get_config_path()
         return cls(
             bus=bus,
             provider=provider,
@@ -437,6 +445,8 @@ class AgentLoop:
             timezone=defaults.timezone,
             unified_session=defaults.unified_session,
             disabled_skills=defaults.disabled_skills,
+            loaded_config_path=config_path,
+            loaded_config_fingerprint=fingerprint_file(config_path),
             session_ttl_minutes=defaults.session_ttl_minutes,
             consolidation_ratio=defaults.consolidation_ratio,
             max_messages=defaults.max_messages,
