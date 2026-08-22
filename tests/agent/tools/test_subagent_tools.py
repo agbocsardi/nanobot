@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from nanobot.agent.runner import AgentRunResult
 from nanobot.config.schema import AgentDefaults
 
 _MAX_TOOL_RESULT_CHARS = AgentDefaults().max_tool_result_chars
@@ -248,8 +249,7 @@ async def test_spawn_max_iterations_override_threads_to_spec(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_spawn_tool_rejects_when_at_concurrency_limit(tmp_path):
-    """SpawnTool should return an error string when the concurrency limit is reached."""
+async def test_spawn_tool_queues_when_at_concurrency_limit(tmp_path):
     from nanobot.agent.subagent import SubagentManager
     from nanobot.agent.tools.spawn import SpawnTool
     from nanobot.bus.queue import MessageBus
@@ -288,14 +288,52 @@ async def test_spawn_tool_rejects_when_at_concurrency_limit(tmp_path):
     result = await tool.execute(task="first task")
     assert "started" in result
 
-    # Second spawn should be rejected (default limit is 1)
+    # Second spawn waits behind the first (default execution limit is 1).
     result = await tool.execute(task="second task")
-    assert "Cannot spawn subagent" in result
-    assert "concurrency limit reached" in result
+    assert "queued" in result
+    assert mgr.get_queued_count() == 1
 
     # Release the first subagent
     release.set()
     # Allow cleanup
+    await asyncio.gather(*mgr._running_tasks.values(), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_spawn_tool_rejects_only_when_bounded_queue_is_full(tmp_path):
+    from nanobot.agent.subagent import SubagentManager
+    from nanobot.agent.tools.context import RequestContext
+    from nanobot.agent.tools.spawn import SpawnTool
+    from nanobot.bus.queue import MessageBus
+
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    mgr = SubagentManager(
+        provider=provider,
+        workspace=tmp_path,
+        bus=MessageBus(),
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        max_concurrent_subagents=1,
+        max_queued_subagents=1,
+    )
+    mgr._announce_result = AsyncMock()
+    release = asyncio.Event()
+
+    async def fake_run(spec):
+        await release.wait()
+        return AgentRunResult(final_content="done", messages=[], stop_reason="completed")
+
+    mgr.runner.run = AsyncMock(side_effect=fake_run)
+    tool = SpawnTool(mgr)
+    tool.set_context(RequestContext(channel="test", chat_id="c1", session_key="test:c1"))
+
+    assert "started" in await tool.execute(task="first")
+    assert "queued" in await tool.execute(task="second")
+    rejected = await tool.execute(task="third")
+
+    assert "Cannot spawn subagent" in rejected
+    assert "queue is full" in rejected
+    release.set()
     await asyncio.gather(*mgr._running_tasks.values(), return_exceptions=True)
 
 

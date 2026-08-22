@@ -543,6 +543,35 @@ class TestCancelBySession:
         count = await sm.cancel_by_session("s1")
         assert count == 0
 
+    @pytest.mark.asyncio
+    async def test_queued_and_running_cancellation_persist_terminal_state(self, tmp_path):
+        sm = _manager(
+            tmp_path,
+            max_concurrent_subagents=1,
+            max_queued_subagents=1,
+        )
+        release = asyncio.Event()
+
+        async def _slow_run(spec):
+            await release.wait()
+            return AgentRunResult(final_content="done", messages=[], stop_reason="completed")
+
+        sm.runner.run = _slow_run
+        sm._announce_result = AsyncMock()
+        with patch.object(sm, "_write_run_record") as write_record:
+            await sm.spawn("running", session_key="s1")
+            await sm.spawn("queued", session_key="s1")
+            await asyncio.sleep(0)
+
+            assert sm.get_executing_count() == 1
+            assert sm.get_queued_count() == 1
+            assert await sm.cancel_by_session("s1") == 2
+
+        recorded_statuses = [call.args[7] for call in write_record.call_args_list]
+        assert len(recorded_statuses) == 2
+        assert all(status.phase == "cancelled" for status in recorded_statuses)
+        assert all(status.stop_reason == "cancelled" for status in recorded_statuses)
+
 
 # ---------------------------------------------------------------------------
 # get_running_count / get_running_count_by_session

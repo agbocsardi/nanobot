@@ -89,6 +89,7 @@ class SubagentManager:
         disabled_skills: list[str] | None = None,
         max_iterations: int | None = None,
         max_concurrent_subagents: int | None = None,
+        max_queued_subagents: int | None = None,
         llm_wall_timeout_for_session: Callable[[str | None], float | None] | None = None,
         run_provider: LLMProvider | None = None,
         run_model: str | None = None,
@@ -114,6 +115,12 @@ class SubagentManager:
             if max_concurrent_subagents is not None
             else defaults.max_concurrent_subagents
         )
+        self.max_queued_subagents = (
+            max_queued_subagents
+            if max_queued_subagents is not None
+            else max(4, self.max_concurrent_subagents * 4)
+        )
+        self._execution_slots = asyncio.Semaphore(self.max_concurrent_subagents)
         self.runner = AgentRunner(provider)
         self.run_provider = run_provider
         self.run_model = run_model
@@ -178,6 +185,11 @@ class SubagentManager:
         workspace_scope: WorkspaceScope | None = None,
     ) -> str:
         """Spawn a subagent to execute a task in the background."""
+        if self.get_queued_count() >= self.max_queued_subagents:
+            raise RuntimeError(
+                f"delegated queue is full ({self.get_queued_count()}/"
+                f"{self.max_queued_subagents} queued)"
+            )
         task_id = str(uuid.uuid4())[:8]
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
         origin = {"channel": origin_channel, "chat_id": origin_chat_id, "session_key": session_key}
@@ -189,6 +201,7 @@ class SubagentManager:
             provider_override, model_override, preset_ctx = self._resolve_preset_override(model_preset)
         effective_ctx = context_window_tokens or preset_ctx
 
+        queued = self.get_running_count() >= self.max_concurrent_subagents
         status = SubagentStatus(
             task_id=task_id,
             label=display_label,
@@ -202,11 +215,12 @@ class SubagentManager:
                 "max_tool_result_chars": self.max_tool_result_chars,
                 "model": model_override or self.run_model or self.model,
             },
+            phase="queued" if queued else "running",
         )
         self._task_statuses[task_id] = status
 
         bg_task = asyncio.create_task(
-            self._run_subagent(
+            self._run_scheduled_subagent(
                 task_id,
                 task,
                 display_label,
@@ -225,7 +239,33 @@ class SubagentManager:
         if session_key:
             self._session_tasks.setdefault(session_key, set()).add(task_id)
 
-        def _cleanup(_: asyncio.Task) -> None:
+        def _cleanup(finished: asyncio.Task) -> None:
+            if finished.cancelled() and status.phase != "cancelled":
+                status.phase = "cancelled"
+                status.stop_reason = "cancelled"
+                cancelled_result = "Task was cancelled before execution started."
+                self._write_run_record(
+                    task_id,
+                    task,
+                    display_label,
+                    origin,
+                    temperature,
+                    workspace_scope,
+                    cancelled_result,
+                    status,
+                    provider=provider_override,
+                    model=model_override,
+                )
+                asyncio.create_task(self._announce_result(
+                    task_id,
+                    display_label,
+                    task,
+                    cancelled_result,
+                    origin,
+                    "error",
+                    origin_message_id,
+                    stop_reason="cancelled",
+                ))
             self._running_tasks.pop(task_id, None)
             self._task_statuses.pop(task_id, None)
             if session_key and (ids := self._session_tasks.get(session_key)):
@@ -236,7 +276,65 @@ class SubagentManager:
         bg_task.add_done_callback(_cleanup)
 
         logger.info("Spawned subagent [{}]: {}", task_id, display_label)
-        return f"Subagent [{display_label}] started (id: {task_id}). I'll notify you when it completes."
+        state = "queued" if queued else "started"
+        return (
+            f"Subagent [{display_label}] {state} (id: {task_id}). "
+            "I'll notify you when it completes."
+        )
+
+    async def _run_scheduled_subagent(
+        self,
+        task_id: str,
+        task: str,
+        label: str,
+        origin: dict[str, str],
+        status: SubagentStatus,
+        origin_message_id: str | None = None,
+        temperature: float | None = None,
+        workspace_scope: WorkspaceScope | None = None,
+        **run_kwargs: Any,
+    ) -> None:
+        try:
+            async with self._execution_slots:
+                await self._run_subagent(
+                    task_id,
+                    task,
+                    label,
+                    origin,
+                    status,
+                    origin_message_id,
+                    temperature,
+                    workspace_scope,
+                    **run_kwargs,
+                )
+        except asyncio.CancelledError:
+            if status.phase != "cancelled":
+                status.phase = "cancelled"
+                status.stop_reason = "cancelled"
+                result = "Task was cancelled while queued."
+                await self._announce_result(
+                    task_id,
+                    label,
+                    task,
+                    result,
+                    origin,
+                    "error",
+                    origin_message_id,
+                    stop_reason="cancelled",
+                )
+                self._write_run_record(
+                    task_id,
+                    task,
+                    label,
+                    origin,
+                    temperature,
+                    workspace_scope,
+                    result,
+                    status,
+                    provider=run_kwargs.get("provider_override"),
+                    model=run_kwargs.get("model_override"),
+                )
+            raise
 
     def _resolve_preset_override(
         self, model_preset: str
@@ -534,6 +632,10 @@ class SubagentManager:
     def get_executing_count(self) -> int:
         """Return tasks that currently hold execution capacity."""
         return sum(status.phase == "running" for status in self._task_statuses.values())
+
+    def get_queued_count(self) -> int:
+        """Return delegated tasks waiting for execution capacity."""
+        return sum(status.phase == "queued" for status in self._task_statuses.values())
 
     def get_running_count_by_session(self, session_key: str) -> int:
         """Return the number of currently running subagents for a session."""

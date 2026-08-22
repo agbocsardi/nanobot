@@ -134,8 +134,15 @@ class RuntimeInspector:
             "available": manager is not None,
             "runs": runs,
             "queue": {
-                "available": False,
-                "reason": "delegated queue is not implemented",
+                "available": manager is not None,
+                "queued": (
+                    manager.get_queued_count()
+                    if manager is not None and hasattr(manager, "get_queued_count")
+                    else None
+                ),
+                "capacity": self._primitive(
+                    getattr(manager, "max_queued_subagents", None)
+                ),
             },
             "manager_budgets": {
                 "max_iterations": self._primitive(getattr(manager, "max_iterations", None)),

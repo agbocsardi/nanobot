@@ -130,8 +130,10 @@ def test_snapshot_uses_live_goal_delegated_and_cron_state(tmp_path) -> None:
     )
     runtime.subagents = SimpleNamespace(
         runtime_statuses=lambda: {"task-1": status},
+        get_queued_count=lambda: 1,
         max_iterations=20,
         max_concurrent_subagents=2,
+        max_queued_subagents=8,
         max_tool_result_chars=8000,
     )
     recent = SimpleNamespace(
@@ -165,6 +167,7 @@ def test_snapshot_uses_live_goal_delegated_and_cron_state(tmp_path) -> None:
     assert delegated["runs"][0]["phase"] == "running"
     assert delegated["runs"][0]["effective_budgets"]["available"] is False
     assert delegated["manager_budgets"]["max_concurrent"] == 2
+    assert delegated["queue"] == {"available": True, "queued": 1, "capacity": 8}
     cron = snapshot["cron"]["jobs"][0]
     assert cron["recent_terminal"]["status"] == "error"
     assert cron["delivery"]["available"] is False
