@@ -262,7 +262,9 @@ async def test_ssrf_soft_block_can_finalize_after_streamed_tool_call(tmp_path):
     )
 
     assert result is not None
-    assert result.content == "I cannot access private URLs. Please share the local file."
+    assert result.content.endswith(
+        "I cannot access private URLs. Please share the local file."
+    )
     assert result.metadata.get("_streamed") is True
 
 

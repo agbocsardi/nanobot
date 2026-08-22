@@ -137,6 +137,7 @@ class TestMessageToolSuppressLogic:
         ])
         loop.provider.chat_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
         loop.tools.get_definitions = MagicMock(return_value=[])
+        loop.tools.prepare_call = MagicMock(return_value=(None, {"path": "foo.txt"}, None))
         loop.tools.execute = AsyncMock(return_value="ok")
 
         progress: list[tuple[str, bool]] = []

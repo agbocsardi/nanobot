@@ -1504,7 +1504,11 @@ class AgentLoop:
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         meta = dict(msg.metadata or {})
-        if on_stream is not None and stop_reason not in {"error", "tool_error"}:
+        if on_stream is not None and stop_reason not in {
+            "error",
+            "provider_error",
+            "tool_error",
+        }:
             meta["_streamed"] = True
         if turn_latency_ms is not None:
             meta["latency_ms"] = int(turn_latency_ms)
