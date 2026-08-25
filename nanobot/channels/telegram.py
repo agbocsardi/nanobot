@@ -6,6 +6,7 @@ import asyncio
 import re
 import time
 import unicodedata
+from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from html import unescape
@@ -1350,6 +1351,115 @@ class TelegramChannel(BaseChannel):
             media.append(descriptor)
         return media
 
+    @staticmethod
+    def _rich_text_to_plain(value: Any) -> str:
+        """Flatten a Bot API RichText value while discarding presentation metadata."""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            return "".join(TelegramChannel._rich_text_to_plain(item) for item in value)
+        if not isinstance(value, Mapping):
+            return ""
+
+        text = TelegramChannel._rich_text_to_plain(value.get("text"))
+        if text:
+            return text
+        if value.get("type") == "custom_emoji":
+            return str(value.get("alternative_text") or "")
+        if value.get("type") == "mathematical_expression":
+            return str(value.get("expression") or "")
+        if value.get("type") == "button":
+            button = value.get("button")
+            if isinstance(button, Mapping):
+                return TelegramChannel._rich_text_to_plain(button.get("text"))
+        return ""
+
+    @classmethod
+    def _rich_message_to_plain(cls, rich_message: Any) -> str:
+        """Extract readable text from a Bot API RichMessage object."""
+        if not isinstance(rich_message, Mapping):
+            return ""
+
+        def flatten_caption(caption: Any) -> str:
+            if isinstance(caption, Mapping):
+                parts = [
+                    cls._rich_text_to_plain(caption.get("text")),
+                    cls._rich_text_to_plain(caption.get("credit")),
+                ]
+                return "\n".join(part for part in parts if part)
+            return cls._rich_text_to_plain(caption)
+
+        def flatten_block(block: Any) -> str:
+            if not isinstance(block, Mapping):
+                return ""
+            block_type = block.get("type")
+            parts: list[str] = []
+
+            if block_type == "divider":
+                return "---"
+            if block_type == "mathematical_expression":
+                return str(block.get("expression") or "")
+            if block_type == "list":
+                for item in block.get("items") or []:
+                    if not isinstance(item, Mapping):
+                        continue
+                    item_text = "\n".join(
+                        part
+                        for part in (
+                            flatten_block(child) for child in item.get("blocks") or []
+                        )
+                        if part
+                    )
+                    if item_text:
+                        label = str(item.get("label") or "-")
+                        parts.append(f"{label} {item_text}")
+                return "\n".join(parts)
+            if block_type == "table":
+                for row in block.get("cells") or []:
+                    cells = [
+                        cls._rich_text_to_plain(cell.get("text"))
+                        for cell in row
+                        if isinstance(cell, Mapping)
+                    ]
+                    cells = [cell for cell in cells if cell]
+                    if cells:
+                        parts.append(" | ".join(cells))
+                caption = cls._rich_text_to_plain(block.get("caption"))
+                if caption:
+                    parts.append(caption)
+                return "\n".join(parts)
+            if block_type == "buttons":
+                button_texts = []
+                for button in block.get("buttons") or []:
+                    if not isinstance(button, Mapping):
+                        continue
+                    text = cls._rich_text_to_plain(button.get("text"))
+                    if text:
+                        button_texts.append(text)
+                return " | ".join(button_texts)
+
+            for field in ("text", "summary", "credit"):
+                text = cls._rich_text_to_plain(block.get(field))
+                if text:
+                    parts.append(text)
+            for child in block.get("blocks") or []:
+                text = flatten_block(child)
+                if text:
+                    parts.append(text)
+            caption = flatten_caption(block.get("caption"))
+            if caption:
+                parts.append(caption)
+            return "\n".join(parts)
+
+        plain = "\n".join(
+            part
+            for part in (
+                flatten_block(block) for block in rich_message.get("blocks") or []
+            )
+            if part
+        )
+        return plain.strip()
+
     async def _extract_reply_details(self, message) -> dict | None:
         """Extract structured context from the message being replied to."""
         reply = self._reply_source(message)
@@ -1371,16 +1481,33 @@ class TelegramChannel(BaseChannel):
         sender_id = getattr(reply_user, "id", None)
         if sender_id is None and origin_details is not None:
             sender_id = (origin_details.get("sender") or {}).get("id")
+        message_id = getattr(reply, "message_id", None) if reply is not None else None
         text = getattr(reply, "text", None) if reply is not None else None
         caption = getattr(reply, "caption", None) if reply is not None else None
+        if not text and not caption and reply is not None:
+            api_kwargs = getattr(reply, "api_kwargs", None)
+            rich_message = api_kwargs.get("rich_message") if isinstance(api_kwargs, Mapping) else None
+            rich_text = self._rich_message_to_plain(rich_message)
+            if rich_text:
+                text = rich_text
+        if not text and not caption and reply is not None and message_id is not None:
+            chat = getattr(reply, "chat", None) or getattr(message, "chat", None)
+            chat_id = getattr(chat, "id", None)
+            if chat_id is not None:
+                text = self._sent_messages.get((str(chat_id), int(message_id)))
+
         details = {
-            "message_id": getattr(reply, "message_id", None) if reply is not None else None,
+            "message_id": message_id,
             "sent_by_bot": sender_id == bot_id if sender_id is not None and bot_id is not None else None,
             "text": self._truncate_reply_text(text),
             "caption": self._truncate_reply_text(caption),
             "quote": self._truncate_reply_text(quote),
             "media": self._describe_reply_media(reply) if reply is not None else [],
         }
+        if reply is not None and not any(
+            (details["text"], details["caption"], details["quote"], details["media"])
+        ):
+            details["content_unavailable"] = True
         if reply_user is not None:
             details["sender"] = {
                 "id": sender_id,
@@ -1435,6 +1562,13 @@ class TelegramChannel(BaseChannel):
             elif media.get("mime_type"):
                 description += f" ({media['mime_type']})"
             lines.append(f"Media: {description}")
+        if details.get("content_unavailable"):
+            lines.extend(
+                [
+                    "Original replied-to message unavailable.",
+                    "Do not infer its content; ask the user to copy or clarify the original message.",
+                ]
+            )
         lines.append("[/Telegram Reply Context]")
         return "\n".join(lines)
 

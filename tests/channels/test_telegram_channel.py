@@ -1463,13 +1463,109 @@ async def test_extract_reply_context_truncation() -> None:
 
 @pytest.mark.asyncio
 async def test_extract_reply_context_no_text_still_identifies_reply() -> None:
-    """A reply remains explicit even when Telegram provides no quoted body."""
+    """An unavailable reply body explicitly forbids guessing its content."""
     channel = TelegramChannel(TelegramConfig(enabled=True, token="123:abc"), MessageBus())
     reply = SimpleNamespace(text=None, caption=None)
     message = SimpleNamespace(reply_to_message=reply)
     context = await channel._extract_reply_context(message)
     assert "Message ID: unknown" in context
+    assert "Original replied-to message unavailable." in context
+    assert "Do not infer its content" in context
+    assert "copy or clarify the original message" in context
     assert context.endswith("[/Telegram Reply Context]")
+
+
+@pytest.mark.asyncio
+async def test_extract_reply_context_recovers_unsupported_rich_message_payload() -> None:
+    """PTB stores Bot API fields it does not type in Message.api_kwargs."""
+    channel = TelegramChannel(TelegramConfig(enabled=True, token="123:abc"), MessageBus())
+    channel._bot_user_id = 99
+    reply = telegram.Message.de_json(
+        {
+            "message_id": 18135,
+            "date": 1787634000,
+            "chat": {"id": 42, "type": "private"},
+            "from": {
+                "id": 99,
+                "is_bot": True,
+                "first_name": "Cody",
+                "username": "hermeusz_bot",
+            },
+            "rich_message": {
+                "blocks": [
+                    {
+                        "type": "paragraph",
+                        "text": [
+                            "Discuss the ",
+                            {"type": "bold", "text": "Jules Datalab photoshoot"},
+                            " with Marjo tonight.",
+                        ],
+                    }
+                ]
+            },
+        },
+        None,
+    )
+
+    assert reply is not None
+    assert reply.text is None
+    assert reply.api_kwargs["rich_message"]["blocks"]
+    details = await channel._extract_reply_details(
+        SimpleNamespace(reply_to_message=reply, chat=reply.chat)
+    )
+
+    assert details is not None
+    assert details["text"] == "Discuss the Jules Datalab photoshoot with Marjo tonight."
+    assert "content_unavailable" not in details
+
+
+@pytest.mark.asyncio
+async def test_rich_reply_payload_takes_precedence_over_sent_message_cache() -> None:
+    channel = TelegramChannel(TelegramConfig(enabled=True, token="123:abc"), MessageBus())
+    channel._bot_user_id = 99
+    channel._remember_sent_message("42", 18135, "Stale cached text")
+    reply = SimpleNamespace(
+        message_id=18135,
+        text=None,
+        caption=None,
+        api_kwargs={
+            "rich_message": {
+                "blocks": [{"type": "paragraph", "text": "Payload text"}]
+            }
+        },
+        from_user=SimpleNamespace(id=99, username=None, first_name="Cody"),
+        chat=SimpleNamespace(id=42),
+    )
+
+    details = await channel._extract_reply_details(
+        SimpleNamespace(reply_to_message=reply, chat=SimpleNamespace(id=42))
+    )
+
+    assert details is not None
+    assert details["text"] == "Payload text"
+
+
+@pytest.mark.asyncio
+async def test_extract_reply_context_falls_back_to_sent_message_cache() -> None:
+    channel = TelegramChannel(TelegramConfig(enabled=True, token="123:abc"), MessageBus())
+    channel._bot_user_id = 99
+    channel._remember_sent_message("42", 18135, "Cached bot message")
+    reply = SimpleNamespace(
+        message_id=18135,
+        text=None,
+        caption=None,
+        api_kwargs={},
+        from_user=SimpleNamespace(id=99, username=None, first_name="Cody"),
+        chat=SimpleNamespace(id=42),
+    )
+
+    details = await channel._extract_reply_details(
+        SimpleNamespace(reply_to_message=reply, chat=SimpleNamespace(id=42))
+    )
+
+    assert details is not None
+    assert details["text"] == "Cached bot message"
+    assert "content_unavailable" not in details
 
 
 @pytest.mark.asyncio
