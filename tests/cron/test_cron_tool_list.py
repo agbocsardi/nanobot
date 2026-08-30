@@ -172,6 +172,43 @@ def test_list_cron_job_shows_expression_and_timezone(tmp_path) -> None:
     assert "cron: 0 9 * * 1-5 (America/Denver)" in result
 
 
+def test_list_shows_authoritative_payload_flags_and_model_preset(tmp_path) -> None:
+    tool = _make_tool(tmp_path)
+    job = tool._cron.add_job(
+        name="Quiet isolated check",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="check",
+        silent=True,
+        isolated=False,
+        model_preset="fast",
+    )
+    # Deliberately add misleading top-level values.  Persisted cron settings
+    # are authoritative on the payload, not on the job object.
+    job.silent = False
+    job.isolated = True
+    job.model_preset = "wrong"
+
+    result = tool._list_jobs()
+
+    assert (
+        "- Quiet isolated check (id: " + job.id + ", every 1m, "
+        "silent: True, isolated: False, model_preset: fast)"
+    ) in result
+
+
+def test_list_shows_global_model_preset_when_job_has_no_override(tmp_path) -> None:
+    tool = _make_tool(tmp_path)
+    tool._cron.add_job(
+        name="Default model check",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="check",
+    )
+
+    result = tool._list_jobs()
+
+    assert "silent: False, isolated: True, model_preset: global" in result
+
+
 def test_list_every_job_shows_human_interval(tmp_path) -> None:
     tool = _make_tool(tmp_path)
     tool._cron.add_job(
@@ -300,7 +337,10 @@ def test_list_includes_protected_dream_system_job_with_memory_purpose(tmp_path) 
 
     result = tool._list_jobs()
 
-    assert "- dream (id: dream, cron: 0 */2 * * * (UTC))" in result
+    assert (
+        "- dream (id: dream, cron: 0 */2 * * * (UTC), "
+        "silent: False, isolated: True, model_preset: global)" in result
+    )
     assert "Dream memory consolidation for long-term memory." in result
     assert "cannot be removed" in result
 

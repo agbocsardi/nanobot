@@ -342,7 +342,23 @@ class CronTool(Tool, ContextAware):
         for j in jobs:
             try:
                 timing = self._format_timing(j.schedule)
-                parts = [f"- {j.name} (id: {j.id}, {timing})"]
+                # These controls live on the payload.  Do not read similarly
+                # named top-level attributes: persisted jobs have no such
+                # fields and the payload is the authoritative source.
+                model_preset = getattr(j.payload, "model_preset", None)
+                model_override = getattr(j.payload, "model_override", None)
+                model_detail = (
+                    f"model_preset: {model_preset}"
+                    if model_preset
+                    else f"model_override: {model_override}"
+                    if model_override
+                    else "model_preset: global"
+                )
+                parts = [
+                    f"- {j.name} (id: {j.id}, {timing}, "
+                    f"silent: {bool(j.payload.silent)}, isolated: {bool(j.payload.isolated)}, "
+                    f"{model_detail})"
+                ]
                 if j.payload.kind == "system_event":
                     parts.append(f"  Purpose: {self._system_job_purpose(j)}")
                     parts.append("  Protected: visible for inspection, but cannot be removed.")
