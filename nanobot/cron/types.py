@@ -64,9 +64,16 @@ class CronPayload:
 
 @dataclass
 class CronRunRecord:
-    """A single execution record for a cron job."""
-    run_at_ms: int
-    status: Literal["ok", "error", "skipped"]
+    """A single execution record for a cron job.
+
+    ``run_at_ms`` is the legacy alias for ``started_at_ms``.
+    """
+    run_at_ms: int = 0
+    scheduled_at_ms: int | None = None
+    detected_at_ms: int | None = None
+    started_at_ms: int | None = None
+    finished_at_ms: int | None = None
+    status: Literal["ok", "error", "skipped"] = "ok"
     duration_ms: int = 0
     error: str | None = None
     delivery_status: str | None = None
@@ -97,6 +104,10 @@ class CronJob:
     created_at_ms: int = 0
     updated_at_ms: int = 0
     delete_after_run: bool = False
+    # What to do when a recurring occurrence is detected after its grace period.
+    # coalesce runs one current occurrence; skip records the missed occurrence.
+    misfire_policy: Literal["skip", "coalesce"] = "coalesce"
+    misfire_grace_ms: int = 60_000
 
     @classmethod
     def from_dict(cls, kwargs: dict):

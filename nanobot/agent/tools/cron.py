@@ -56,6 +56,14 @@ _CRON_PARAMETERS = tool_parameters_schema(
         "should stay quiet unless they find something. Default false so reminders "
         "keep pinging."
     ),
+    misfire_policy=StringSchema(
+        "What to do when a run is late beyond misfire_grace_seconds: skip or coalesce. Defaults to coalesce.",
+        enum=["skip", "coalesce"],
+    ),
+    misfire_grace_seconds=IntegerSchema(
+        0, minimum=0,
+        description="Nonnegative seconds a late run may start within before misfire handling. Defaults to 60.",
+    ),
     isolated=BooleanSchema(
         description=
         "true (default) = run in a dedicated background session, isolated from "
@@ -181,13 +189,16 @@ class CronTool(Tool, ContextAware):
         silent: bool = False,
         model_preset: str | None = None,
         isolated: bool = True,
+        misfire_policy: str = "coalesce",
+        misfire_grace_seconds: int = 60,
         **kwargs: Any,
     ) -> str:
         if action == "add":
             if self._in_cron_context.get():
                 return "Error: cannot schedule new jobs from within a cron job execution"
             return self._add_job(
-                name, message, every_seconds, cron_expr, tz, at, silent, model_preset, isolated
+                name, message, every_seconds, cron_expr, tz, at, silent, model_preset, isolated,
+                misfire_policy, misfire_grace_seconds
             )
         elif action == "list":
             return self._list_jobs()
@@ -206,7 +217,13 @@ class CronTool(Tool, ContextAware):
         silent: bool = False,
         model_preset: str | None = None,
         isolated: bool = True,
+        misfire_policy: str = "coalesce",
+        misfire_grace_seconds: int = 60,
     ) -> str:
+        if misfire_policy not in ("skip", "coalesce"):
+            return "Error: misfire_policy must be 'skip' or 'coalesce'"
+        if misfire_grace_seconds < 0:
+            return "Error: misfire_grace_seconds must be nonnegative"
         if not message:
             return (
                 "Error: cron action='add' requires a non-empty 'message' parameter "
@@ -278,6 +295,8 @@ class CronTool(Tool, ContextAware):
             silent=silent,
             model_preset=preset_name,
             isolated=isolated,
+            misfire_policy=misfire_policy,
+            misfire_grace_ms=misfire_grace_seconds * 1000,
         )
         return ToolResult(
             f"Created job '{job.name}' (id: {job.id})",
@@ -317,6 +336,14 @@ class CronTool(Tool, ContextAware):
             if state.last_error:
                 info += f" ({state.last_error})"
             lines.append(info)
+        if state.run_history:
+            run = state.run_history[-1]
+            if run.scheduled_at_ms is not None:
+                late = (run.detected_at_ms - run.scheduled_at_ms) if run.detected_at_ms is not None else None
+                detail = f"  Last diagnostic: scheduled={run.scheduled_at_ms}, detected={run.detected_at_ms}, started={run.started_at_ms}, finished={run.finished_at_ms}"
+                if late is not None:
+                    detail += f", late-by={max(0, late)}ms"
+                lines.append(detail + f" — {run.status}" + (f" ({run.error})" if run.error else ""))
         if state.next_run_at_ms:
             lines.append(f"  Next run: {self._format_timestamp(state.next_run_at_ms, display_tz)}")
         return lines
@@ -342,18 +369,59 @@ class CronTool(Tool, ContextAware):
         for j in jobs:
             try:
                 timing = self._format_timing(j.schedule)
-                parts = [f"- {j.name} (id: {j.id}, {timing})"]
+                # These controls live on the payload.  Do not read similarly
+                # named top-level attributes: persisted jobs have no such
+                # fields and the payload is the authoritative source.
+                model_preset = getattr(j.payload, "model_preset", None)
+                model_override = getattr(j.payload, "model_override", None)
+                model_detail = (
+                    f"model_preset: {model_preset}"
+                    if model_preset
+                    else f"model_override: {model_override}"
+                    if model_override
+                    else "model_preset: global"
+                )
+                claim_reader = getattr(self._cron, "claim_status", None)
+                claim = claim_reader(j.id, j.state.next_run_at_ms) if callable(claim_reader) else {"status": "none"}
+                parts = [
+                    f"- {j.name} (id: {j.id}, {timing}, "
+                    f"silent: {bool(j.payload.silent)}, isolated: {bool(j.payload.isolated)}, "
+                    f"{model_detail})"
+                ]
+                parts.append(f"  Misfire: policy={j.misfire_policy}, grace={j.misfire_grace_ms // 1000}s")
                 if j.payload.kind == "system_event":
                     parts.append(f"  Purpose: {self._system_job_purpose(j)}")
                     parts.append("  Protected: visible for inspection, but cannot be removed.")
                 parts.extend(self._format_state(j.state, j.schedule))
+                if claim["status"] != "none":
+                    expires = claim.get("lease_expires_at_ms")
+                    suffix = f" (expires {expires})" if expires is not None else ""
+                    parts.append(f"  Claim: {claim['status']}{suffix}")
                 if j.state.last_delivery_status:
                     delivery = f"  Last delivery: {j.state.last_delivery_status}"
                     if j.state.last_delivery_error:
                         delivery += f" ({j.state.last_delivery_error})"
                     parts.append(delivery)
                 lines.append("\n".join(parts))
-                listed_jobs.append({"id": j.id, "name": j.name})
+                latest = j.state.run_history[-1] if j.state.run_history else None
+                run_data = None
+                if latest:
+                    late = (latest.detected_at_ms - latest.scheduled_at_ms) if latest.detected_at_ms is not None and latest.scheduled_at_ms is not None else None
+                    run_data = {"scheduled_at_ms": latest.scheduled_at_ms, "detected_at_ms": latest.detected_at_ms,
+                                "started_at_ms": latest.started_at_ms, "finished_at_ms": latest.finished_at_ms,
+                                "late_by_ms": max(0, late) if late is not None else None, "status": latest.status,
+                                "error": latest.error, "delivery_status": latest.delivery_status,
+                                "delivery_error": latest.delivery_error}
+                listed_jobs.append({"id": j.id, "name": j.name, "enabled": j.enabled,
+                                    "misfire_policy": j.misfire_policy,
+                                    "misfire_grace_seconds": j.misfire_grace_ms // 1000,
+                                    "silent": bool(j.payload.silent), "isolated": bool(j.payload.isolated),
+                                    "model_preset": model_preset or model_override or "global", "model_override": model_override,
+                                    "next_run_at_ms": j.state.next_run_at_ms, "last_run": run_data,
+                                    "last_run_at_ms": j.state.last_run_at_ms,
+                                    "last_status": j.state.last_status, "last_error": j.state.last_error,
+                                    "last_delivery_status": j.state.last_delivery_status,
+                                    "last_delivery_error": j.state.last_delivery_error, "claim": claim})
             except Exception as exc:
                 job_id = str(getattr(j, "id", "unknown"))
                 message = f"{type(exc).__name__}: {exc}"
