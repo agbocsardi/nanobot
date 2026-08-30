@@ -52,6 +52,33 @@ class SubagentStatus:
     holds_capacity: bool = False
 
 
+class QueueFullError(RuntimeError):
+    """Structured rejection when the bounded delegated queue is saturated.
+
+    Carries the queue length at rejection time, the 1-based position the new
+    task would occupy if admitted, and the queue capacity, so the spawn tool
+    can report the wait state precisely (every slot is occupied, so the task
+    would have waited at ``position``).
+    """
+
+    def __init__(
+        self,
+        *,
+        queue_length: int,
+        position: int,
+        capacity: int,
+        would_wait: bool = True,
+    ) -> None:
+        self.queue_length = queue_length
+        self.position = position
+        self.capacity = capacity
+        self.would_wait = would_wait
+        super().__init__(
+            f"delegated queue is full ({queue_length}/{capacity} queued; "
+            f"capacity {capacity}; this task would wait at position {position})"
+        )
+
+
 class _SubagentHook(AgentHook):
     """Hook for subagent execution — logs tool calls and updates status."""
 
@@ -203,13 +230,16 @@ class SubagentManager:
         model_preset: str | None = None,
         max_iterations: int | None = None,
         context_window_tokens: int | None = None,
+        max_tokens: int | None = None,
         workspace_scope: WorkspaceScope | None = None,
     ) -> str:
         """Spawn a subagent to execute a task in the background."""
-        if self.get_queued_count() >= self.max_queued_subagents:
-            raise RuntimeError(
-                f"delegated queue is full ({self.get_queued_count()}/"
-                f"{self.max_queued_subagents} queued)"
+        queued_count = self.get_queued_count()
+        if queued_count >= self.max_queued_subagents:
+            raise QueueFullError(
+                queue_length=queued_count,
+                position=queued_count + 1,
+                capacity=self.max_queued_subagents,
             )
         task_id = str(uuid.uuid4())[:8]
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
@@ -238,6 +268,7 @@ class SubagentManager:
                 "max_iterations": effective_max_iterations,
                 "context_window_tokens": effective_ctx,
                 "max_tool_result_chars": effective_max_tool_result_chars,
+                "max_tokens": max_tokens,
                 "model": effective_model,
                 "model_preset": model_preset,
             },
@@ -261,6 +292,7 @@ class SubagentManager:
                 context_window_tokens=effective_ctx,
                 max_iterations=effective_max_iterations,
                 max_tool_result_chars=effective_max_tool_result_chars,
+                max_tokens=max_tokens,
             )
         )
         self._running_tasks[task_id] = bg_task
@@ -327,6 +359,7 @@ class SubagentManager:
         origin_message_id: str | None = None,
         temperature: float | None = None,
         workspace_scope: WorkspaceScope | None = None,
+        max_tokens: int | None = None,
         **run_kwargs: Any,
     ) -> None:
         try:
@@ -342,6 +375,7 @@ class SubagentManager:
                         origin_message_id,
                         temperature,
                         workspace_scope,
+                        max_tokens=max_tokens,
                         **run_kwargs,
                     )
                 finally:
@@ -408,6 +442,7 @@ class SubagentManager:
         context_window_tokens: int | None = None,
         max_iterations: int | None = None,
         max_tool_result_chars: int | None = None,
+        max_tokens: int | None = None,
     ) -> None:
         """Execute the subagent task and announce the result."""
         status.phase = "running"
@@ -439,6 +474,7 @@ class SubagentManager:
                 "max_iterations": eff_max_iterations,
                 "context_window_tokens": context_window_tokens,
                 "max_tool_result_chars": eff_max_tool_result_chars,
+                "max_tokens": max_tokens,
                 "model": run_model,
                 "model_preset": model_preset,
             }
@@ -485,6 +521,7 @@ class SubagentManager:
                     max_iterations=eff_max_iterations,
                     max_tool_result_chars=eff_max_tool_result_chars,
                     context_window_tokens=context_window_tokens,
+                    max_tokens=max_tokens,
                     hook=_SubagentHook(task_id, status),
                     max_iterations_message="Task ended without a verified final synthesis.",
                     finalize_on_max_iterations=True,

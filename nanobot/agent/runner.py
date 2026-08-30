@@ -684,7 +684,15 @@ class AgentRunner:
                     usage,
                 )
             if final_content is None:
+                # The forced no-tools finalization produced no final answer,
+                # so the run stays incomplete with the explicit fallback.
                 final_content = self._max_iterations_fallback(spec)
+            else:
+                # The budget-exhausted finalization produced a genuine final
+                # response, so the run settles as completed instead of
+                # retaining stop_reason="max_iterations" (which downstream
+                # consumers announce/record as incomplete).
+                stop_reason = "completed"
             self._append_final_message(messages, final_content)
 
         return AgentRunResult(

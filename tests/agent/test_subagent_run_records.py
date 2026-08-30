@@ -208,6 +208,60 @@ class TestSubagentRunRecord:
         assert rec["model_preset"] == "careful"
 
     @pytest.mark.asyncio
+    async def test_record_persists_per_spawn_max_tokens_override(self, tmp_path):
+        sm = _manager(tmp_path)
+        sm.runner.run = AsyncMock(return_value=AgentRunResult(
+            final_content="ok", messages=[], stop_reason="completed",
+        ))
+
+        with patch.object(sm, "_announce_result", new_callable=AsyncMock):
+            await sm._run_subagent(
+                "t1", "do task", "label",
+                {"channel": "cli", "chat_id": "direct"},
+                _status(),
+                max_tokens=4096,
+            )
+
+        rec = _read_record(tmp_path, "t1")
+        assert rec["params"]["max_tokens"] == 4096
+
+    @pytest.mark.asyncio
+    async def test_spawn_max_tokens_override_appears_in_record_exactly(self, tmp_path):
+        """max_tokens passed through spawn() must land verbatim in the record."""
+        sm = _manager(tmp_path)
+        sm.runner.run = AsyncMock(return_value=AgentRunResult(
+            final_content="done", messages=[], stop_reason="completed",
+        ))
+        response = await sm.spawn("do task", session_key="cli:record", max_tokens=2048)
+        task_id = response.split("id: ", 1)[1].split(")", 1)[0]
+        await asyncio.sleep(0)
+        await asyncio.gather(*sm._running_tasks.values(), return_exceptions=True)
+
+        rec = _read_record(tmp_path, task_id)
+        assert rec["params"]["max_tokens"] == 2048
+
+    @pytest.mark.asyncio
+    async def test_budget_exhausted_but_finalized_record_shows_completed(self, tmp_path):
+        """A run whose finalization produced a final answer persists as completed."""
+        sm = _manager(tmp_path)
+        sm.runner.run = AsyncMock(return_value=AgentRunResult(
+            final_content="Final synthesis.",
+            messages=[],
+            stop_reason="completed",
+        ))
+
+        with patch.object(sm, "_announce_result", new_callable=AsyncMock):
+            await sm._run_subagent(
+                "t1", "do task", "label",
+                {"channel": "cli", "chat_id": "direct"}, _status(),
+            )
+
+        rec = _read_record(tmp_path, "t1")
+        assert rec["stop_reason"] == "completed"
+        assert rec["phase"] == "completed"
+        assert rec["result"] == "Final synthesis."
+
+    @pytest.mark.asyncio
     async def test_record_persists_task_relevant_context_decisions(self, tmp_path):
         (tmp_path / "rules.md").write_text("nanobot repository rules", encoding="utf-8")
         (tmp_path / "context-manifest.json").write_text(

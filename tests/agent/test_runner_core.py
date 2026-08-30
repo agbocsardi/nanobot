@@ -154,7 +154,9 @@ async def test_runner_uses_no_tools_finalization_after_max_iterations():
         max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
     ))
 
-    assert result.stop_reason == "max_iterations"
+    # The forced no-tools finalization produced a real final response, so the
+    # run settles as completed rather than retaining stop_reason=max_iterations.
+    assert result.stop_reason == "completed"
     assert result.final_content == "Read the directory twice. More investigation remains."
     assert result.messages[-1] == {
         "role": "assistant",
@@ -163,6 +165,54 @@ async def test_runner_uses_no_tools_finalization_after_max_iterations():
     assert len(calls) == 3
     assert calls[-1]["tools"] is None
     assert "tool-call budget" in calls[-1]["messages"][-1]["content"]
+    assert tools.execute.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_runner_blank_finalization_after_max_iterations_stays_incomplete():
+    """A no-tools finalization that returns blank text keeps the run incomplete.
+
+    The budget-exhausted finalization must only upgrade a run to completed when
+    it actually produced a final answer; otherwise the fallback message is used
+    and the run retains stop_reason=max_iterations.
+    """
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
+
+    provider = MagicMock(spec=LLMProvider)
+    calls: list[dict] = []
+
+    async def chat_with_retry(*, messages, tools=None, **kwargs):
+        calls.append({"messages": messages, "tools": tools})
+        if len(calls) <= 2:
+            return LLMResponse(
+                content="still working",
+                tool_calls=[
+                    ToolCallRequest(
+                        id=f"call_{len(calls)}",
+                        name="list_dir",
+                        arguments={"path": "."},
+                    )
+                ],
+            )
+        return LLMResponse(content="   ", tool_calls=[], usage={})
+
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(return_value="tool result")
+
+    runner = AgentRunner(provider)
+    result = await runner.run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "inspect the repo"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=2,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    ))
+
+    assert result.stop_reason == "max_iterations"
+    assert "maximum number of tool call iterations" in result.final_content
+    assert calls[-1]["tools"] is None
     assert tools.execute.await_count == 2
 
 
