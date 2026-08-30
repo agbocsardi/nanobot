@@ -32,3 +32,13 @@
 - Repository validation passed: Ruff clean and 2,967 pytest tests passed (one existing aiohttp deprecation warning).
 - Remaining #25 follow-up: separate agent-finished and delivery-finished timestamps, plus eventual retirement of the legacy action log.
 - Merged as `f355e16b` and pushed `origin/main`; deployment is blocked because hostname `uhl` did not resolve from this session.
+
+## Next session (same date) — #25 finish, #20 finish, #1 start
+
+- User confirmed: deploy/restart is theirs; we merge and push.
+- Created three topic branches off main 17b1f45f, each in its own git worktree:
+  - `feat/cron-finalize` (/home/gergo/projects/fork-nanobot-25): separate agent/delivery timestamps, retire action.jsonl transactional mutation path, crash/interleaving tests, finish #25.
+  - `feat/delegated-run-finalize` (/home/gergo/projects/fork-nanobot-20): final-synthesis terminal semantics, per-spawn token budget override, queue-full structured rejection, tests, finish #20.
+  - `feat/memory-search` (/home/gergo/projects/fork-nanobot-1): built-in memory_search tool (exact search, structured filters, memory-file search, read-only), start #1.
+- Spawned three Luna workers (cron-finalize, delegated-finalize, memory-search-tool); each syncs its own venv, works only in its worktree, and does not commit.
+- After workers reply: review diffs, validate, merge each branch into main, push, post issue comments/closures, update TODO.
