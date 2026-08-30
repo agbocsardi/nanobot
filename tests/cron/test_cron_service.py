@@ -831,3 +831,85 @@ async def test_list_jobs_during_on_job_does_not_cause_stale_reload(tmp_path) -> 
         next_run = j["state"]["nextRunAtMs"]
         assert next_run is not None
         assert next_run > now_ms, f"Job '{j['name']}' next_run should be in the future"
+
+
+@pytest.mark.asyncio
+async def test_run_record_has_diagnostic_timestamps_and_old_history_compatibility(tmp_path):
+    store_path = tmp_path / "cron" / "jobs.json"
+    service = CronService(store_path, on_job=lambda _: asyncio.sleep(0))
+    job = service.add_job("diagnostic", CronSchedule(kind="every", every_ms=60_000), "hello")
+    await service.run_job(job.id)
+    record = service.get_job(job.id).state.run_history[0]
+    assert record.scheduled_at_ms is not None
+    assert record.detected_at_ms is not None
+    assert record.started_at_ms is not None
+    assert record.finished_at_ms is not None
+    assert record.detected_at_ms <= record.started_at_ms <= record.finished_at_ms
+
+    raw = json.loads(store_path.read_text())
+    raw["jobs"][0]["state"]["runHistory"] = [{"runAtMs": 7, "status": "ok"}]
+    store_path.write_text(json.dumps(raw))
+    old = CronService(store_path).get_job(job.id).state.run_history[0]
+    assert old.run_at_ms == 7
+    assert old.started_at_ms == 7
+
+
+def test_misfire_policy_is_persisted_with_safe_defaults(tmp_path):
+    path = tmp_path / "cron" / "jobs.json"
+    service = CronService(path)
+    job = service.add_job("default", CronSchedule(kind="every", every_ms=1000), "x")
+    assert job.misfire_policy == "coalesce"
+    assert job.misfire_grace_ms == 60_000
+    service._running = True
+    service._save_store()
+    loaded = CronService(path).get_job(job.id)
+    assert loaded.misfire_policy == "coalesce"
+    assert loaded.misfire_grace_ms == 60_000
+
+
+@pytest.mark.asyncio
+async def test_skip_misfire_records_without_callback(tmp_path):
+    called = []
+    service = CronService(tmp_path / "cron" / "jobs.json", on_job=lambda j: (called.append(j.id), asyncio.sleep(0))[1])
+    service._running = True
+    service._load_store()
+    job = service.add_job("late", CronSchedule(kind="every", every_ms=1000), "x", misfire_policy="skip", misfire_grace_ms=0)
+    job.state.next_run_at_ms = 1
+    service._running = True
+    service._save_store()
+    service._arm_timer = lambda: None
+    await service._on_timer()
+    assert called == []
+    assert service.get_job(job.id).state.run_history[-1].status == "skipped"
+
+
+
+
+@pytest.mark.asyncio
+async def test_due_jobs_are_started_independently_with_bounded_concurrency(tmp_path, monkeypatch):
+    now = 1_000
+    monkeypatch.setattr("nanobot.cron.service._now_ms", lambda: now)
+    started = []
+    release = asyncio.Event()
+    other_started = asyncio.Event()
+
+    async def callback(job):
+        started.append(job.name)
+        if job.name == "blocked":
+            await release.wait()
+        else:
+            other_started.set()
+
+    service = CronService(tmp_path / "cron" / "jobs.json", on_job=callback, max_concurrency=2)
+    service._running = True
+    service._load_store()
+    blocked = service.add_job("blocked", CronSchedule(kind="every", every_ms=100), "x")
+    other = service.add_job("other", CronSchedule(kind="every", every_ms=100), "x")
+    tasks = [
+        asyncio.create_task(service._execute_due_job(blocked, now)),
+        asyncio.create_task(service._execute_due_job(other, now)),
+    ]
+    await asyncio.wait_for(other_started.wait(), timeout=1)
+    assert set(started) == {"blocked", "other"}
+    release.set()
+    await asyncio.gather(*tasks)

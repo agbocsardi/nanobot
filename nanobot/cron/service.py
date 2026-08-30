@@ -143,6 +143,7 @@ class CronService:
         store_path: Path,
         on_job: Callable[[CronJob], Coroutine[Any, Any, str | None]] | None = None,
         max_sleep_ms: int = 300_000,  # 5 minutes
+        max_concurrency: int = 4,
     ):
         self.store_path = store_path
         self._action_path = store_path.parent / "action.jsonl"
@@ -154,6 +155,8 @@ class CronService:
         self._running = False
         self._timer_active = False
         self.max_sleep_ms = max_sleep_ms
+        self.max_concurrency = max(1, max_concurrency)
+        self._concurrency = asyncio.Semaphore(self.max_concurrency)
 
     def _load_jobs(self) -> tuple[list[CronJob], int] | None:
         """Load jobs from disk.
@@ -225,7 +228,11 @@ class CronService:
                             last_delivery_error=j.get("state", {}).get("lastDeliveryError"),
                             run_history=[
                                 CronRunRecord(
-                                    run_at_ms=r["runAtMs"],
+                                    run_at_ms=r.get("runAtMs", r.get("startedAtMs", 0)),
+                                    scheduled_at_ms=r.get("scheduledAtMs"),
+                                    detected_at_ms=r.get("detectedAtMs"),
+                                    started_at_ms=r.get("startedAtMs", r.get("runAtMs")),
+                                    finished_at_ms=r.get("finishedAtMs"),
                                     status=r["status"],
                                     duration_ms=r.get("durationMs", 0),
                                     error=r.get("error"),
@@ -238,6 +245,8 @@ class CronService:
                         created_at_ms=j.get("createdAtMs", 0),
                         updated_at_ms=j.get("updatedAtMs", 0),
                         delete_after_run=j.get("deleteAfterRun", False),
+                        misfire_policy=j.get("misfirePolicy", j.get("misfire_policy", "coalesce")),
+                        misfire_grace_ms=j.get("misfireGraceMs", j.get("misfire_grace_ms", 60_000)),
                     )
                     _normalize_agent_turn_job(job)
                     jobs.append(job)
@@ -369,6 +378,10 @@ class CronService:
                         "runHistory": [
                             {
                                 "runAtMs": r.run_at_ms,
+                                "scheduledAtMs": r.scheduled_at_ms,
+                                "detectedAtMs": r.detected_at_ms,
+                                "startedAtMs": r.started_at_ms,
+                                "finishedAtMs": r.finished_at_ms,
                                 "status": r.status,
                                 "durationMs": r.duration_ms,
                                 "error": r.error,
@@ -381,6 +394,8 @@ class CronService:
                     "createdAtMs": j.created_at_ms,
                     "updatedAtMs": j.updated_at_ms,
                     "deleteAfterRun": j.delete_after_run,
+                    "misfirePolicy": j.misfire_policy,
+                    "misfireGraceMs": j.misfire_grace_ms,
                 }
                 for j in self._store.jobs
             ]
@@ -464,7 +479,9 @@ class CronService:
             return
         now = _now_ms()
         for job in self._store.jobs:
-            if job.enabled:
+            if job.enabled and job.state.next_run_at_ms is None:
+                # Keep an overdue occurrence so restart handling can apply the
+                # persisted misfire policy instead of silently dropping it.
                 job.state.next_run_at_ms = _compute_next_run(job.schedule, now)
 
     def _get_next_wake_ms(self) -> int | None:
@@ -515,16 +532,62 @@ class CronService:
                 if j.enabled and j.state.next_run_at_ms and now >= j.state.next_run_at_ms
             ]
 
-            for job in due_jobs:
-                await self._execute_job(job)
-
+            # Snapshot due jobs: each gets an independent task, bounded by a
+            # semaphore, so a slow callback cannot prevent other jobs starting.
+            tasks = [asyncio.create_task(self._execute_due_job(j, now)) for j in due_jobs]
+            if tasks:
+                await asyncio.gather(*tasks)
             self._save_store()
         finally:
             self._timer_active = False
         self._arm_timer()
 
-    async def _execute_job(self, job: CronJob) -> None:
+    def _advance_schedule(self, job: CronJob, scheduled_ms: int | None) -> None:
+        if job.schedule.kind == "every" and scheduled_ms is not None and job.schedule.every_ms:
+            # Keep the phase stable. Coalescing intentionally skips missed slots.
+            job.state.next_run_at_ms = scheduled_ms + job.schedule.every_ms
+            now_ms = _now_ms()
+            if job.state.next_run_at_ms <= now_ms:
+                missed = (now_ms - job.state.next_run_at_ms) // job.schedule.every_ms + 1
+                job.state.next_run_at_ms += missed * job.schedule.every_ms
+        elif scheduled_ms is not None and job.schedule.kind == "cron":
+            # Coalescing skips every missed calendar occurrence and schedules
+            # the first occurrence after the detection time.
+            job.state.next_run_at_ms = _compute_next_run(job.schedule, max(scheduled_ms, _now_ms()))
+        else:
+            job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
+
+    async def _execute_due_job(self, job: CronJob, detected_ms: int) -> None:
+        scheduled_ms = job.state.next_run_at_ms
+        if scheduled_ms is None:
+            return
+        late = detected_ms - scheduled_ms
+        if late > max(0, job.misfire_grace_ms) and job.misfire_policy == "skip":
+            job.state.last_status = "skipped"
+            job.state.last_error = f"misfire: {late}ms late"
+            job.state.last_run_at_ms = detected_ms
+            job.state.run_history.append(CronRunRecord(
+                run_at_ms=detected_ms, scheduled_at_ms=scheduled_ms,
+                detected_at_ms=detected_ms, started_at_ms=None,
+                finished_at_ms=detected_ms, status="skipped", error=job.state.last_error,
+            ))
+            job.state.run_history = job.state.run_history[-self._MAX_RUN_HISTORY:]
+            if job.schedule.kind == "at":
+                if job.delete_after_run:
+                    self._store.jobs = [j for j in self._store.jobs if j.id != job.id]
+                else:
+                    job.enabled = False
+                    job.state.next_run_at_ms = None
+            else:
+                self._advance_schedule(job, scheduled_ms)
+            return
+        async with self._concurrency:
+            await self._execute_job(job, scheduled_ms, detected_ms)
+
+    async def _execute_job(self, job: CronJob, scheduled_ms: int | None = None, detected_ms: int | None = None) -> None:
         """Execute a single job."""
+        detected_ms = detected_ms if detected_ms is not None else _now_ms()
+        scheduled_ms = scheduled_ms if scheduled_ms is not None else job.state.next_run_at_ms
         start_ms = _now_ms()
         logger.info("Cron: executing job '{}' ({})", job.name, job.id)
 
@@ -558,6 +621,10 @@ class CronService:
 
         job.state.run_history.append(CronRunRecord(
             run_at_ms=start_ms,
+            scheduled_at_ms=scheduled_ms,
+            detected_at_ms=detected_ms,
+            started_at_ms=start_ms,
+            finished_at_ms=end_ms,
             status=job.state.last_status,
             duration_ms=end_ms - start_ms,
             error=job.state.last_error,
@@ -574,8 +641,8 @@ class CronService:
                 job.enabled = False
                 job.state.next_run_at_ms = None
         else:
-            # Compute next run
-            job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
+            # Advance from the scheduled occurrence, not completion time.
+            self._advance_schedule(job, scheduled_ms)
 
     def _append_action(self, action: Literal["add", "del", "update"], params: dict):
         self.store_path.parent.mkdir(parents=True, exist_ok=True)
@@ -623,9 +690,15 @@ class CronService:
         silent: bool = False,
         model_preset: str | None = None,
         isolated: bool = True,
+        misfire_policy: Literal["skip", "coalesce"] = "coalesce",
+        misfire_grace_ms: int = 60_000,
     ) -> CronJob:
         """Add a new job."""
         _validate_schedule_for_add(schedule)
+        if misfire_policy not in ("skip", "coalesce"):
+            raise ValueError("misfire_policy must be 'skip' or 'coalesce'")
+        if misfire_grace_ms < 0:
+            raise ValueError("misfire_grace_ms must be non-negative")
         now = _now_ms()
 
         job = CronJob(
@@ -652,6 +725,8 @@ class CronService:
             created_at_ms=now,
             updated_at_ms=now,
             delete_after_run=delete_after_run,
+            misfire_policy=misfire_policy,
+            misfire_grace_ms=misfire_grace_ms,
         )
         _normalize_agent_turn_job(job)
         if self._running:
@@ -736,6 +811,8 @@ class CronService:
         delete_after_run: bool | None = None,
         silent: bool | None = None,
         isolated: bool | None = None,
+        misfire_policy: Literal["skip", "coalesce"] | None = None,
+        misfire_grace_ms: int | None = None,
     ) -> CronJob | Literal["not_found", "protected"]:
         """Update mutable fields of an existing job. System jobs cannot be updated.
 
@@ -768,6 +845,14 @@ class CronService:
             job.payload.silent = silent
         if isolated is not None:
             job.payload.isolated = isolated
+        if misfire_policy is not None:
+            if misfire_policy not in ("skip", "coalesce"):
+                raise ValueError("misfire_policy must be 'skip' or 'coalesce'")
+            job.misfire_policy = misfire_policy
+        if misfire_grace_ms is not None:
+            if misfire_grace_ms < 0:
+                raise ValueError("misfire_grace_ms must be non-negative")
+            job.misfire_grace_ms = misfire_grace_ms
         _normalize_agent_turn_job(job)
 
         job.updated_at_ms = _now_ms()
