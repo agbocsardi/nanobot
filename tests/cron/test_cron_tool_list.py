@@ -1,5 +1,6 @@
 """Tests for CronTool._list_jobs() output formatting."""
 
+import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -9,7 +10,7 @@ from nanobot.agent.tools.base import ToolResult
 from nanobot.agent.tools.context import RequestContext
 from nanobot.agent.tools.cron import CronTool
 from nanobot.cron.service import CronService
-from nanobot.cron.types import CronJob, CronJobState, CronPayload, CronSchedule
+from nanobot.cron.types import CronJob, CronJobState, CronPayload, CronRunRecord, CronSchedule
 
 
 def _make_tool(tmp_path) -> CronTool:
@@ -494,3 +495,64 @@ def test_list_excludes_disabled_jobs(tmp_path) -> None:
     result = tool._list_jobs()
     assert "Paused job" not in result
     assert result == "No scheduled jobs."
+
+
+def test_list_structured_data_includes_diagnostics_and_claim_without_secrets(tmp_path) -> None:
+    tool = _make_tool(tmp_path)
+    job = tool._cron.add_job(name="diagnostic", schedule=CronSchedule(kind="every", every_ms=60000), message="x",
+                             misfire_policy="skip", misfire_grace_ms=5000)
+    stored = tool._cron._load_store().jobs[0]
+    stored.state.next_run_at_ms = 1000
+    stored.state.run_history.append(CronRunRecord(
+        scheduled_at_ms=1000, detected_at_ms=9000, started_at_ms=9001, finished_at_ms=9010,
+        status="skipped", error="late"))
+    tool._cron._save_store()
+    tool._cron._action_path.write_text("")
+    tool._cron._running = True
+    tool._cron._claims_path.write_text(json.dumps({f"{job.id}:1000": {
+        "job_id": job.id, "scheduled_at_ms": 1000, "owner": "secret-owner", "token": "secret-token",
+        "lease_expires_at_ms": 9999999999999}}))
+    result = tool._list_jobs()
+    data = result.data["jobs"][0]
+    assert data["misfire_grace_seconds"] == 5
+    assert data["last_run"]["late_by_ms"] == 8000
+    assert data["last_run"]["status"] == "skipped"
+    assert data["claim"]["status"] == "active"
+    assert "secret" not in repr(data)
+
+
+def test_list_surfaces_delivery_failure_in_text_and_structured_data(tmp_path) -> None:
+    tool = _make_tool(tmp_path)
+    job = tool._cron.add_job(
+        name="delivery failure",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="x",
+    )
+    stored = tool._cron.get_job(job.id)
+    assert stored is not None
+    stored.state.last_run_at_ms = 2_000
+    stored.state.last_status = "error"
+    stored.state.last_delivery_status = "failed"
+    stored.state.last_delivery_error = "channel unavailable"
+    stored.state.run_history.append(
+        CronRunRecord(
+            run_at_ms=2_000,
+            scheduled_at_ms=1_000,
+            detected_at_ms=1_500,
+            started_at_ms=2_000,
+            finished_at_ms=2_100,
+            status="error",
+            delivery_status="failed",
+            delivery_error="channel unavailable",
+        )
+    )
+    tool._cron._action_path.write_text("", encoding="utf-8")
+    tool._cron._save_store()
+
+    result = tool._list_jobs()
+
+    assert "Last delivery: failed (channel unavailable)" in result
+    data = result.data["jobs"][0]
+    assert data["last_delivery_status"] == "failed"
+    assert data["last_delivery_error"] == "channel unavailable"
+    assert data["last_run"]["delivery_status"] == "failed"

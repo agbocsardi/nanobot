@@ -155,3 +155,34 @@ class TestModelPresetValidation:
             action="add", message="m", every_seconds=60
         ))
         assert "Created job" in out
+
+
+def test_add_forwards_misfire_policy_and_grace_seconds() -> None:
+    import asyncio
+    captured = {}
+    class Capturing(_SvcStub):
+        def add_job(self, **kwargs):
+            captured.update(kwargs)
+            return super().add_job(**kwargs)
+    tool = CronTool(Capturing())
+    tool.set_context(RequestContext(channel="c", chat_id="d", session_key="c:d"))
+    out = asyncio.run(tool.execute(action="add", message="m", every_seconds=60,
+                                   misfire_policy="skip", misfire_grace_seconds=7))
+    assert "Created job" in out
+    assert captured["misfire_policy"] == "skip"
+    assert captured["misfire_grace_ms"] == 7000
+
+
+def test_schema_advertises_misfire_controls() -> None:
+    tool = CronTool(_SvcStub())
+    props = tool.parameters["properties"]
+    assert props["misfire_policy"]["enum"] == ["skip", "coalesce"]
+    assert props["misfire_grace_seconds"]["minimum"] == 0
+
+
+def test_add_rejects_negative_misfire_grace() -> None:
+    import asyncio
+    tool = CronTool(_SvcStub())
+    tool.set_context(RequestContext(channel="c", chat_id="d", session_key="c:d"))
+    out = asyncio.run(tool.execute(action="add", message="m", every_seconds=60, misfire_grace_seconds=-1))
+    assert "nonnegative" in out

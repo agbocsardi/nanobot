@@ -145,6 +145,7 @@ class CronService:
         on_job: Callable[[CronJob], Coroutine[Any, Any, str | None]] | None = None,
         max_sleep_ms: int = 300_000,  # 5 minutes
         max_concurrency: int = 4,
+        job_timeout_s: float = 300,
     ):
         self.store_path = store_path
         self._action_path = store_path.parent / "action.jsonl"
@@ -160,6 +161,7 @@ class CronService:
         self._timer_active = False
         self.max_sleep_ms = max_sleep_ms
         self.max_concurrency = max(1, max_concurrency)
+        self.job_timeout_s = max(0.001, float(job_timeout_s))
         self._concurrency = asyncio.Semaphore(self.max_concurrency)
 
     def _load_jobs(self) -> tuple[list[CronJob], int] | None:
@@ -602,7 +604,7 @@ class CronService:
 
         try:
             if self.on_job:
-                await self.on_job(job)
+                await asyncio.wait_for(self.on_job(job), timeout=self.job_timeout_s)
 
             job.state.last_status = "ok"
             job.state.last_error = None
@@ -619,6 +621,10 @@ class CronService:
             job.state.last_status = "error"
             job.state.last_error = str(e) or e.__class__.__name__
             logger.exception("Cron: job '{}' was cancelled", job.name)
+        except TimeoutError:
+            job.state.last_status = "error"
+            job.state.last_error = f"job timed out after {self.job_timeout_s:g}s"
+            logger.error("Cron: job '{}' timed out", job.name)
         except Exception as e:
             job.state.last_status = "error"
             job.state.last_error = str(e)
@@ -1049,6 +1055,23 @@ class CronService:
         """Get a job by ID."""
         store = self._load_store()
         return next((j for j in store.jobs if j.id == job_id), None)
+
+    def claim_status(self, job_id: str, scheduled_ms: int | None = None) -> dict[str, Any]:
+        """Return safe, secret-free claim state for inspection."""
+        now = _now_ms()
+        try:
+            claims = self._read_claims()
+        except RuntimeError:
+            return {"status": "unknown"}
+        matches = [c for c in claims.values() if c.get("job_id") == job_id and
+                   (scheduled_ms is None or c.get("scheduled_at_ms") == scheduled_ms)]
+        if not matches:
+            return {"status": "none"}
+        claim = max(matches, key=lambda c: int(c.get("lease_expires_at_ms", 0)))
+        expires = int(claim.get("lease_expires_at_ms", 0))
+        return {"status": "active" if expires > now else "expired",
+                "scheduled_at_ms": claim.get("scheduled_at_ms"),
+                "lease_expires_at_ms": expires}
 
     def status(self) -> dict:
         """Get service status."""

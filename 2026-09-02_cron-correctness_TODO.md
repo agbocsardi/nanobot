@@ -7,8 +7,8 @@
 - [x] Correct stale README claims without adding fork productization
 - [x] Add minimal GitHub Actions CI for Ruff and pytest
 - [x] Design #25 misfire, claim/lease, bounded concurrency, and diagnostics behavior
-- [ ] Implement and test the agreed #25 correctness tranche
-- [ ] Run targeted and full validation
+- [x] Implement and test the agreed #25 correctness tranche
+- [x] Run targeted and full validation
 - [ ] Commit, merge to `main`, push, and deploy to `uhl`
 
 ## Log
@@ -23,3 +23,10 @@
 - Confirmed #25 needs staged misfire/diagnostics, bounded concurrency, and transactional claim work; stage 1 implementation is in progress.
 - Replaced the stale upstream-facing README with an accurate private-fork overview and source workflow.
 - Added minimal GitHub Actions CI for Ruff and pytest.
+
+- Added durable per-occurrence claims in `23abface`, with lease renewal, expiry recovery, token-fenced completion, and fresh-state merging.
+- Added nine focused claim tests; the full cron suite now passes 120 tests.
+- Started stage 3 to expose misfire controls, diagnostic timestamps, delivery outcomes, and claim state through cron inspection.
+- Exposed misfire controls and secret-free claim/lease diagnostics through `cron list`; added timeout and delivery-failure coverage.
+- Repository validation passed: Ruff clean and 2,967 pytest tests passed (one existing aiohttp deprecation warning).
+- Remaining #25 follow-up: separate agent-finished and delivery-finished timestamps, plus eventual retirement of the legacy action log.

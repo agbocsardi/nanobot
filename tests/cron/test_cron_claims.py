@@ -192,3 +192,40 @@ def test_stale_finalizer_does_not_consume_pending_actions(tmp_path, monkeypatch)
 
     assert not first._finalize_claim(old[0], 1_000, old[1])
     assert editor._action_path.read_text(encoding="utf-8") == action_before
+
+
+def test_claim_status_is_secret_free_and_reports_active_and_expired(tmp_path, monkeypatch):
+    monkeypatch.setattr("nanobot.cron.service._now_ms", lambda: 1000)
+    service = _service(tmp_path)
+    job = service.add_job("x", CronSchedule(kind="every", every_ms=100), "x")
+    service._claims_path.write_text(json.dumps({"k": {"job_id": job.id, "scheduled_at_ms": 2, "token": "secret", "owner": "secret", "lease_expires_at_ms": 2000}}))
+    active = service.claim_status(job.id, 2)
+    assert active == {"status": "active", "scheduled_at_ms": 2, "lease_expires_at_ms": 2000}
+    monkeypatch.setattr("nanobot.cron.service._now_ms", lambda: 3000)
+    assert service.claim_status(job.id, 2)["status"] == "expired"
+
+
+def test_claim_status_corrupt_is_unknown(tmp_path):
+    service = _service(tmp_path)
+    service._claims_path.write_text("not-json")
+    assert service.claim_status("missing")["status"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_claimed_job_timeout_records_error_and_releases_claim(tmp_path, monkeypatch):
+    monkeypatch.setattr("nanobot.cron.service._now_ms", lambda: 1_000)
+
+    async def blocked(_job):
+        await asyncio.Event().wait()
+
+    service = CronService(tmp_path / "jobs.json", on_job=blocked, job_timeout_s=0.01)
+    job = service.add_job("blocked", CronSchedule(kind="every", every_ms=100), "x")
+    due = _due(service, job.id, 1_000)
+
+    await service._execute_due_job(due, 1_000)
+
+    stored = CronService(service.store_path).get_job(job.id)
+    assert stored is not None
+    assert stored.state.last_status == "error"
+    assert stored.state.last_error == "job timed out after 0.01s"
+    assert service.claim_status(job.id, 1_000)["status"] == "none"
