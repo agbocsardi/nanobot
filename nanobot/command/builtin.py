@@ -37,6 +37,13 @@ class BuiltinCommandSpec:
 
 BUILTIN_COMMAND_SPECS: tuple[BuiltinCommandSpec, ...] = (
     BuiltinCommandSpec(
+        "/policy",
+        "Policy approvals",
+        "List, approve or deny pending tool-policy approvals.",
+        "shield-check",
+        arg_hint="[approve|deny <token>]",
+    ),
+    BuiltinCommandSpec(
         "/new",
         "New chat",
         "Stop the current task and start a fresh conversation.",
@@ -673,6 +680,93 @@ async def cmd_pairing(ctx: CommandContext) -> OutboundMessage:
     )
 
 
+async def cmd_policy(ctx: CommandContext) -> OutboundMessage:
+    """List, approve or deny pending tool-policy approvals for this session."""
+    loop = ctx.loop
+    content: str
+    if loop is None or not hasattr(loop, "approval_store"):
+        content = "Policy approvals are not available in this context."
+    else:
+        store = loop.approval_store(ctx.key)
+        action, _, token = ctx.args.partition(" ")
+        token = token.strip()
+        if not ctx.args.strip() or action in {"help", "-h", "--help"}:
+            pending = store.pending_list()
+            if not pending:
+                content = (
+                    "No pending tool-policy approvals for this session. "
+                    "An ask rule will emit one when it blocks a tool call."
+                )
+            else:
+                lines = [f"Pending policy approvals ({len(pending)}):", ""]
+                for item in pending:
+                    resource = f" {item.resource}" if item.resource else ""
+                    lines.append(
+                        f"- `{item.token}` — rule `{item.rule_id}`, "
+                        f"tool `{item.tool}`{resource} (requested {_format_age(item.requested_at)})"
+                    )
+                content = "\n".join(lines) + (
+                    "\n\nApprove with `/policy approve <token|rule>` or "
+                    "deny with `/policy deny <token|rule>`."
+                )
+        elif action in {"approve", "allow"}:
+            if not token:
+                content = "Usage: `/policy approve <token|rule-id>`"
+            else:
+                resolution = store.approve(token)
+                if resolution is None:
+                    content = _policy_unknown_token_message(store, token)
+                else:
+                    content = (
+                        f"Approved rule `{resolution.rule_id}` for tool "
+                        f"`{resolution.tool}` (token `{resolution.token}`). "
+                        f"The decision is cached for {resolution.cache_ttl_s:.0f}s "
+                        "in this session; the same call will not be re-prompted."
+                    )
+        elif action in {"deny", "block"}:
+            if not token:
+                content = "Usage: `/policy deny <token|rule-id>`"
+            else:
+                resolution = store.deny(token)
+                if resolution is None:
+                    content = _policy_unknown_token_message(store, token)
+                else:
+                    content = (
+                        f"Denied rule `{resolution.rule_id}` for tool "
+                        f"`{resolution.tool}` (token `{resolution.token}`). "
+                        "Matching calls are blocked like a deny rule for "
+                        f"{resolution.cache_ttl_s:.0f}s in this session."
+                    )
+        else:
+            content = (
+                "Usage: `/policy` (list), `/policy approve <token|rule-id>`, "
+                "`/policy deny <token|rule-id>`."
+            )
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content=content,
+        metadata=dict(ctx.msg.metadata or {}),
+    )
+
+
+def _format_age(epoch: float) -> str:
+    age = max(0, time.time() - epoch)
+    if age < 60:
+        return f"{age:.0f}s ago"
+    return f"{age / 60:.1f}m ago"
+
+
+def _policy_unknown_token_message(store, token: str) -> str:
+    pending = store.pending_list()
+    if not pending:
+        return f"No pending approval matches `{token}` (none pending)."
+    lines = [f"No valid pending approval matches `{token}`. Pending:", ""]
+    for item in pending:
+        lines.append(f"- `{item.token}` — rule `{item.rule_id}`, tool `{item.tool}`")
+    return "\n".join(lines)
+
+
 async def cmd_skill(ctx: CommandContext) -> OutboundMessage:
     """List all enabled skills (name and description only)."""
     loop = ctx.loop
@@ -735,3 +829,5 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.exact("/help", cmd_help)
     router.exact("/pairing", cmd_pairing)
     router.prefix("/pairing ", cmd_pairing)
+    router.exact("/policy", cmd_policy)
+    router.prefix("/policy ", cmd_policy)

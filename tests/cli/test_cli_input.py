@@ -311,3 +311,10 @@ def test_render_interactive_ansi_force_terminal_follows_isatty():
     with patch.object(sys.stdout, "isatty", return_value=False):
         commands._render_interactive_ansi(render_fn)
         assert captured["console"]._force_terminal is False
+
+
+def test_cli_interactive_metadata_stamps_foreground_mode():
+    """Interactive CLI publishes streamed, foreground-mode turns for policy."""
+    metadata = commands._cli_interactive_metadata()
+    assert metadata["_wants_stream"] is True
+    assert metadata["_interaction_mode"] == "foreground"

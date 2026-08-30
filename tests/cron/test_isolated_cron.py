@@ -291,3 +291,20 @@ if __name__ == "__main__":
     asyncio.run(test_isolated_records_error_and_reraises_when_turn_raises())
     test_default_isolated_true_for_legacy_payload()
     print("OK")
+
+
+@pytest.mark.asyncio
+async def test_isolated_cron_run_stamps_cron_mode() -> None:
+    """Isolated cron runs propagate mode=cron into process_direct metadata."""
+    from nanobot.cron.session_turns import is_cron_turn
+
+    agent = _FakeAgent(content="done")
+    job = _job(silent=False)
+    _, deliver = _make_deliver()
+
+    await run_isolated_cron_job(job, agent=agent, cron=_FakeRecorder(), deliver=deliver)
+
+    assert len(agent.process_direct_calls) == 1
+    call = agent.process_direct_calls[0]
+    assert call.get("metadata", {}).get("_interaction_mode") == "cron"
+    assert is_cron_turn(call.get("metadata", {})) is False  # isolated: no trigger meta

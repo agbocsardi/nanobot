@@ -61,6 +61,7 @@ If a local `nanobot agent` session can already answer normally, you can also ask
 | Area | Read | Best for |
 |---|---|---|
 | Full configuration schema | [`configuration.md`](./configuration.md) | Exact fields, defaults, provider tables, web tools, MCP, security, and runtime options |
+| Tool policy rules & approvals | [`tool-policies.md`](./tool-policies.md) | Declarative allow/deny/ask rules, interaction modes, audit/exploration defaults, `/policy` approvals |
 | CLI commands | [`cli-reference.md`](./cli-reference.md) | Command names, common flags, and entrypoints |
 | Architecture | [`architecture.md`](./architecture.md) | Source-level runtime map for core flow, providers, channels, tools, WebUI, memory, security, and extension points |
 | Development | [`development.md`](./development.md) | Contributor notes for adding providers and transcription adapters |

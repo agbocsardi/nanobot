@@ -56,6 +56,7 @@ class BoundCronAgent(Protocol):
         run_provider: Any = None,
         run_model: str | None = None,
         run_context_window_tokens: int | None = None,
+        metadata: dict | None = None,
     ) -> OutboundMessage | None:
         ...
 
@@ -126,6 +127,8 @@ async def run_bound_cron_job(
             f"Scheduled cron job triggered: {job.name}\n\n{job.payload.message}"
         ),
     }
+    # Mode for policy rules: scheduled cron turns are mode=cron.
+    metadata["_interaction_mode"] = "cron"
     metadata[CRON_DEFER_UNTIL_IDLE_META] = True
     # Per-job model preset wins over the global cron snapshot; fall back to
     # the global snapshot (then the main model) if resolution fails.
@@ -309,6 +312,7 @@ async def run_isolated_cron_job(
             chat_id=chat_id,
             on_progress=_async_noop,
             ephemeral=True,
+            metadata={"_interaction_mode": "cron"},
             run_provider=(snapshot.get("provider") if snapshot else None),
             run_model=(snapshot.get("model") if snapshot else None),
             run_context_window_tokens=(

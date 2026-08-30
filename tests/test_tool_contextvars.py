@@ -283,7 +283,7 @@ async def test_webui_cron_tool_uses_origin_session_when_unified_enabled(tmp_path
     assert jobs[0].payload.session_key == "websocket:chat-123"
     assert jobs[0].payload.origin_channel == "websocket"
     assert jobs[0].payload.origin_chat_id == "chat-123"
-    assert jobs[0].payload.origin_metadata == {"webui": True}
+    assert jobs[0].payload.origin_metadata == {"webui": True, "interaction_mode": "foreground"}
 
 
 @pytest.mark.asyncio

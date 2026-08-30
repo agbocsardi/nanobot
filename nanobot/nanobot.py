@@ -74,6 +74,7 @@ class Nanobot:
         *,
         session_key: str = "sdk:default",
         hooks: list[AgentHook] | None = None,
+        mode: str | None = None,
     ) -> RunResult:
         """Run the agent once and return the result.
 
@@ -82,15 +83,20 @@ class Nanobot:
             session_key: Session identifier for conversation isolation.
                 Different keys get independent history.
             hooks: Optional lifecycle hooks for this run.
+            mode: Interaction mode for the run (audit, exploration, cron,
+                heartbeat, delegated, ...). Policy rules match it
+                deterministically; audit/exploration defaults are applied when
+                the corresponding tools config flags are enabled.
         """
         capture = SDKCaptureHook()
         prev = self._loop._extra_hooks
         base_hooks = list(hooks) if hooks is not None else list(prev or [])
         self._loop._extra_hooks = [capture, *base_hooks]
         try:
-            response = await self._loop.process_direct(
-                message, session_key=session_key,
-            )
+            kwargs: dict[str, Any] = {"session_key": session_key}
+            if mode is not None:
+                kwargs["metadata"] = {"interaction_mode": mode}
+            response = await self._loop.process_direct(message, **kwargs)
         finally:
             self._loop._extra_hooks = prev
 

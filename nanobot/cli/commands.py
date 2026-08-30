@@ -381,6 +381,15 @@ async def _maybe_print_interactive_progress(
     return True
 
 
+def _cli_interactive_metadata() -> dict[str, Any]:
+    """Metadata for interactive CLI turns.
+
+    Streams progressively and stamps the foreground policy interaction mode so
+    policy rules match CLI turns deterministically.
+    """
+    return {"_wants_stream": True, "_interaction_mode": "foreground"}
+
+
 def _is_exit_command(command: str) -> bool:
     """Return True when input should end interactive chat."""
     return command.lower() in EXIT_COMMANDS
@@ -819,6 +828,7 @@ def _run_gateway(
                         ephemeral=True,
                         tools=store.build_dream_tools(),
                         on_progress=_silent,
+                        metadata={"_interaction_mode": "cron"},
                         run_provider=(dream_snapshot.provider if dream_snapshot else None),
                         run_model=(dream_snapshot.model if dream_snapshot else None),
                         run_context_window_tokens=(
@@ -896,6 +906,7 @@ def _run_gateway(
                     channel=channel,
                     chat_id=chat_id,
                     on_progress=_silent,
+                    metadata={"_interaction_mode": "heartbeat"},
                 )
             finally:
                 if isinstance(message_tool, MessageTool) and suppress_token is not None:
@@ -1320,7 +1331,7 @@ def agent(
                             sender_id="user",
                             chat_id=cli_chat_id,
                             content=user_input,
-                            metadata={"_wants_stream": True},
+                            metadata=_cli_interactive_metadata(),
                         ))
 
                         await turn_done.wait()
