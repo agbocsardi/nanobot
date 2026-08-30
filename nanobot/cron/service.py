@@ -7,7 +7,6 @@ import os
 import time
 import uuid
 from contextlib import suppress
-from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Literal
@@ -148,6 +147,8 @@ class CronService:
         job_timeout_s: float = 300,
     ):
         self.store_path = store_path
+        # Legacy pre-transactional mutation log; today only recognized to be
+        # ignored and removed on load (see _drop_leftover_action_log).
         self._action_path = store_path.parent / "action.jsonl"
         self._claims_path = store_path.parent / "claims.json"
         self._owner = uuid.uuid4().hex
@@ -232,6 +233,7 @@ class CronService:
                             last_error=j.get("state", {}).get("lastError"),
                             last_delivery_status=j.get("state", {}).get("lastDeliveryStatus"),
                             last_delivery_error=j.get("state", {}).get("lastDeliveryError"),
+                            last_delivery_at_ms=j.get("state", {}).get("lastDeliveryAtMs"),
                             run_history=[
                                 CronRunRecord(
                                     run_at_ms=r.get("runAtMs", r.get("startedAtMs", 0)),
@@ -239,6 +241,8 @@ class CronService:
                                     detected_at_ms=r.get("detectedAtMs"),
                                     started_at_ms=r.get("startedAtMs", r.get("runAtMs")),
                                     finished_at_ms=r.get("finishedAtMs"),
+                                    agent_finished_at_ms=r.get("agentFinishedAtMs"),
+                                    delivery_finished_at_ms=r.get("deliveryFinishedAtMs"),
                                     status=r["status"],
                                     duration_ms=r.get("durationMs", 0),
                                     error=r.get("error"),
@@ -274,46 +278,10 @@ class CronService:
                 return None
         return jobs, version
 
-    def _merge_action(self):
-        if not self._action_path.exists():
-            return
-
-        jobs_map = {j.id: j for j in self._store.jobs}
-        def _update(params: dict):
-            j = CronJob.from_dict(params)
-            _normalize_agent_turn_job(j)
-            jobs_map[j.id] = j
-
-        def _del(params: dict):
-            if job_id := params.get("job_id"):
-                jobs_map.pop(job_id)
-
-        with self._lock:
-            with open(self._action_path, "r", encoding="utf-8") as f:
-                changed = False
-                for line in f:
-                    try:
-                        line = line.strip()
-                        action = json.loads(line)
-                        if "action" not in action:
-                            continue
-                        if action["action"] == "del":
-                            _del(action.get("params", {}))
-                        else:
-                            _update(action.get("params", {}))
-                        changed = True
-                    except Exception:
-                        logger.exception("load action line error")
-                        continue
-            self._store.jobs = list(jobs_map.values())
-            if self._running and changed:
-                self._action_path.write_text("", encoding="utf-8")
-                self._save_store()
-        return
-
     def _load_store(self) -> CronStore | None:
         """Load jobs from disk. Reloads automatically if file was modified externally.
-        - Reload every time because it needs to merge operations on the jobs object from other instances.
+        - Reload every time so mutations committed by other CronService
+          instances (transactional jobs.json writes) are picked up.
         - During _on_timer execution, return the existing store to prevent concurrent
           _load_store calls (e.g. from list_jobs polling) from replacing it mid-execution.
         - When the on-disk store exists but is unreadable: keep using the
@@ -321,6 +289,9 @@ class CronService:
           transient corruption does not drop live jobs); only the very first
           load (during ``start``) can return ``None`` to signal an unrecoverable
           state to the caller.
+        - A leftover legacy ``action.jsonl`` is ignored and removed (see
+          ``_drop_leftover_action_log``): every mutation is applied to
+          ``jobs.json`` transactionally, so the action log is never replayed.
         """
         if self._timer_active and self._store:
             return self._store
@@ -334,9 +305,60 @@ class CronService:
             return None
         jobs, version = loaded
         self._store = CronStore(version=version, jobs=jobs)
-        self._merge_action()
+        self._drop_leftover_action_log()
 
         return self._store
+
+    def _drop_leftover_action_log(self) -> None:
+        """Remove a leftover legacy ``action.jsonl`` mutation log, if any.
+
+        Pre-transactional CronService versions appended every stopped-service
+        mutation here and replayed the file during loads. Modern versions
+        apply every mutation directly to ``jobs.json`` under the inter-process
+        FileLock, so the file is never read. A leftover file (from an old
+        version or an interrupted migration) is ignored — its actions were
+        already folded into ``jobs.json`` by the old load path — and deleted
+        under the lock so it cannot be mistaken for a live log later.
+        """
+        if not self._action_path.exists():
+            return
+        with self._lock:
+            if not self._action_path.exists():
+                return
+            logger.warning(
+                "Cron: ignored and removed legacy action log at {}", self._action_path
+            )
+            with suppress(OSError):
+                self._action_path.unlink(missing_ok=True)
+
+    def _mutate(self, mutate: Callable[[CronStore], None]) -> CronStore | None:
+        """Apply *mutate* to a fresh on-disk snapshot and save it, atomically.
+
+        Runs under the process-wide inter-instance FileLock: ``jobs.json`` is
+        reloaded from disk, the mutation is applied to that fresh snapshot,
+        and the result is written back. This makes stopped-service mutations
+        behave exactly like running-service ones and keeps concurrent services
+        from losing each other's writes:
+
+        - two CronService instances mutating at the same time both start from
+          the last committed file, so neither clobbers the other's change;
+        - a crash between load and save cannot lose an update, because the
+          next transaction starts from the last saved ``jobs.json`` again.
+
+        Returns the new store, or ``None`` when the on-disk store is corrupt
+        (the corrupt file has been preserved with a ``.corrupt-<ts>`` suffix;
+        callers decide how to fail).
+        """
+        with self._lock:
+            loaded = self._load_jobs()
+            if loaded is None:
+                return None
+            jobs, version = loaded
+            store = CronStore(version=version, jobs=jobs)
+            mutate(store)
+            self._store = store
+            self._save_store_unlocked()
+        return store
 
     def _save_store(self) -> None:
         """Save jobs to disk."""
@@ -381,6 +403,7 @@ class CronService:
                         "lastError": j.state.last_error,
                         "lastDeliveryStatus": j.state.last_delivery_status,
                         "lastDeliveryError": j.state.last_delivery_error,
+                        "lastDeliveryAtMs": j.state.last_delivery_at_ms,
                         "runHistory": [
                             {
                                 "runAtMs": r.run_at_ms,
@@ -388,6 +411,8 @@ class CronService:
                                 "detectedAtMs": r.detected_at_ms,
                                 "startedAtMs": r.started_at_ms,
                                 "finishedAtMs": r.finished_at_ms,
+                                "agentFinishedAtMs": r.agent_finished_at_ms,
+                                "deliveryFinishedAtMs": r.delivery_finished_at_ms,
                                 "status": r.status,
                                 "durationMs": r.duration_ms,
                                 "error": r.error,
@@ -602,9 +627,10 @@ class CronService:
         start_ms = _now_ms()
         logger.info("Cron: executing job '{}' ({})", job.name, job.id)
 
+        result = None
         try:
             if self.on_job:
-                await asyncio.wait_for(self.on_job(job), timeout=self.job_timeout_s)
+                result = await asyncio.wait_for(self.on_job(job), timeout=self.job_timeout_s)
 
             job.state.last_status = "ok"
             job.state.last_error = None
@@ -634,12 +660,32 @@ class CronService:
         job.state.last_run_at_ms = start_ms
         job.updated_at_ms = end_ms
 
+        # Timing metadata: the runner reports exactly when the agent turn
+        # returned and when delivery completed/failed (see CronRunResult).
+        # Legacy callbacks (plain str/None) leave both unset, so fall back to
+        # the observed callback end; the runner's own run record stays the
+        # source of truth for precise delivery timing in that case.
+        agent_finished_at_ms = getattr(result, "agent_finished_at_ms", None)
+        delivery_finished_at_ms = getattr(result, "delivery_finished_at_ms", None)
+        if agent_finished_at_ms is None:
+            agent_finished_at_ms = end_ms
+        if delivery_finished_at_ms is None:
+            # The runner may have recorded delivery completion on the job
+            # state itself (e.g. it re-raised after a delivery failure).
+            delivery_finished_at_ms = job.state.last_delivery_at_ms
+        else:
+            # Persist the delivery time reported by the callback on the job
+            # state so the finalizer carries it into jobs.json.
+            job.state.last_delivery_at_ms = delivery_finished_at_ms
+
         job.state.run_history.append(CronRunRecord(
             run_at_ms=start_ms,
             scheduled_at_ms=scheduled_ms,
             detected_at_ms=detected_ms,
             started_at_ms=start_ms,
             finished_at_ms=end_ms,
+            agent_finished_at_ms=agent_finished_at_ms,
+            delivery_finished_at_ms=delivery_finished_at_ms,
             status=job.state.last_status,
             duration_ms=end_ms - start_ms,
             error=job.state.last_error,
@@ -747,30 +793,6 @@ class CronService:
                 return False
             jobs, version = loaded
 
-            # Fold legacy queued mutations into the fresh snapshot. Validate
-            # the claim first: a stale worker must never consume another
-            # process's pending actions.
-            actions_changed = False
-            if self._action_path.exists():
-                jobs_map = {item.id: item for item in jobs}
-                with open(self._action_path, "r", encoding="utf-8") as action_file:
-                    for line in action_file:
-                        try:
-                            action = json.loads(line)
-                            params = action.get("params", {})
-                            if action.get("action") == "del":
-                                jobs_map.pop(params.get("job_id"), None)
-                                actions_changed = True
-                            elif action.get("action") in ("add", "update"):
-                                changed_job = CronJob.from_dict(params)
-                                _normalize_agent_turn_job(changed_job)
-                                jobs_map[changed_job.id] = changed_job
-                                actions_changed = True
-                        except Exception:
-                            logger.exception("load action line error during claim finalization")
-                if actions_changed:
-                    jobs = list(jobs_map.values())
-
             current = next((item for item in jobs if item.id == job.id), None)
             if current is None:
                 claims.pop(key, None)
@@ -785,6 +807,7 @@ class CronService:
             current.state.last_error = job.state.last_error
             current.state.last_delivery_status = job.state.last_delivery_status
             current.state.last_delivery_error = job.state.last_delivery_error
+            current.state.last_delivery_at_ms = job.state.last_delivery_at_ms
             current.state.run_history = job.state.run_history
             if same_occurrence:
                 current.state.next_run_at_ms = job.state.next_run_at_ms
@@ -794,23 +817,18 @@ class CronService:
             current.updated_at_ms = max(current.updated_at_ms, job.updated_at_ms)
             self._store = CronStore(version=version, jobs=jobs)
             self._save_store_unlocked()
-            if actions_changed:
-                self._atomic_write(self._action_path, "")
             claims.pop(key, None)
             self._atomic_write(self._claims_path, json.dumps(claims, indent=2))
             return True
 
     def _save_store_unlocked(self) -> None:
-        """Save while the caller owns the process-wide persistence lock."""
-        # _save_store is lock-taking for ordinary mutations; this variant is
-        # used by the claim finalization transaction to avoid re-entrancy.
-        self._save_store()
+        """Save while the caller owns the process-wide persistence lock.
 
-    def _append_action(self, action: Literal["add", "del", "update"], params: dict):
-        self.store_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._lock:
-            with open(self._action_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps({"action": action, "params": params}, ensure_ascii=False) + "\n")
+        ``_save_store`` itself takes no lock; this variant documents that the
+        caller (mutation transactions and claim finalization) already holds
+        ``self._lock`` and must not re-acquire it.
+        """
+        self._save_store()
 
 
     # ========== Public API ==========
@@ -891,74 +909,101 @@ class CronService:
             misfire_grace_ms=misfire_grace_ms,
         )
         _normalize_agent_turn_job(job)
+        store = self._mutate(lambda s: s.jobs.append(job))
+        if store is None:
+            raise RuntimeError(
+                f"cron store at {self.store_path} is corrupt; refusing to add job"
+            )
         if self._running:
-            store = self._load_store()
-            store.jobs.append(job)
-            self._save_store()
             self._arm_timer()
-        else:
-            self._append_action("add", asdict(job))
 
         logger.info("Cron: added job '{}' ({})", name, job.id)
         return job
 
     def register_system_job(self, job: CronJob) -> CronJob:
-        """Register an internal system job (idempotent on restart)."""
-        store = self._load_store()
+        """Register an internal system job (idempotent on restart).
+
+        Transactional like every other mutation: the current ``jobs.json`` is
+        reloaded under the lock, the system job replaces any existing job with
+        the same id, and the result is saved back.
+        """
         now = _now_ms()
-        job.state = CronJobState(next_run_at_ms=_compute_next_run(job.schedule, now))
-        job.created_at_ms = now
-        job.updated_at_ms = now
-        store.jobs = [j for j in store.jobs if j.id != job.id]
-        store.jobs.append(job)
-        self._save_store()
+
+        def _apply(store: CronStore) -> None:
+            job.state = CronJobState(next_run_at_ms=_compute_next_run(job.schedule, now))
+            job.created_at_ms = now
+            job.updated_at_ms = now
+            store.jobs = [j for j in store.jobs if j.id != job.id]
+            store.jobs.append(job)
+
+        store = self._mutate(_apply)
+        if store is None:
+            raise RuntimeError(
+                f"cron store at {self.store_path} is corrupt; refusing to register system job"
+            )
         self._arm_timer()
         logger.info("Cron: registered system job '{}' ({})", job.name, job.id)
         return job
 
     def remove_job(self, job_id: str) -> Literal["removed", "protected", "not_found"]:
-        """Remove a job by ID, unless it is a protected system job."""
-        store = self._load_store()
-        job = next((j for j in store.jobs if j.id == job_id), None)
-        if job is None:
-            return "not_found"
-        if job.payload.kind == "system_event":
+        """Remove a job by ID, unless it is a protected system job.
+
+        Transactional: under the FileLock the fresh ``jobs.json`` is reloaded
+        and the job removed atomically, so a concurrent add from another
+        service is never clobbered.
+        """
+        outcome: dict[str, bool] = {"found": False, "protected": False}
+
+        def _apply(store: CronStore) -> None:
+            job = next((j for j in store.jobs if j.id == job_id), None)
+            if job is None:
+                return
+            outcome["found"] = True
+            if job.payload.kind == "system_event":
+                outcome["protected"] = True
+                return
+            store.jobs = [j for j in store.jobs if j.id != job_id]
+
+        store = self._mutate(_apply)
+        if store is None:
+            raise RuntimeError(
+                f"cron store at {self.store_path} is corrupt; refusing to remove job"
+            )
+        if outcome["protected"]:
             logger.info("Cron: refused to remove protected system job {}", job_id)
             return "protected"
-
-        before = len(store.jobs)
-        store.jobs = [j for j in store.jobs if j.id != job_id]
-        removed = len(store.jobs) < before
-
-        if removed:
+        if outcome["found"]:
             if self._running:
-                self._save_store()
                 self._arm_timer()
-            else:
-                self._append_action("del", {"job_id": job_id})
             logger.info("Cron: removed job {}", job_id)
             return "removed"
-
         return "not_found"
 
     def enable_job(self, job_id: str, enabled: bool = True) -> CronJob | None:
-        """Enable or disable a job."""
-        store = self._load_store()
-        for job in store.jobs:
-            if job.id == job_id:
-                job.enabled = enabled
-                job.updated_at_ms = _now_ms()
-                if enabled:
-                    job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
-                else:
-                    job.state.next_run_at_ms = None
-                if self._running:
-                    self._save_store()
-                    self._arm_timer()
-                else:
-                    self._append_action("update", asdict(job))
-                return job
-        return None
+        """Enable or disable a job (transactional, like every mutation)."""
+        found: dict[str, CronJob | None] = {"job": None}
+
+        def _apply(store: CronStore) -> None:
+            for job in store.jobs:
+                if job.id == job_id:
+                    job.enabled = enabled
+                    job.updated_at_ms = _now_ms()
+                    if enabled:
+                        job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
+                    else:
+                        job.state.next_run_at_ms = None
+                    found["job"] = job
+                    return
+
+        store = self._mutate(_apply)
+        if store is None:
+            raise RuntimeError(
+                f"cron store at {self.store_path} is corrupt; refusing to update job"
+            )
+        job = found["job"]
+        if job is not None and self._running:
+            self._arm_timer()
+        return job
 
     def update_job(
         self,
@@ -980,54 +1025,70 @@ class CronService:
 
         For ``channel`` and ``to``, pass an explicit value (including ``None``)
         to update; omit (sentinel ``...``) to leave unchanged.
+
+        Transactional: the fresh ``jobs.json`` is reloaded under the lock, the
+        update is applied to that snapshot, and the result is saved back, so
+        concurrent edits from other CronService instances are never lost.
         """
-        store = self._load_store()
-        job = next((j for j in store.jobs if j.id == job_id), None)
-        if job is None:
+        outcome: dict[str, Any] = {"job": None, "protected": False, "found": False}
+
+        def _apply(store: CronStore) -> None:
+            job = next((j for j in store.jobs if j.id == job_id), None)
+            if job is None:
+                return
+            outcome["found"] = True
+            if job.payload.kind == "system_event":
+                outcome["protected"] = True
+                return
+
+            if schedule is not None:
+                _validate_schedule_for_add(schedule)
+                job.schedule = schedule
+            if name is not None:
+                job.name = name
+            if message is not None:
+                job.payload.message = message
+            if deliver is not None:
+                job.payload.deliver = deliver
+            if channel is not ...:
+                job.payload.channel = channel
+            if to is not ...:
+                job.payload.to = to
+            if delete_after_run is not None:
+                job.delete_after_run = delete_after_run
+            if silent is not None:
+                job.payload.silent = silent
+            if isolated is not None:
+                job.payload.isolated = isolated
+            if misfire_policy is not None:
+                if misfire_policy not in ("skip", "coalesce"):
+                    raise ValueError("misfire_policy must be 'skip' or 'coalesce'")
+                job.misfire_policy = misfire_policy
+            if misfire_grace_ms is not None:
+                if misfire_grace_ms < 0:
+                    raise ValueError("misfire_grace_ms must be non-negative")
+                job.misfire_grace_ms = misfire_grace_ms
+            _normalize_agent_turn_job(job)
+
+            job.updated_at_ms = _now_ms()
+            if job.enabled:
+                job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
+            outcome["job"] = job
+
+        store = self._mutate(_apply)
+        if store is None:
+            raise RuntimeError(
+                f"cron store at {self.store_path} is corrupt; refusing to update job"
+            )
+        if not outcome["found"]:
             return "not_found"
-        if job.payload.kind == "system_event":
+        if outcome["protected"]:
             return "protected"
-
-        if schedule is not None:
-            _validate_schedule_for_add(schedule)
-            job.schedule = schedule
-        if name is not None:
-            job.name = name
-        if message is not None:
-            job.payload.message = message
-        if deliver is not None:
-            job.payload.deliver = deliver
-        if channel is not ...:
-            job.payload.channel = channel
-        if to is not ...:
-            job.payload.to = to
-        if delete_after_run is not None:
-            job.delete_after_run = delete_after_run
-        if silent is not None:
-            job.payload.silent = silent
-        if isolated is not None:
-            job.payload.isolated = isolated
-        if misfire_policy is not None:
-            if misfire_policy not in ("skip", "coalesce"):
-                raise ValueError("misfire_policy must be 'skip' or 'coalesce'")
-            job.misfire_policy = misfire_policy
-        if misfire_grace_ms is not None:
-            if misfire_grace_ms < 0:
-                raise ValueError("misfire_grace_ms must be non-negative")
-            job.misfire_grace_ms = misfire_grace_ms
-        _normalize_agent_turn_job(job)
-
-        job.updated_at_ms = _now_ms()
-        if job.enabled:
-            job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
-
-        if self._running:
-            self._save_store()
-            self._arm_timer()
-        else:
-            self._append_action("update", asdict(job))
-
-        logger.info("Cron: updated job '{}' ({})", job.name, job.id)
+        job = outcome["job"]
+        if job is not None:
+            if self._running:
+                self._arm_timer()
+            logger.info("Cron: updated job '{}' ({})", job.name, job.id)
         return job
 
     async def run_job(self, job_id: str, force: bool = False) -> bool:

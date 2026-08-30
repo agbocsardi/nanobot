@@ -556,3 +556,69 @@ def test_list_surfaces_delivery_failure_in_text_and_structured_data(tmp_path) ->
     assert data["last_delivery_status"] == "failed"
     assert data["last_delivery_error"] == "channel unavailable"
     assert data["last_run"]["delivery_status"] == "failed"
+
+
+def test_list_surfaces_delivery_timestamps_in_text_and_structured_data(tmp_path) -> None:
+    """The separated agent/delivery timestamps appear in the list text output
+    (Last delivery line + Last diagnostic line) and in the structured data."""
+    tool = _make_tool(tmp_path)
+    job = tool._cron.add_job(
+        name="timed",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="x",
+    )
+    stored = tool._cron.get_job(job.id)
+    assert stored is not None
+    stored.state.last_run_at_ms = 1_500
+    stored.state.last_status = "ok"
+    stored.state.last_delivery_status = "delivered"
+    stored.state.last_delivery_at_ms = 2_500
+    stored.state.run_history.append(
+        CronRunRecord(
+            run_at_ms=1_000,
+            scheduled_at_ms=1_000,
+            detected_at_ms=1_500,
+            started_at_ms=1_500,
+            finished_at_ms=2_100,
+            agent_finished_at_ms=1_800,
+            delivery_finished_at_ms=2_500,
+            status="ok",
+            delivery_status="delivered",
+        )
+    )
+    tool._cron._save_store()
+
+    result = tool._list_jobs()
+
+    assert "Last delivery: delivered at " in result
+    assert "agent-finished=1800" in result
+    assert "delivery-finished=2500" in result
+    data = result.data["jobs"][0]
+    assert data["last_delivery_at_ms"] == 2_500
+    assert data["last_run"]["agent_finished_at_ms"] == 1_800
+    assert data["last_run"]["delivery_finished_at_ms"] == 2_500
+
+
+def test_list_delivery_timestamps_absent_when_never_delivered(tmp_path) -> None:
+    """Jobs that never reached delivery keep every new timestamp None in the
+    structured data and no stray 'at' suffix in the text output."""
+    tool = _make_tool(tmp_path)
+    job = tool._cron.add_job(
+        name="never delivered",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="x",
+    )
+    stored = tool._cron.get_job(job.id)
+    assert stored is not None
+    stored.state.last_run_at_ms = 1_000
+    stored.state.last_status = "error"
+    stored.state.last_delivery_status = "not_attempted"
+    tool._cron._save_store()
+
+    result = tool._list_jobs()
+
+    assert "Last delivery: not_attempted" in result
+    assert " at " not in result.split("Last delivery:")[1].split("\n")[0]
+    data = result.data["jobs"][0]
+    assert data["last_delivery_at_ms"] is None
+    assert data["last_run"] is None or data["last_run"]["agent_finished_at_ms"] is None

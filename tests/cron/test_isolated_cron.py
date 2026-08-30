@@ -17,7 +17,7 @@ import pytest
 from nanobot.agent.tools.cron import CronTool
 from nanobot.bus.events import OutboundMessage
 from nanobot.cron.bound_runner import run_isolated_cron_job
-from nanobot.cron.types import CronJob, CronPayload, CronSchedule
+from nanobot.cron.types import CronJob, CronPayload, CronRunResult, CronSchedule
 
 
 def _spied_cron_tool() -> CronTool:
@@ -144,7 +144,9 @@ async def test_isolated_runs_via_process_direct_and_delivers_when_not_silent() -
     assert ok["isolated"] is True
     assert ok["silent"] is False
     assert ok["response"] == "biometrics ok"
-    assert ok["delivery"] == {"status": "delivered", "error": None}
+    assert ok["delivery"]["status"] == "delivered"
+    assert ok["delivery"]["error"] is None
+    assert ok["delivery"]["at_ms"] > 0
     assert ok["usage"]["provider"]
 
 
@@ -176,10 +178,9 @@ async def test_isolated_delivery_failure_is_recorded_and_reraised() -> None:
         await run_isolated_cron_job(job, agent=agent, cron=recorder, deliver=fail_delivery)
 
     assert [record["status"] for _, record in recorder.records] == ["queued", "error"]
-    assert recorder.records[-1][1]["delivery"] == {
-        "status": "failed",
-        "error": "channel unavailable",
-    }
+    assert recorder.records[-1][1]["delivery"]["status"] == "failed"
+    assert recorder.records[-1][1]["delivery"]["error"] == "channel unavailable"
+    assert recorder.records[-1][1]["delivery"]["at_ms"] > 0
     assert job.state.last_delivery_status == "failed"
     assert job.state.last_delivery_error == "channel unavailable"
 
@@ -212,6 +213,76 @@ def test_default_isolated_true_for_legacy_payload() -> None:
         origin_chat_id="42",
     )
     assert legacy.isolated is True
+
+
+@pytest.mark.asyncio
+async def test_isolated_records_agent_finish_before_delivery_timestamp(monkeypatch) -> None:
+    """Agent-turn finish and delivery finish are recorded separately: the run
+    record and job state carry both, in the right order."""
+    clock = iter([1_000, 2_000, 3_000])  # run_id, agent finish, delivery finish
+    monkeypatch.setattr("nanobot.cron.bound_runner._now_ms", lambda: next(clock))
+    agent = _FakeAgent(content="biometrics ok")
+    recorder = _FakeRecorder()
+    delivered, deliver = _make_deliver()
+    job = _job(silent=False)
+
+    resp = await run_isolated_cron_job(job, agent=agent, cron=recorder, deliver=deliver)
+
+    assert isinstance(resp, CronRunResult)
+    assert resp.agent_finished_at_ms == 2_000
+    assert resp.delivery_finished_at_ms == 3_000
+    ok = recorder.records[-1][1]
+    assert ok["agent_finished_at_ms"] == 2_000
+    assert ok["delivery"] == {"status": "delivered", "error": None, "at_ms": 3_000}
+    assert ok["agent_finished_at_ms"] < ok["delivery"]["at_ms"]
+    assert job.state.last_delivery_at_ms == 3_000
+    assert job.state.last_delivery_status == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_isolated_delivery_failure_records_delivery_finished_at_ms(monkeypatch) -> None:
+    """A failed delivery still stamps the delivery-finished time on the job
+    state and the run record, so delivery duration is measurable on failures."""
+    clock = iter([1_000, 2_000, 3_000])
+    monkeypatch.setattr("nanobot.cron.bound_runner._now_ms", lambda: next(clock))
+    agent = _FakeAgent(content="important result")
+    recorder = _FakeRecorder()
+    job = _job()
+
+    async def fail_delivery(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("channel unavailable")
+
+    with pytest.raises(RuntimeError, match="channel unavailable"):
+        await run_isolated_cron_job(job, agent=agent, cron=recorder, deliver=fail_delivery)
+
+    error = recorder.records[-1][1]
+    assert error["agent_finished_at_ms"] == 2_000
+    assert error["delivery"] == {
+        "status": "failed",
+        "error": "channel unavailable",
+        "at_ms": 3_000,
+    }
+    assert job.state.last_delivery_at_ms == 3_000
+    assert job.state.last_delivery_status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_isolated_silent_job_still_records_delivery_finish(monkeypatch) -> None:
+    """Suppressed/empty deliveries complete at a measurable time too: the
+    delivery timestamp is recorded even though nothing was sent."""
+    clock = iter([1_000, 2_000, 3_000])  # run_id, agent finish, delivery finish
+    monkeypatch.setattr("nanobot.cron.bound_runner._now_ms", lambda: next(clock))
+    agent = _FakeAgent(content="nothing to report")
+    recorder = _FakeRecorder()
+    delivered, deliver = _make_deliver()
+    job = _job(silent=True)
+
+    await run_isolated_cron_job(job, agent=agent, cron=recorder, deliver=deliver)
+
+    assert delivered == []
+    ok = recorder.records[-1][1]
+    assert ok["delivery"] == {"status": "suppressed", "error": None, "at_ms": 3_000}
+    assert job.state.last_delivery_at_ms == 3_000
 
 
 if __name__ == "__main__":

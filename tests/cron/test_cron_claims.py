@@ -173,7 +173,9 @@ def test_recurring_delete_after_run_is_not_deleted_by_finalizer(tmp_path, monkey
     assert CronService(service.store_path).get_job(job.id) is not None
 
 
-def test_stale_finalizer_does_not_consume_pending_actions(tmp_path, monkeypatch):
+def test_stale_finalizer_does_not_overwrite_fresh_edit(tmp_path, monkeypatch):
+    """A token-fenced finalize must never clobber an edit another service
+    committed to jobs.json while the run was in flight."""
     now = 1_000
     monkeypatch.setattr("nanobot.cron.service._now_ms", lambda: now)
     first = _service(tmp_path)
@@ -188,10 +190,13 @@ def test_stale_finalizer_does_not_consume_pending_actions(tmp_path, monkeypatch)
     assert new is not None
     editor = _service(tmp_path)
     assert editor.update_job(job.id, name="queued edit") != "not_found"
-    action_before = editor._action_path.read_text(encoding="utf-8")
+    assert editor.get_job(job.id).name == "queued edit"
 
     assert not first._finalize_claim(old[0], 1_000, old[1])
-    assert editor._action_path.read_text(encoding="utf-8") == action_before
+    # The stale finalizer must not have consumed or reverted the fresh edit.
+    check = _service(tmp_path)
+    assert check.get_job(job.id).name == "queued edit"
+    assert not check._action_path.exists()
 
 
 def test_claim_status_is_secret_free_and_reports_active_and_expired(tmp_path, monkeypatch):

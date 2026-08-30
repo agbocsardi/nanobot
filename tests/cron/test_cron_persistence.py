@@ -19,10 +19,9 @@ from nanobot.cron.types import CronSchedule
 
 def _seeded_store(tmp_path: Path) -> tuple[CronService, Path]:
     """Build a service with one persisted job on disk and return both the
-    service and the resolved store path.  Adds the job via the action log
-    (the path used when the service is not running) and then triggers a
-    merge so ``jobs.json`` is written, mirroring the persisted on-disk
-    state seen in production."""
+    service and the resolved store path.  ``add_job`` applies the mutation
+    transactionally straight to ``jobs.json`` (stopped or running), so by the
+    time we return the on-disk state matches production."""
     store_path = tmp_path / "cron" / "jobs.json"
     service = CronService(store_path)
     service.add_job(
@@ -30,13 +29,6 @@ def _seeded_store(tmp_path: Path) -> tuple[CronService, Path]:
         schedule=CronSchedule(kind="cron", expr="0 10 * * *", tz="Asia/Kuwait"),
         message="hello",
     )
-    # add_job appended to action.jsonl; flush to jobs.json by toggling
-    # ``_running`` long enough for ``_merge_action`` to do its rewrite.
-    service._running = True
-    try:
-        service._load_store()
-    finally:
-        service._running = False
     assert store_path.exists()
     return service, store_path
 

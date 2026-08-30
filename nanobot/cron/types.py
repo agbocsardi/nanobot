@@ -67,12 +67,19 @@ class CronRunRecord:
     """A single execution record for a cron job.
 
     ``run_at_ms`` is the legacy alias for ``started_at_ms``.
+
+    Delivery timing is tracked separately from the turn: the agent turn
+    finishes at ``agent_finished_at_ms`` and delivery afterwards completes
+    (or fails) at ``delivery_finished_at_ms``, so delivery duration is
+    ``delivery_finished_at_ms - agent_finished_at_ms``.
     """
     run_at_ms: int = 0
     scheduled_at_ms: int | None = None
     detected_at_ms: int | None = None
     started_at_ms: int | None = None
     finished_at_ms: int | None = None
+    agent_finished_at_ms: int | None = None
+    delivery_finished_at_ms: int | None = None
     status: Literal["ok", "error", "skipped"] = "ok"
     duration_ms: int = 0
     error: str | None = None
@@ -89,6 +96,7 @@ class CronJobState:
     last_error: str | None = None
     last_delivery_status: str | None = None
     last_delivery_error: str | None = None
+    last_delivery_at_ms: int | None = None
     run_history: list[CronRunRecord] = field(default_factory=list)
 
 
@@ -120,6 +128,31 @@ class CronJob:
         kwargs["payload"] = CronPayload(**kwargs.get("payload", {}))
         kwargs["state"] = CronJobState(**state_kwargs)
         return cls(**kwargs)
+
+
+class CronRunResult(str):
+    """Structured return value of a cron ``on_job`` callback.
+
+    Keeps the legacy callback contract — the response text is the string
+    value, so ``str``-typed callers are unaffected — while carrying exact
+    timing metadata the service persists into the run record and job state:
+    ``agent_finished_at_ms`` is the moment the agent turn returned and
+    ``delivery_finished_at_ms`` the moment delivery completed or failed.
+    """
+    agent_finished_at_ms: int | None
+    delivery_finished_at_ms: int | None
+
+    def __new__(
+        cls,
+        response: str | None = None,
+        *,
+        agent_finished_at_ms: int | None = None,
+        delivery_finished_at_ms: int | None = None,
+    ) -> "CronRunResult":
+        obj = str.__new__(cls, response or "")
+        obj.agent_finished_at_ms = agent_finished_at_ms
+        obj.delivery_finished_at_ms = delivery_finished_at_ms
+        return obj
 
 
 @dataclass
