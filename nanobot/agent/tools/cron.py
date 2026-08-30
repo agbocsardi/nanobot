@@ -341,6 +341,10 @@ class CronTool(Tool, ContextAware):
             if run.scheduled_at_ms is not None:
                 late = (run.detected_at_ms - run.scheduled_at_ms) if run.detected_at_ms is not None else None
                 detail = f"  Last diagnostic: scheduled={run.scheduled_at_ms}, detected={run.detected_at_ms}, started={run.started_at_ms}, finished={run.finished_at_ms}"
+                if run.agent_finished_at_ms is not None:
+                    detail += f", agent-finished={run.agent_finished_at_ms}"
+                if run.delivery_finished_at_ms is not None:
+                    detail += f", delivery-finished={run.delivery_finished_at_ms}"
                 if late is not None:
                     detail += f", late-by={max(0, late)}ms"
                 lines.append(detail + f" — {run.status}" + (f" ({run.error})" if run.error else ""))
@@ -397,8 +401,12 @@ class CronTool(Tool, ContextAware):
                     expires = claim.get("lease_expires_at_ms")
                     suffix = f" (expires {expires})" if expires is not None else ""
                     parts.append(f"  Claim: {claim['status']}{suffix}")
-                if j.state.last_delivery_status:
-                    delivery = f"  Last delivery: {j.state.last_delivery_status}"
+                if j.state.last_delivery_status or j.state.last_delivery_at_ms is not None:
+                    delivery = f"  Last delivery: {j.state.last_delivery_status or 'unknown'}"
+                    if j.state.last_delivery_at_ms is not None:
+                        delivery += (
+                            f" at {self._format_timestamp(j.state.last_delivery_at_ms, self._display_timezone(j.schedule))}"
+                        )
                     if j.state.last_delivery_error:
                         delivery += f" ({j.state.last_delivery_error})"
                     parts.append(delivery)
@@ -409,6 +417,8 @@ class CronTool(Tool, ContextAware):
                     late = (latest.detected_at_ms - latest.scheduled_at_ms) if latest.detected_at_ms is not None and latest.scheduled_at_ms is not None else None
                     run_data = {"scheduled_at_ms": latest.scheduled_at_ms, "detected_at_ms": latest.detected_at_ms,
                                 "started_at_ms": latest.started_at_ms, "finished_at_ms": latest.finished_at_ms,
+                                "agent_finished_at_ms": latest.agent_finished_at_ms,
+                                "delivery_finished_at_ms": latest.delivery_finished_at_ms,
                                 "late_by_ms": max(0, late) if late is not None else None, "status": latest.status,
                                 "error": latest.error, "delivery_status": latest.delivery_status,
                                 "delivery_error": latest.delivery_error}
@@ -421,7 +431,8 @@ class CronTool(Tool, ContextAware):
                                     "last_run_at_ms": j.state.last_run_at_ms,
                                     "last_status": j.state.last_status, "last_error": j.state.last_error,
                                     "last_delivery_status": j.state.last_delivery_status,
-                                    "last_delivery_error": j.state.last_delivery_error, "claim": claim})
+                                    "last_delivery_error": j.state.last_delivery_error,
+                                    "last_delivery_at_ms": j.state.last_delivery_at_ms, "claim": claim})
             except Exception as exc:
                 job_id = str(getattr(j, "id", "unknown"))
                 message = f"{type(exc).__name__}: {exc}"

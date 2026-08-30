@@ -199,11 +199,11 @@ def test_add_job_preserves_origin_delivery_context(tmp_path) -> None:
     assert job.payload.origin_chat_id == "C123"
     assert job.payload.origin_metadata == metadata
 
-    raw = json.loads((tmp_path / "cron" / "action.jsonl").read_text(encoding="utf-8"))
-    payload = raw["params"]["payload"]
-    assert payload["origin_channel"] == "slack"
-    assert payload["origin_chat_id"] == "C123"
-    assert payload["origin_metadata"] == metadata
+    raw = json.loads((tmp_path / "cron" / "jobs.json").read_text(encoding="utf-8"))
+    payload = raw["jobs"][0]["payload"]
+    assert payload["originChannel"] == "slack"
+    assert payload["originChatId"] == "C123"
+    assert payload["originMetadata"] == metadata
 
     reloaded = service.get_job(job.id)
     assert reloaded is not None
@@ -752,7 +752,9 @@ async def test_update_job_preserves_run_history(tmp_path) -> None:
     assert result.state.run_history[0].status == "ok"
 
 
-def test_update_job_offline_writes_action(tmp_path) -> None:
+def test_update_job_offline_writes_jobs_json(tmp_path) -> None:
+    """Stopped-service mutations are transactional: they land in jobs.json
+    immediately, exactly like running-service mutations."""
     service = CronService(tmp_path / "cron" / "jobs.json")
     job = service.add_job(
         name="offline",
@@ -761,12 +763,11 @@ def test_update_job_offline_writes_action(tmp_path) -> None:
     )
     service.update_job(job.id, name="updated-offline")
 
-    action_path = tmp_path / "cron" / "action.jsonl"
-    assert action_path.exists()
-    lines = [line for line in action_path.read_text().strip().split("\n") if line]
-    last = json.loads(lines[-1])
-    assert last["action"] == "update"
-    assert last["params"]["name"] == "updated-offline"
+    store_path = tmp_path / "cron" / "jobs.json"
+    assert store_path.exists()
+    data = json.loads(store_path.read_text(encoding="utf-8"))
+    assert data["jobs"][0]["name"] == "updated-offline"
+    assert not (tmp_path / "cron" / "action.jsonl").exists()
 
 
 def test_update_job_migrates_legacy_delivery_target(tmp_path) -> None:

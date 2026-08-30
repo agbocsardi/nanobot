@@ -11,6 +11,7 @@
 - [x] Run targeted and full validation
 - [x] Commit, merge to `main`, and push
 - [ ] Deploy to `uhl`
+- [x] #25 follow-up: separate agent-finished/delivery-finished timestamps; retire the legacy action log (feat/cron-finalize, uncommitted)
 
 ## Log
 
@@ -31,4 +32,24 @@
 - Exposed misfire controls and secret-free claim/lease diagnostics through `cron list`; added timeout and delivery-failure coverage.
 - Repository validation passed: Ruff clean and 2,967 pytest tests passed (one existing aiohttp deprecation warning).
 - Remaining #25 follow-up: separate agent-finished and delivery-finished timestamps, plus eventual retirement of the legacy action log.
+
+### 2026-09-03
+
+- Implemented the remaining #25 follow-up on `feat/cron-finalize` (worktree fork-nanobot-25, uncommitted):
+  - Split delivery timing: `CronRunRecord.agent_finished_at_ms` /
+    `delivery_finished_at_ms`, `CronJobState.last_delivery_at_ms`, persisted
+    backward-compatibly (old stores load, serializer writes the new keys).
+    Both runners stamp turn-finish and delivery-finish times; the service
+    persists them from the callback's structured `CronRunResult` metadata.
+  - Retired `action.jsonl`: every mutation (add/update/remove/enable/disable/
+    register_system_job) is now transactional via `_mutate` — reload fresh
+    `jobs.json` under the inter-process FileLock, apply, atomic save.
+    `_merge_action`/`_append_action` deleted; leftover action.jsonl is ignored
+    and removed on load. Claim finalization uses the same save helper.
+  - Surfaced the new timestamps in `cron list` text + structured data.
+  - Tests: +6 transaction (concurrent add/update/delete across instances,
+    threaded concurrency, crash-window/no-resurrection, leftover-dot-tmp,
+    leftover action log), +3 deterministic timestamp, +3 runner timing,
+    +2 tool-list surface, +1 bound-runner timing.
+  - Validation: full suite 2892 passed / 2 skipped; Ruff clean.
 - Merged as `f355e16b` and pushed `origin/main`; deployment is blocked because hostname `uhl` did not resolve from this session.

@@ -11,7 +11,7 @@ from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import Config
 from nanobot.cron.bound_runner import run_bound_cron_job
 from nanobot.cron.session_turns import CRON_RUN_SNAPSHOT_META
-from nanobot.cron.types import CronJob, CronPayload, CronSchedule
+from nanobot.cron.types import CronJob, CronPayload, CronRunResult, CronSchedule
 from nanobot.providers.factory import ProviderSnapshot
 
 
@@ -160,3 +160,33 @@ async def test_bound_cron_turn_falls_back_to_global_when_resolver_missing() -> N
 
     # Fallback: global snapshot model, not None.
     assert agent.seen_metadata[CRON_RUN_SNAPSHOT_META]["model"] == "cheap-model"
+
+
+@pytest.mark.asyncio
+async def test_bound_cron_turn_reports_agent_and_delivery_finish_timestamps(monkeypatch) -> None:
+    """run_bound_cron_job separates agent-turn finish from delivery finish in
+    its return metadata and on the job state."""
+    clock = iter([1_000, 2_000, 3_000])  # run_id, agent finish, delivery finish
+    monkeypatch.setattr("nanobot.cron.bound_runner._now_ms", lambda: next(clock))
+    agent = _FakeAgent()
+    job = CronJob(
+        id="j4",
+        name="timed",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        payload=CronPayload(
+            kind="agent_turn",
+            message="check things",
+            session_key="cli:direct",
+            origin_channel="cli",
+            origin_chat_id="direct",
+        ),
+    )
+
+    result = await run_bound_cron_job(job, agent=agent, cron=_FakeCron())
+
+    assert isinstance(result, CronRunResult)
+    assert result.agent_finished_at_ms == 2_000
+    assert result.delivery_finished_at_ms == 3_000
+    assert result.agent_finished_at_ms < result.delivery_finished_at_ms
+    assert job.state.last_delivery_at_ms == 3_000
+    assert job.state.last_delivery_status == "delivered"

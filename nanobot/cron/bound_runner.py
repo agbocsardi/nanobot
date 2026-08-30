@@ -18,9 +18,14 @@ from nanobot.cron.session_turns import (
     CRON_SILENT_META,
     CRON_TRIGGER_META,
 )
-from nanobot.cron.types import CronJob
+from nanobot.cron.types import CronJob, CronRunResult
 from nanobot.utils.prompt_templates import render_template
 from nanobot.utils.run_records import build_usage_block
+
+
+def _now_ms() -> int:
+    """Wall-clock time in ms. Module-level so tests can pin it."""
+    return int(time.time() * 1000)
 
 
 class BoundCronAgent(Protocol):
@@ -106,7 +111,7 @@ async def run_bound_cron_job(
         message=job.payload.message,
     )
     prompt_ref = _cron_prompt_ref(prompt)
-    run_id = f"{job.id}:{int(time.time() * 1000)}:{uuid.uuid4().hex[:8]}"
+    run_id = f"{job.id}:{_now_ms()}:{uuid.uuid4().hex[:8]}"
     channel, chat_id, metadata = _bound_session_delivery_context(
         job,
         turn_seed=f"cron:{job.id}",
@@ -171,8 +176,10 @@ async def run_bound_cron_job(
                 session_key_override=session_key,
             )
         )
+        agent_finished_at_ms = _now_ms()
     except (Exception, asyncio.CancelledError) as exc:
         error_text = str(exc) or exc.__class__.__name__
+        agent_finished_at_ms = _now_ms()
         job.state.last_delivery_status = "not_attempted"
         job.state.last_delivery_error = error_text
         cron.write_run_record(
@@ -181,6 +188,7 @@ async def run_bound_cron_job(
                 **run_record_base,
                 "status": "error",
                 "error": error_text,
+                "agent_finished_at_ms": agent_finished_at_ms,
                 "delivery": {"status": "not_attempted", "error": error_text},
             },
         )
@@ -193,6 +201,11 @@ async def run_bound_cron_job(
     delivery_status = "empty" if not response else "suppressed" if job.payload.silent else "delivered"
     job.state.last_delivery_status = delivery_status
     job.state.last_delivery_error = None
+    # In-band cron delivery is complete once the turn's reply has been routed
+    # back through the loop; record the wall time so delivery duration is
+    # separately measurable from turn duration.
+    delivery_finished_at_ms = _now_ms()
+    job.state.last_delivery_at_ms = delivery_finished_at_ms
     # What actually ran + what it cost. provider/model come from the loop's
     # active runtime for this turn (cron turns do not currently override the
     # provider). usage is the delta captured by _last_usage for this turn.
@@ -209,10 +222,19 @@ async def run_bound_cron_job(
             "status": "ok",
             "response": response,
             "usage": usage_block,
-            "delivery": {"status": delivery_status, "error": None},
+            "agent_finished_at_ms": agent_finished_at_ms,
+            "delivery": {
+                "status": delivery_status,
+                "error": None,
+                "at_ms": delivery_finished_at_ms,
+            },
         },
     )
-    return response
+    return CronRunResult(
+        response,
+        agent_finished_at_ms=agent_finished_at_ms,
+        delivery_finished_at_ms=delivery_finished_at_ms,
+    )
 
 
 async def _async_noop(*_args: Any, **_kwargs: Any) -> None:
@@ -245,7 +267,7 @@ async def run_isolated_cron_job(
         message=job.payload.message,
     )
     prompt_ref = _cron_prompt_ref(prompt)
-    run_id = f"{job.id}:{int(time.time() * 1000)}:{uuid.uuid4().hex[:8]}"
+    run_id = f"{job.id}:{_now_ms()}:{uuid.uuid4().hex[:8]}"
     channel, chat_id, _ = origin_delivery_context(job)
 
     # Per-job model preset wins over the global cron snapshot; fall back to
@@ -293,8 +315,10 @@ async def run_isolated_cron_job(
                 snapshot.get("context_window_tokens") if snapshot else None
             ),
         )
+        agent_finished_at_ms = _now_ms()
     except (Exception, asyncio.CancelledError) as exc:
         error_text = str(exc) or exc.__class__.__name__
+        agent_finished_at_ms = _now_ms()
         job.state.last_delivery_status = "not_attempted"
         job.state.last_delivery_error = error_text
         cron.write_run_record(
@@ -303,6 +327,7 @@ async def run_isolated_cron_job(
                 **run_record_base,
                 "status": "error",
                 "error": error_text,
+                "agent_finished_at_ms": agent_finished_at_ms,
                 "delivery": {"status": "not_attempted", "error": error_text},
             },
         )
@@ -324,8 +349,10 @@ async def run_isolated_cron_job(
         except (Exception, asyncio.CancelledError) as exc:
             delivery_status = "failed"
             delivery_error = str(exc) or exc.__class__.__name__
+            delivery_finished_at_ms = _now_ms()
             job.state.last_delivery_status = delivery_status
             job.state.last_delivery_error = delivery_error
+            job.state.last_delivery_at_ms = delivery_finished_at_ms
             cron.write_run_record(
                 run_id,
                 {
@@ -333,13 +360,20 @@ async def run_isolated_cron_job(
                     "status": "error",
                     "error": f"delivery failed: {delivery_error}",
                     "response": response,
-                    "delivery": {"status": delivery_status, "error": delivery_error},
+                    "agent_finished_at_ms": agent_finished_at_ms,
+                    "delivery": {
+                        "status": delivery_status,
+                        "error": delivery_error,
+                        "at_ms": delivery_finished_at_ms,
+                    },
                 },
             )
             raise
 
+    delivery_finished_at_ms = _now_ms()
     job.state.last_delivery_status = delivery_status
     job.state.last_delivery_error = delivery_error
+    job.state.last_delivery_at_ms = delivery_finished_at_ms
 
     provider_name = _agent_provider_name(agent)
     usage_block = build_usage_block(
@@ -354,7 +388,16 @@ async def run_isolated_cron_job(
             "status": "ok",
             "response": response,
             "usage": usage_block,
-            "delivery": {"status": delivery_status, "error": delivery_error},
+            "agent_finished_at_ms": agent_finished_at_ms,
+            "delivery": {
+                "status": delivery_status,
+                "error": delivery_error,
+                "at_ms": delivery_finished_at_ms,
+            },
         },
     )
-    return response
+    return CronRunResult(
+        response,
+        agent_finished_at_ms=agent_finished_at_ms,
+        delivery_finished_at_ms=delivery_finished_at_ms,
+    )
