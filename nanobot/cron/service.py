@@ -1,6 +1,7 @@
 """Cron service for scheduling agent tasks."""
 
 import asyncio
+import copy
 import json
 import os
 import time
@@ -147,6 +148,9 @@ class CronService:
     ):
         self.store_path = store_path
         self._action_path = store_path.parent / "action.jsonl"
+        self._claims_path = store_path.parent / "claims.json"
+        self._owner = uuid.uuid4().hex
+        self._claim_lease_ms = 300_000
         self._run_records_dir = store_path.parent / "runs"
         self._lock = FileLock(str(self._action_path.parent) + ".lock")
         self.on_job = on_job
@@ -537,7 +541,6 @@ class CronService:
             tasks = [asyncio.create_task(self._execute_due_job(j, now)) for j in due_jobs]
             if tasks:
                 await asyncio.gather(*tasks)
-            self._save_store()
         finally:
             self._timer_active = False
         self._arm_timer()
@@ -561,28 +564,34 @@ class CronService:
         scheduled_ms = job.state.next_run_at_ms
         if scheduled_ms is None:
             return
+        claimed = self._claim_occurrence(job.id, scheduled_ms, require_due=True)
+        if claimed is None:
+            return
+        claimed_job, token = claimed
         late = detected_ms - scheduled_ms
-        if late > max(0, job.misfire_grace_ms) and job.misfire_policy == "skip":
-            job.state.last_status = "skipped"
-            job.state.last_error = f"misfire: {late}ms late"
-            job.state.last_run_at_ms = detected_ms
-            job.state.run_history.append(CronRunRecord(
+        if late > max(0, claimed_job.misfire_grace_ms) and claimed_job.misfire_policy == "skip":
+            claimed_job.state.last_status = "skipped"
+            claimed_job.state.last_error = f"misfire: {late}ms late"
+            claimed_job.state.last_run_at_ms = detected_ms
+            claimed_job.state.run_history.append(CronRunRecord(
                 run_at_ms=detected_ms, scheduled_at_ms=scheduled_ms,
                 detected_at_ms=detected_ms, started_at_ms=None,
-                finished_at_ms=detected_ms, status="skipped", error=job.state.last_error,
+                finished_at_ms=detected_ms, status="skipped", error=claimed_job.state.last_error,
             ))
-            job.state.run_history = job.state.run_history[-self._MAX_RUN_HISTORY:]
-            if job.schedule.kind == "at":
-                if job.delete_after_run:
-                    self._store.jobs = [j for j in self._store.jobs if j.id != job.id]
+            claimed_job.state.run_history = claimed_job.state.run_history[-self._MAX_RUN_HISTORY:]
+            if claimed_job.schedule.kind == "at":
+                if claimed_job.delete_after_run:
+                    claimed_job.enabled = False
                 else:
-                    job.enabled = False
-                    job.state.next_run_at_ms = None
+                    claimed_job.enabled = False
+                    claimed_job.state.next_run_at_ms = None
             else:
-                self._advance_schedule(job, scheduled_ms)
+                self._advance_schedule(claimed_job, scheduled_ms)
+            claimed_job.updated_at_ms = detected_ms
+            self._finalize_claim(claimed_job, scheduled_ms, token)
             return
-        async with self._concurrency:
-            await self._execute_job(job, scheduled_ms, detected_ms)
+        await self._run_claimed(claimed_job, scheduled_ms, detected_ms, token)
+        self._finalize_claim(claimed_job, scheduled_ms, token)
 
     async def _execute_job(self, job: CronJob, scheduled_ms: int | None = None, detected_ms: int | None = None) -> None:
         """Execute a single job."""
@@ -643,6 +652,153 @@ class CronService:
         else:
             # Advance from the scheduled occurrence, not completion time.
             self._advance_schedule(job, scheduled_ms)
+
+    def _read_claims(self) -> dict[str, dict[str, Any]]:
+        try:
+            data = json.loads(self._claims_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except (json.JSONDecodeError, OSError) as exc:
+            raise RuntimeError(f"cron claims store is corrupt: {self._claims_path}") from exc
+        if not isinstance(data, dict) or not all(isinstance(value, dict) for value in data.values()):
+            raise RuntimeError(f"cron claims store has invalid shape: {self._claims_path}")
+        return data
+
+    def _claim_occurrence(
+        self, job_id: str, scheduled_ms: int, *, force: bool = False, require_due: bool = True
+    ) -> tuple[CronJob, str] | None:
+        """Atomically claim one occurrence, without holding the lock while running it."""
+        now = _now_ms()
+        with self._lock:
+            loaded = self._load_jobs()
+            if loaded is None:
+                return None
+            jobs, version = loaded
+            job = next((j for j in jobs if j.id == job_id), None)
+            if job is None or (not force and not job.enabled):
+                return None
+            if require_due and job.state.next_run_at_ms != scheduled_ms:
+                return None
+            # A manual run claims the same pending occurrence as the timer.
+            if not require_due and job.state.next_run_at_ms != scheduled_ms:
+                return None
+            claims = self._read_claims()
+            key = f"{job_id}:{scheduled_ms}"
+            # Remove abandoned claims while holding the same transaction lock.
+            claims = {k: v for k, v in claims.items()
+                      if int(v.get("lease_expires_at_ms", 0)) > now}
+            old = claims.get(key)
+            if old and int(old.get("lease_expires_at_ms", 0)) > now:
+                return None
+            token = uuid.uuid4().hex
+            claims[key] = {
+                "job_id": job_id, "scheduled_at_ms": scheduled_ms,
+                "owner": self._owner, "token": token,
+                "lease_expires_at_ms": now + self._claim_lease_ms,
+            }
+            self._atomic_write(self._claims_path, json.dumps(claims, indent=2))
+            return copy.deepcopy(job), token
+
+    def _renew_claim(self, job_id: str, scheduled_ms: int, token: str) -> bool:
+        with self._lock:
+            claims = self._read_claims()
+            key = f"{job_id}:{scheduled_ms}"
+            claim = claims.get(key)
+            if not claim or claim.get("token") != token:
+                return False
+            claim["lease_expires_at_ms"] = _now_ms() + self._claim_lease_ms
+            self._atomic_write(self._claims_path, json.dumps(claims, indent=2))
+            return True
+
+    async def _claim_heartbeat(self, job_id: str, scheduled_ms: int, token: str) -> None:
+        interval = max(1, self._claim_lease_ms // 3) / 1000
+        while True:
+            await asyncio.sleep(interval)
+            if not self._renew_claim(job_id, scheduled_ms, token):
+                return
+
+    async def _run_claimed(self, job: CronJob, scheduled_ms: int, detected_ms: int, token: str) -> None:
+        heartbeat = asyncio.create_task(self._claim_heartbeat(job.id, scheduled_ms, token))
+        try:
+            async with self._concurrency:
+                await self._execute_job(job, scheduled_ms, detected_ms)
+        finally:
+            heartbeat.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat
+
+    def _finalize_claim(self, job: CronJob, scheduled_ms: int, token: str) -> bool:
+        """Commit execution state only while the claim token is still fenced."""
+        with self._lock:
+            claims = self._read_claims()
+            key = f"{job.id}:{scheduled_ms}"
+            claim = claims.get(key)
+            if not claim or claim.get("token") != token:
+                return False
+
+            loaded = self._load_jobs()
+            if loaded is None:
+                return False
+            jobs, version = loaded
+
+            # Fold legacy queued mutations into the fresh snapshot. Validate
+            # the claim first: a stale worker must never consume another
+            # process's pending actions.
+            actions_changed = False
+            if self._action_path.exists():
+                jobs_map = {item.id: item for item in jobs}
+                with open(self._action_path, "r", encoding="utf-8") as action_file:
+                    for line in action_file:
+                        try:
+                            action = json.loads(line)
+                            params = action.get("params", {})
+                            if action.get("action") == "del":
+                                jobs_map.pop(params.get("job_id"), None)
+                                actions_changed = True
+                            elif action.get("action") in ("add", "update"):
+                                changed_job = CronJob.from_dict(params)
+                                _normalize_agent_turn_job(changed_job)
+                                jobs_map[changed_job.id] = changed_job
+                                actions_changed = True
+                        except Exception:
+                            logger.exception("load action line error during claim finalization")
+                if actions_changed:
+                    jobs = list(jobs_map.values())
+
+            current = next((item for item in jobs if item.id == job.id), None)
+            if current is None:
+                claims.pop(key, None)
+                self._atomic_write(self._claims_path, json.dumps(claims, indent=2))
+                return False
+
+            # Keep edits made while the agent was running. Execution owns only
+            # runtime state, and advances the schedule only if it is unchanged.
+            same_occurrence = current.state.next_run_at_ms == scheduled_ms
+            current.state.last_run_at_ms = job.state.last_run_at_ms
+            current.state.last_status = job.state.last_status
+            current.state.last_error = job.state.last_error
+            current.state.last_delivery_status = job.state.last_delivery_status
+            current.state.last_delivery_error = job.state.last_delivery_error
+            current.state.run_history = job.state.run_history
+            if same_occurrence:
+                current.state.next_run_at_ms = job.state.next_run_at_ms
+                current.enabled = job.enabled
+                if job.delete_after_run and current.schedule.kind == "at":
+                    jobs = [item for item in jobs if item.id != job.id]
+            current.updated_at_ms = max(current.updated_at_ms, job.updated_at_ms)
+            self._store = CronStore(version=version, jobs=jobs)
+            self._save_store_unlocked()
+            if actions_changed:
+                self._atomic_write(self._action_path, "")
+            claims.pop(key, None)
+            self._atomic_write(self._claims_path, json.dumps(claims, indent=2))
+            return True
+
+    def _save_store_unlocked(self) -> None:
+        """Save while the caller owns the process-wide persistence lock."""
+        # _save_store is lock-taking for ordinary mutations; this variant is
+        # used by the claim finalization transaction to avoid re-entrancy.
+        self._save_store()
 
     def _append_action(self, action: Literal["add", "del", "update"], params: dict):
         self.store_path.parent.mkdir(parents=True, exist_ok=True)
@@ -869,19 +1025,21 @@ class CronService:
         return job
 
     async def run_job(self, job_id: str, force: bool = False) -> bool:
-        """Manually run a job without disturbing the service's running state."""
+        """Manually run a job; manual and timer runs share occurrence claims."""
         was_running = self._running
         self._running = True
         try:
             store = self._load_store()
-            for job in store.jobs:
-                if job.id == job_id:
-                    if not force and not job.enabled:
-                        return False
-                    await self._execute_job(job)
-                    self._save_store()
-                    return True
-            return False
+            job = next((j for j in store.jobs if j.id == job_id), None)
+            if job is None or (not force and not job.enabled) or job.state.next_run_at_ms is None:
+                return False
+            scheduled_ms = job.state.next_run_at_ms
+            claimed = self._claim_occurrence(job_id, scheduled_ms, force=force, require_due=False)
+            if claimed is None:
+                return False
+            claimed_job, token = claimed
+            await self._run_claimed(claimed_job, scheduled_ms, _now_ms(), token)
+            return self._finalize_claim(claimed_job, scheduled_ms, token)
         finally:
             self._running = was_running
             if was_running:
