@@ -611,6 +611,7 @@ class TestAnnounceResult:
             "status": "ok",
             "stop_reason": None,
             "result": "result text",
+            "record_path": str(sm.records_dir / "t1.json"),
         }
 
     @pytest.mark.asyncio

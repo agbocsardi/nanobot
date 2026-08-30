@@ -29,7 +29,16 @@ from nanobot.security.workspace_access import (
     workspace_sandbox_status,
 )
 from nanobot.utils.prompt_templates import render_template
-from nanobot.utils.run_records import build_usage_block, write_run_record
+from nanobot.utils.run_records import (
+    build_usage_block,
+    safe_record_name,
+    write_run_record,
+)
+
+# Bounded tool-event persistence: a 121-iteration run must not balloon the
+# record file, so only the most recent events are persisted (schema stays
+# additive — old records without enriched fields remain readable).
+MAX_PERSISTED_TOOL_EVENTS = 50
 
 
 @dataclass(slots=True)
@@ -525,6 +534,7 @@ class SubagentManager:
                     hook=_SubagentHook(task_id, status),
                     max_iterations_message="Task ended without a verified final synthesis.",
                     finalize_on_max_iterations=True,
+                    record_tool_details=True,
                     error_message=None,
                     fail_on_tool_error=False,
                     checkpoint_callback=_on_checkpoint,
@@ -622,6 +632,10 @@ class SubagentManager:
                 model=run_model,
             )
 
+    def _record_path(self, task_id: str) -> Path:
+        """Deterministic path where this run's record will be written."""
+        return self.records_dir / f"{safe_record_name(task_id)}.json"
+
     async def _announce_result(
         self,
         task_id: str,
@@ -635,6 +649,7 @@ class SubagentManager:
     ) -> None:
         """Announce the subagent result to the main agent via the message bus."""
         status_text = "completed successfully" if status == "ok" else "failed"
+        record_path = self._record_path(task_id)
 
         announce_content = render_template(
             "agent/subagent_announce.md",
@@ -642,6 +657,7 @@ class SubagentManager:
             status_text=status_text,
             task=task,
             result=result,
+            record_path=str(record_path),
         )
 
         # Inject as system message to trigger main agent.
@@ -659,6 +675,7 @@ class SubagentManager:
                 "status": status,
                 "stop_reason": stop_reason,
                 "result": result,
+                "record_path": str(record_path),
             },
         }
         if origin_message_id:
@@ -840,12 +857,15 @@ class SubagentManager:
                 provider=self._provider_name(provider),
                 model=model or self.model,
             ),
-            "tool_events": list(status.tool_events),
+            # Bounded persistence: only the most recent events are kept so
+            # 121-iteration runs stay compact. Keys are additive (args/preview)
+            # and absent on old records, which remain readable.
+            "tool_events": list(status.tool_events)[-MAX_PERSISTED_TOOL_EVENTS:],
             "context": dict(status.context_report),
             "result": result_text,
         }
         try:
-            write_run_record(self.records_dir, task_id, record)
+            return write_run_record(self.records_dir, task_id, record)
         except OSError:
             # Records are observability-only; never let a write failure
             # propagate into the subagent announce path.
