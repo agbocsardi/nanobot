@@ -94,6 +94,9 @@ async def test_runner_forces_continue_when_goal_active():
         max_iterations=3,
         max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
         goal_active_predicate=lambda: True,
+        # Mirror the loop: when a goal continuation owns the response, the
+        # runner slice ends at max_iterations without a no-tools finalization.
+        finalize_on_max_iterations=False,
     ))
 
     # Because the predicate keeps returning True, the runner should never
@@ -124,6 +127,7 @@ async def test_runner_respects_max_iterations_even_with_active_goal():
         max_iterations=1,
         max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
         goal_active_predicate=lambda: True,
+        finalize_on_max_iterations=False,
     ))
 
     assert result.stop_reason == "max_iterations"

@@ -50,6 +50,14 @@ if TYPE_CHECKING:
             ),
             minimum=1,
         ),
+        max_tokens=IntegerSchema(
+            description=(
+                "Optional cap on completion tokens the subagent's model may "
+                "produce per response. Overrides the provider's default output "
+                "token budget for this spawn only."
+            ),
+            minimum=1,
+        ),
         required=["task"],
     )
 )
@@ -99,6 +107,7 @@ class SpawnTool(Tool, ContextAware):
         model_preset: str | None = None,
         max_iterations: int | None = None,
         context_window_tokens: int | None = None,
+        max_tokens: int | None = None,
         **kwargs: Any,
     ) -> str:
         """Spawn a subagent to execute the given task."""
@@ -114,6 +123,7 @@ class SpawnTool(Tool, ContextAware):
                 model_preset=model_preset,
                 max_iterations=max_iterations,
                 context_window_tokens=context_window_tokens,
+                max_tokens=max_tokens,
                 workspace_scope=current_workspace_scope(),
             )
         except (ValueError, KeyError, RuntimeError) as e:

@@ -1,6 +1,7 @@
 """Tests for SubagentManager lifecycle — spawn, run, announce, cancel."""
 
 import asyncio
+import json
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -289,6 +290,73 @@ class TestSpawn:
 
 
 # ---------------------------------------------------------------------------
+# queue-full structured rejection
+# ---------------------------------------------------------------------------
+
+
+class TestQueueFullRejection:
+    @pytest.mark.asyncio
+    async def test_full_queue_raises_structured_error(self, tmp_path):
+        from nanobot.agent.subagent import QueueFullError
+
+        sm = _manager(
+            tmp_path,
+            max_concurrent_subagents=1,
+            max_queued_subagents=2,
+        )
+        release = asyncio.Event()
+
+        async def _slow_run(spec):
+            await release.wait()
+            return AgentRunResult(final_content="done", messages=[], stop_reason="completed")
+
+        sm.runner.run = _slow_run
+        await sm.spawn("first", session_key="s1")
+        await sm.spawn("second", session_key="s1")
+        await sm.spawn("third", session_key="s1")
+
+        with pytest.raises(QueueFullError) as excinfo:
+            await sm.spawn("fourth", session_key="s1")
+
+        err = excinfo.value
+        assert err.queue_length == 2
+        assert err.position == 3  # would occupy the (full) third queue slot
+        assert err.capacity == 2
+        assert err.would_wait is True
+        assert "queue is full" in str(err)
+        assert "2/2" in str(err)
+
+        release.set()
+        await _drain_subagent_tasks(sm)
+
+    @pytest.mark.asyncio
+    async def test_normal_saturation_queues_instead_of_raising(self, tmp_path):
+        """Below the queue bound, saturation queues rather than rejecting."""
+        sm = _manager(
+            tmp_path,
+            max_concurrent_subagents=1,
+            max_queued_subagents=2,
+        )
+        release = asyncio.Event()
+
+        async def _slow_run(spec):
+            await release.wait()
+            return AgentRunResult(final_content="done", messages=[], stop_reason="completed")
+
+        sm.runner.run = _slow_run
+        await sm.spawn("running", session_key="s1")
+        await sm.spawn("queued-1", session_key="s1")
+        await sm.spawn("queued-2", session_key="s1")  # still within the bound
+        await asyncio.sleep(0)  # let the first task acquire the execution slot
+
+        assert sm.get_executing_count() == 1
+        assert sm.get_queued_count() == 2
+        release.set()
+        await _drain_subagent_tasks(sm)
+        assert sm.get_running_count() == 0
+
+
+# ---------------------------------------------------------------------------
 # _run_subagent
 # ---------------------------------------------------------------------------
 
@@ -474,7 +542,44 @@ class TestRunSubagent:
             )
 
         assert status.phase == "incomplete"
+        assert status.stop_reason == stop_reason
         assert announce.call_args.args[-2] == "error"
+        assert announce.call_args.kwargs["stop_reason"] == stop_reason
+        record = json.loads((tmp_path / "subagents" / "t1.json").read_text(encoding="utf-8"))
+        assert record["phase"] == "incomplete"
+        assert record["stop_reason"] == stop_reason
+
+    @pytest.mark.asyncio
+    async def test_budget_exhausted_but_finalized_settles_completed(self, tmp_path):
+        """A run that hit max_iterations but finalized with a real answer settles
+        as completed: phase, announcement, and persisted record all agree."""
+        sm = _manager(tmp_path)
+        sm.runner.run = AsyncMock(return_value=AgentRunResult(
+            final_content="Final synthesis after exhausting the budget.",
+            messages=[],
+            stop_reason="completed",
+        ))
+        status = SubagentStatus(
+            task_id="t1",
+            label="label",
+            task_description="do task",
+            started_at=time.monotonic(),
+        )
+
+        with patch.object(sm, "_announce_result", new_callable=AsyncMock) as announce:
+            await sm._run_subagent(
+                "t1", "do task", "label",
+                {"channel": "cli", "chat_id": "direct"}, status,
+            )
+
+        assert status.phase == "completed"
+        assert status.stop_reason == "completed"
+        assert announce.call_args.args[-2] == "ok"
+        assert announce.call_args.kwargs["stop_reason"] == "completed"
+        record = json.loads((tmp_path / "subagents" / "t1.json").read_text(encoding="utf-8"))
+        assert record["phase"] == "completed"
+        assert record["stop_reason"] == "completed"
+        assert record["result"] == "Final synthesis after exhausting the budget."
 
 
 # ---------------------------------------------------------------------------

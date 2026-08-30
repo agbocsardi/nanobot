@@ -300,6 +300,118 @@ async def test_spawn_tool_queues_when_at_concurrency_limit(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_spawn_max_tokens_override_threads_to_spec(tmp_path):
+    """max_tokens passed to spawn should reach the AgentRunSpec."""
+    from nanobot.agent.subagent import SubagentManager
+    from nanobot.bus.queue import MessageBus
+
+    bus = MessageBus()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "default-model"
+    mgr = SubagentManager(
+        provider=provider,
+        workspace=tmp_path,
+        bus=bus,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    )
+    mgr._announce_result = AsyncMock()
+
+    seen = {}
+
+    async def fake_run(spec):
+        seen["max_tokens"] = spec.max_tokens
+        return SimpleNamespace(
+            stop_reason="done", final_content="done", error=None, tool_events=[],
+        )
+
+    mgr.runner.run = AsyncMock(side_effect=fake_run)
+
+    await mgr.spawn(task="do task", max_tokens=3072)
+    await asyncio.gather(*mgr._running_tasks.values(), return_exceptions=True)
+
+    assert seen["max_tokens"] == 3072
+
+
+@pytest.mark.asyncio
+async def test_spawn_tool_max_tokens_reaches_manager_and_spec(tmp_path):
+    """The spawn tool schema must accept max_tokens and forward it end-to-end."""
+    from nanobot.agent.subagent import SubagentManager
+    from nanobot.agent.tools.context import RequestContext
+    from nanobot.agent.tools.spawn import SpawnTool
+    from nanobot.bus.queue import MessageBus
+
+    bus = MessageBus()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    mgr = SubagentManager(
+        provider=provider,
+        workspace=tmp_path,
+        bus=bus,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    )
+    mgr._announce_result = AsyncMock()
+
+    seen = {}
+
+    async def fake_run(spec):
+        seen["max_tokens"] = spec.max_tokens
+        return SimpleNamespace(
+            stop_reason="done", final_content="done", error=None, tool_events=[],
+        )
+
+    mgr.runner.run = AsyncMock(side_effect=fake_run)
+    tool = SpawnTool(mgr)
+    tool.set_context(RequestContext(channel="test", chat_id="c1", session_key="test:c1"))
+
+    result = await tool.execute(task="do task", max_tokens=5120)
+    assert "started" in result
+    await asyncio.gather(*mgr._running_tasks.values(), return_exceptions=True)
+    assert seen["max_tokens"] == 5120
+
+
+@pytest.mark.asyncio
+async def test_spawn_tool_queue_full_rejection_is_structured(tmp_path):
+    """Queue-full rejection message must carry length, position, and capacity."""
+    from nanobot.agent.subagent import SubagentManager
+    from nanobot.agent.tools.context import RequestContext
+    from nanobot.agent.tools.spawn import SpawnTool
+    from nanobot.bus.queue import MessageBus
+
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    mgr = SubagentManager(
+        provider=provider,
+        workspace=tmp_path,
+        bus=MessageBus(),
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        max_concurrent_subagents=1,
+        max_queued_subagents=1,
+    )
+    mgr._announce_result = AsyncMock()
+    release = asyncio.Event()
+
+    async def fake_run(spec):
+        await release.wait()
+        return AgentRunResult(final_content="done", messages=[], stop_reason="completed")
+
+    mgr.runner.run = AsyncMock(side_effect=fake_run)
+    tool = SpawnTool(mgr)
+    tool.set_context(RequestContext(channel="test", chat_id="c1", session_key="test:c1"))
+
+    assert "started" in await tool.execute(task="first")
+    assert "queued" in await tool.execute(task="second")
+    rejected = await tool.execute(task="third")
+
+    assert "Cannot spawn subagent" in rejected
+    assert "queue is full" in rejected
+    assert "1/1" in rejected          # queue length / capacity
+    assert "capacity 1" in rejected
+    assert "position 2" in rejected   # would occupy the next (full) slot
+    release.set()
+    await asyncio.gather(*mgr._running_tasks.values(), return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_spawn_tool_rejects_only_when_bounded_queue_is_full(tmp_path):
     from nanobot.agent.subagent import SubagentManager
     from nanobot.agent.tools.context import RequestContext

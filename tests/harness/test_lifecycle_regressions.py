@@ -26,7 +26,9 @@ async def test_iteration_exhaustion_uses_reserved_final_synthesis() -> None:
         max_iterations=1,
     )
 
-    assert result.stop_reason == "max_iterations"
+    # The no-tools finalization produced a real final answer, so the run
+    # settles as completed rather than retaining stop_reason="max_iterations".
+    assert result.stop_reason == "completed"
     assert result.final_content == "I reached the budget before verification."
     assert result.messages[-1] == {
         "role": "assistant",
