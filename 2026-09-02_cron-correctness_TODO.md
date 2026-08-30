@@ -67,3 +67,7 @@
 - Merged #25 final tranche as 9b06b10e (c04e8ad4) and closed issue #25.
 - memory_search v1 merged earlier as 736a29bb; issue #1 commented with remaining semantic work.
 - Waiting on the delegated-run (#20) worker.
+
+- Finished #20: closed; merged as b9e1c4e5 (6f6489ea).
+- #1: v1 memory_search shipped; issue stays open for semantic/ranking/indexing follow-ups.
+- Cleaned up worktrees and local topic branches; CI green on all merged pushes.
