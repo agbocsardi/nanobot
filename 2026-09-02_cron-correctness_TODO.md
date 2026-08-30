@@ -63,3 +63,7 @@
   - `feat/memory-search` (/home/gergo/projects/fork-nanobot-1): built-in memory_search tool (exact search, structured filters, memory-file search, read-only), start #1.
 - Spawned three Luna workers (cron-finalize, delegated-finalize, memory-search-tool); each syncs its own venv, works only in its worktree, and does not commit.
 - After workers reply: review diffs, validate, merge each branch into main, push, post issue comments/closures, update TODO.
+
+- Merged #25 final tranche as 9b06b10e (c04e8ad4) and closed issue #25.
+- memory_search v1 merged earlier as 736a29bb; issue #1 commented with remaining semantic work.
+- Waiting on the delegated-run (#20) worker.
