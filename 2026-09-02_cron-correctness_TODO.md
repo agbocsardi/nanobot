@@ -9,7 +9,8 @@
 - [x] Design #25 misfire, claim/lease, bounded concurrency, and diagnostics behavior
 - [x] Implement and test the agreed #25 correctness tranche
 - [x] Run targeted and full validation
-- [ ] Commit, merge to `main`, push, and deploy to `uhl`
+- [x] Commit, merge to `main`, and push
+- [ ] Deploy to `uhl`
 
 ## Log
 
@@ -30,3 +31,4 @@
 - Exposed misfire controls and secret-free claim/lease diagnostics through `cron list`; added timeout and delivery-failure coverage.
 - Repository validation passed: Ruff clean and 2,967 pytest tests passed (one existing aiohttp deprecation warning).
 - Remaining #25 follow-up: separate agent-finished and delivery-finished timestamps, plus eventual retirement of the legacy action log.
+- Merged as `f355e16b` and pushed `origin/main`; deployment is blocked because hostname `uhl` did not resolve from this session.
