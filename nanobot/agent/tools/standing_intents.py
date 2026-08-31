@@ -22,7 +22,11 @@ from typing import Any
 
 from nanobot.agent.tools._durable_store import DurableJsonStore
 from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
-from nanobot.agent.tools.context import ContextAware, RequestContext
+from nanobot.agent.tools.context import (
+    ContextAware,
+    RequestContext,
+    current_request_context,
+)
 from nanobot.agent.tools.schema import (
     ArraySchema,
     StringSchema,
@@ -335,6 +339,20 @@ class IntentTool(Tool, ContextAware):
         intent_id: str | None = None,
         **kwargs: Any,
     ) -> ToolResult:
+        # Follow-up injections and turn continuations keep the same run alive
+        # without a fresh dispatch, so the stamped tool context can go stale.
+        # Fall back to the run-bound request context (same pattern as ask_user).
+        if not self._sender_id or not self._session_key:
+            bound_ctx = current_request_context()
+            if bound_ctx is not None:
+                if bound_ctx.sender_id:
+                    self._sender_id = str(bound_ctx.sender_id)
+                if bound_ctx.session_key:
+                    self._session_key = bound_ctx.session_key
+                if bound_ctx.channel:
+                    self._channel = bound_ctx.channel
+                if bound_ctx.chat_id:
+                    self._chat_id = str(bound_ctx.chat_id)
         store = self._store()
         if action == "add":
             if not self._session_key or not self._sender_id:
