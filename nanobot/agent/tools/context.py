@@ -21,6 +21,7 @@ class RequestContext:
     chat_id: str
     message_id: str | None = None
     session_key: str | None = None
+    sender_id: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     # Session-scoped interactive approval store consulted by the policy engine
     # for ask outcomes. None outside interactive agent turns (e.g. standalone

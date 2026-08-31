@@ -17,6 +17,13 @@ RUNTIME_CONTROL_ACK = "_ack"
 RUNTIME_CONTROL_MCP_RELOAD = "mcp_reload"
 
 
+# A button is either a legacy plain label string (rendered with the label as
+# callback value where the channel supports it) or a structured spec with a
+# display label and an opaque callback_value (used by ask_user so the visible
+# label is never the callback payload).
+ButtonSpec = str | dict[str, str]
+
+
 @dataclass
 class InboundMessage:
     """Message received from a chat channel."""
@@ -51,4 +58,4 @@ class OutboundMessage:
     reply_to: str | None = None
     media: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
-    buttons: list[list[str]] = field(default_factory=list)
+    buttons: list[list[ButtonSpec]] = field(default_factory=list)

@@ -13,7 +13,8 @@ try:
 except ImportError:
     pytest.skip("Telegram dependencies not installed (python-telegram-bot)", allow_module_level=True)
 
-from nanobot.bus.events import OUTBOUND_META_REACTION, OutboundMessage
+from nanobot.agent.tools.ask_user import PendingQuestionStore, question_callback_value
+from nanobot.bus.events import OUTBOUND_META_REACTION, InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.telegram import (
     TELEGRAM_RECOVERY_BACKOFF_INITIAL,
@@ -390,7 +391,7 @@ async def test_start_webhook_mode(monkeypatch) -> None:
         "port": 8081,
         "url_path": "telegram",
         "webhook_url": "https://example.com/telegram",
-        "allowed_updates": ["message", "edited_message", "message_reaction"],
+        "allowed_updates": ["message", "edited_message", "message_reaction", "callback_query"],
         "drop_pending_updates": False,
         "secret_token": "secret-token",
         "max_connections": 1,
@@ -3352,3 +3353,195 @@ async def test_stop_cancels_supervisor_and_tears_down_app() -> None:
 
     assert channel._app is None  # torn down, not leaked
     assert channel._supervisor is None
+
+# --- ask_user durable question adapter (issue #26) ----------------------------
+
+
+class _FakeBus:
+    def __init__(self) -> None:
+        self.outbound: list[OutboundMessage] = []
+        self.inbound: list[InboundMessage] = []
+
+    async def publish_outbound(self, msg: OutboundMessage) -> None:
+        self.outbound.append(msg)
+
+    async def publish_inbound(self, msg: InboundMessage) -> None:
+        self.inbound.append(msg)
+
+
+def _channel(tmp_path: Path, *, inline_keyboards: bool = False) -> tuple[TelegramChannel, _FakeBus]:
+    config = TelegramConfig(
+        enabled=True,
+        token="123:abc",
+        allow_from=["*"],
+        inline_keyboards=inline_keyboards,
+    )
+    bus = _FakeBus()
+    channel = TelegramChannel(config, bus)
+    channel.workspace = tmp_path
+    return channel, bus
+
+
+def _query(*, data: str, chat_id: int = 123) -> SimpleNamespace:
+    message = None if chat_id is None else SimpleNamespace(chat_id=chat_id)
+    return SimpleNamespace(
+        id="cq1",
+        data=data,
+        answer=AsyncMock(),
+        edit_reply_markup=AsyncMock(),
+        message=message,
+    )
+
+
+def _user() -> SimpleNamespace:
+    return SimpleNamespace(id=7, username="alice", first_name="Alice")
+
+
+def _callback(channel, query, user) -> SimpleNamespace:
+    return SimpleNamespace(
+        callback_query=query,
+        effective_user=user,
+    )
+
+
+# ---------------------------------------------------------------------------
+# keyboard rendering
+# ---------------------------------------------------------------------------
+
+
+def test_build_keyboard_structured_buttons_render_without_inline_flag(tmp_path) -> None:
+    channel, _ = _channel(tmp_path, inline_keyboards=False)
+
+    markup = channel._build_keyboard(
+        [[{"label": "Yes", "callback_value": "pq:abcd1234:a"}]]
+    )
+
+    assert markup is not None
+    button = markup.inline_keyboard[0][0]
+    assert button.text == "Yes"
+    assert button.callback_data == "pq:abcd1234:a"
+
+
+def test_build_keyboard_legacy_strings_gated_on_inline_keyboards(tmp_path) -> None:
+    channel_off, _ = _channel(tmp_path, inline_keyboards=False)
+    channel_on, _ = _channel(tmp_path, inline_keyboards=True)
+
+    assert channel_off._build_keyboard([["Yes"]]) is None
+    markup = channel_on._build_keyboard([["Yes"]])
+    assert markup is not None
+    assert markup.inline_keyboard[0][0].callback_data == "Yes"
+
+
+# ---------------------------------------------------------------------------
+# callback routing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_question_callback_creates_one_structured_inbound_turn(tmp_path) -> None:
+    channel, bus = _channel(tmp_path)
+    store = PendingQuestionStore(tmp_path)
+    question = store.create(
+        prompt="pick one",
+        option_labels=["yes", "no"],
+        channel="telegram",
+        chat_id="123",
+        session_key="telegram:123",
+        sender_id="7|alice",
+    )
+    payload = question_callback_value(question.question_id, "a")
+    query = _query(data=payload, chat_id=123)
+
+    await channel._on_callback_query(_callback(channel, query, _user()), None)
+
+    query.answer.assert_awaited_once()
+    assert query.answer.call_args.kwargs.get("text") == "Answered: yes"
+    assert len(bus.inbound) == 1
+    msg = bus.inbound[0]
+    assert msg.content.startswith("Answered question ")
+    assert msg.metadata["question_id"] == question.question_id
+    assert msg.metadata["option_id"] == "a"
+    assert msg.metadata["question_answer"] is True
+    assert msg.session_key == "telegram:123"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_tap_acks_without_second_turn(tmp_path) -> None:
+    channel, bus = _channel(tmp_path)
+    store = PendingQuestionStore(tmp_path)
+    question = store.create(
+        prompt="pick one",
+        option_labels=["yes", "no"],
+        channel="telegram",
+        chat_id="123",
+        session_key="telegram:123",
+        sender_id="7|alice",
+    )
+    payload = question_callback_value(question.question_id, "a")
+    query = _query(data=payload, chat_id=123)
+
+    await channel._on_callback_query(_callback(channel, query, _user()), None)
+    await channel._on_callback_query(_callback(channel, query, _user()), None)
+
+    assert len(bus.inbound) == 1
+    assert query.answer.await_count == 2
+    assert query.answer.call_args.kwargs.get("text") == "Already answered."
+
+
+@pytest.mark.asyncio
+async def test_wrong_user_gets_polite_ack_without_turn(tmp_path) -> None:
+    channel, bus = _channel(tmp_path)
+    store = PendingQuestionStore(tmp_path)
+    question = store.create(
+        prompt="pick one",
+        option_labels=["yes", "no"],
+        channel="telegram",
+        chat_id="123",
+        session_key="telegram:123",
+        sender_id="7|alice",
+    )
+    payload = question_callback_value(question.question_id, "a")
+    query = _query(data=payload, chat_id=123)
+    other_user = SimpleNamespace(id=99, username="mallory", first_name="Mallory")
+
+    await channel._on_callback_query(_callback(channel, query, other_user), None)
+
+    assert len(bus.inbound) == 0
+    assert query.answer.call_args.kwargs.get("text") == "Not available to you."
+
+
+@pytest.mark.asyncio
+async def test_expired_question_gets_expired_ack(tmp_path) -> None:
+    channel, bus = _channel(tmp_path)
+    store = PendingQuestionStore(tmp_path)
+    question = store.create(
+        prompt="pick one",
+        option_labels=["yes", "no"],
+        channel="telegram",
+        chat_id="123",
+        session_key="telegram:123",
+        sender_id="7|alice",
+        expires_at_ms=1,
+    )
+    payload = question_callback_value(question.question_id, "a")
+    query = _query(data=payload, chat_id=123)
+
+    await channel._on_callback_query(_callback(channel, query, _user()), None)
+
+    assert len(bus.inbound) == 0
+    assert query.answer.call_args.kwargs.get("text") == "This question expired."
+
+
+@pytest.mark.asyncio
+async def test_legacy_string_callback_still_routes_message(tmp_path) -> None:
+    channel, bus = _channel(tmp_path, inline_keyboards=True)
+    channel._start_typing = lambda *args, **kwargs: None
+    query = _query(data="Yes", chat_id=123)
+
+    await channel._on_callback_query(_callback(channel, query, _user()), None)
+
+    assert len(bus.inbound) == 1
+    msg = bus.inbound[0]
+    assert msg.content == "Yes"
+    assert msg.metadata.get("is_callback") is True
+    assert "question_id" not in msg.metadata

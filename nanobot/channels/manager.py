@@ -87,6 +87,7 @@ class ChannelManager:
                 continue
             try:
                 channel = cls(section, self.bus)
+                channel.workspace = getattr(self.config, "workspace_path", None)
                 channel.send_progress = self._resolve_bool_override(
                     section, "send_progress", self.config.channels.send_progress,
                 )

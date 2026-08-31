@@ -673,7 +673,7 @@ class AgentLoop:
     def _set_tool_context(
         self, channel: str, chat_id: str,
         message_id: str | None = None, metadata: dict | None = None,
-        session_key: str | None = None,
+        session_key: str | None = None, sender_id: str | None = None,
     ) -> None:
         """Update context for all tools that need routing info."""
         from nanobot.agent.tools.context import ContextAware
@@ -688,6 +688,7 @@ class AgentLoop:
             chat_id=chat_id,
             message_id=message_id,
             session_key=effective_key,
+            sender_id=sender_id,
             metadata=self._effective_turn_metadata(metadata),
             approvals=self.approval_store(effective_key),
         )
@@ -1413,7 +1414,7 @@ class AgentLoop:
             self.sessions.save(session)
         self._set_tool_context(
             channel, chat_id, msg.metadata.get("message_id"),
-            msg.metadata, session_key=key,
+            msg.metadata, session_key=key, sender_id=None if is_subagent else msg.sender_id,
         )
         current_role = "assistant" if is_subagent else "user"
         _hist_kwargs: dict[str, Any] = {
@@ -1709,6 +1710,7 @@ class AgentLoop:
             ctx.msg.metadata.get("message_id"),
             ctx.msg.metadata,
             session_key=ctx.session_key,
+            sender_id=ctx.msg.sender_id,
         )
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
