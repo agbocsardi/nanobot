@@ -41,6 +41,7 @@ from nanobot.agent.tools.policy import (
 )
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.self import MyTool
+from nanobot.agent.tools.standing_intents import StandingIntentStore, source_digest
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.progress import build_bus_progress_callback
 from nanobot.bus.queue import MessageBus
@@ -329,6 +330,7 @@ class AgentLoop:
         # One file-read/write tracker per logical session. The tool registry is
         # shared by this loop, so tools resolve the active state via contextvars.
         self._file_state_store = FileStateStore(max_sessions=MAX_FILE_STATE_SESSIONS)
+        self._standing_intents = StandingIntentStore(workspace)
         self.runner = AgentRunner(provider)
         self.subagents = SubagentManager(
             provider=provider,
@@ -697,6 +699,45 @@ class AgentLoop:
             tool = self.tools.get(name)
             if tool and isinstance(tool, ContextAware):
                 tool.set_context(request_ctx)
+
+    def _fire_standing_intents(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        session_key: str,
+        sender_id: str,
+        source_key: str,
+        text: str,
+        messages: list[dict[str, Any]],
+    ) -> None:
+        """Deterministically fire owned standing intents for one trusted turn.
+
+        Wall-clock/durability safe: the store performs atomic claim semantics;
+        failures here never break the user turn.
+        """
+        try:
+            fired = self._standing_intents.match_and_fire(
+                session_key=session_key,
+                sender_id=sender_id,
+                source_key=source_key,
+                text=text,
+            )
+        except Exception:
+            logger.warning("Standing intent match failed", exc_info=True)
+            return
+        for intent in fired:
+            messages.insert(
+                0,
+                {
+                    "role": "system",
+                    "content": (
+                        "[Standing reminder fired (id: {})] {}".format(
+                            intent.intent_id, intent.reminder
+                        )
+                    ),
+                },
+            )
 
     @staticmethod
     def _runtime_chat_id(msg: InboundMessage) -> str:
@@ -1442,6 +1483,25 @@ class AgentLoop:
             unified_session=self._unified_session,
             input_token_budget=self._replay_token_budget(),
         )
+        # Standing intents (#28): deterministic matches over trusted user text,
+        # before prompt construction. Reminders surface as system lines and
+        # never rewrite the user's own content; fires are atomic/deduped.
+        if not is_subagent and channel != "system":
+            self._fire_standing_intents(
+                channel=channel,
+                chat_id=chat_id,
+                session_key=key,
+                sender_id=msg.sender_id,
+                source_key=source_digest(
+                    channel,
+                    chat_id,
+                    key,
+                    msg.metadata.get("update_id") or msg.metadata.get("message_id"),
+                    msg.content,
+                ),
+                text=msg.content,
+                messages=messages,
+            )
         context_report = dict(self.context.last_context_report)
         t_wall = time.time()
         final_content, _, all_msgs, stop_reason, _ = await self._run_agent_loop(
