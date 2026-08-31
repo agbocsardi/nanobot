@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -64,6 +65,7 @@ class SubagentStatus:
     effective_budgets: dict[str, Any] = field(default_factory=dict)
     context_report: dict[str, Any] = field(default_factory=dict)
     holds_capacity: bool = False
+    retry_of: str | None = None
 
 
 class QueueFullError(RuntimeError):
@@ -253,6 +255,8 @@ class SubagentManager:
         context_window_tokens: int | None = None,
         max_tokens: int | None = None,
         workspace_scope: WorkspaceScope | None = None,
+        origin_sender_id: str | None = None,
+        retry_of: str | None = None,
     ) -> str:
         """Spawn a subagent to execute a task in the background."""
         queued_count = self.get_queued_count()
@@ -265,6 +269,8 @@ class SubagentManager:
         task_id = str(uuid.uuid4())[:8]
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
         origin = {"channel": origin_channel, "chat_id": origin_chat_id, "session_key": session_key}
+        if origin_sender_id is not None:
+            origin["sender_id"] = str(origin_sender_id)
 
         provider_override: LLMProvider | None = None
         model_override: str | None = None
@@ -294,6 +300,7 @@ class SubagentManager:
                 "model_preset": model_preset,
             },
             phase="queued" if queued else "running",
+            retry_of=retry_of,
         )
         self._task_statuses[task_id] = status
 
@@ -658,6 +665,183 @@ class SubagentManager:
         """Deterministic path where this run's record will be written."""
         return self.records_dir / f"{safe_record_name(task_id)}.json"
 
+    # ------------------------------------------------------------------
+    # Task-control surface (issue #27): durable, session-scoped, bounded.
+    # ------------------------------------------------------------------
+
+    _TASK_LIST_LIMIT = 20
+    _TASK_CHAT_TEXT_LIMIT = 800
+
+    @staticmethod
+    def _truncate_chat(text: str | None, limit: int = _TASK_CHAT_TEXT_LIMIT) -> str:
+        """Bounded, single-line-safe text for chat output."""
+        text = (text or "").strip().replace("\n", " ")
+        if len(text) <= limit:
+            return text
+        return text[: max(0, limit - 1)] + "\u2026"
+
+    @classmethod
+    def task_status_vocabulary(cls, record: dict[str, Any]) -> str:
+        """Map a durable record to the chat status vocabulary.
+
+        queued/running/waiting are live states; terminal states map by
+        stop_reason. ``waiting`` is deliberately only derived from the
+        existing waiting_for_capacity activity (never fabricated).
+        """
+        phase = str(record.get("phase") or "")
+        if phase == "queued" or phase == "running":
+            if phase == "queued" and str(record.get("activity") or "") == "waiting_for_capacity":
+                return "waiting"
+            return phase
+        stop_reason = str(record.get("stop_reason") or "")
+        if phase == "cancelled" or stop_reason == "cancelled":
+            return "cancelled"
+        if stop_reason == "completed" or phase == "completed":
+            return "completed"
+        if stop_reason in ("partial_completion", "empty_final_response", "max_iterations"):
+            return "incomplete"
+        if stop_reason in ("error", "provider_error", "tool_error", "policy_block", "exception"):
+            return "failed"
+        return "failed"
+
+    def read_run_record(self, task_id: str) -> dict[str, Any] | None:
+        """Return one durable subagent run record (disk is the source of truth)."""
+        path = self._record_path(task_id)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(data, dict) or str(data.get("task_id", "")) != str(task_id):
+            return None
+        return data
+
+    def list_session_task_records(
+        self,
+        session_key: str,
+        *,
+        sender_id: str | None = None,
+        limit: int = _TASK_LIST_LIMIT,
+    ) -> list[dict[str, Any]]:
+        """Bounded, newest-first durable records owned by *session_key*."""
+        if self.records_dir is None or not self.records_dir.exists():
+            return []
+        records: list[dict[str, Any]] = []
+        for path in self.records_dir.glob("*.json"):
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(record, dict):
+                continue
+            origin = record.get("origin")
+            if not isinstance(origin, dict) or origin.get("session_key") != session_key:
+                continue
+            rec_sender = origin.get("sender_id")
+            if sender_id is not None and rec_sender and str(rec_sender) != str(sender_id):
+                continue
+            records.append(record)
+        records.sort(
+            key=lambda r: int(r.get("updated_at_ms") or r.get("created_at_ms") or 0),
+            reverse=True,
+        )
+        return records[: max(1, limit)]
+
+    async def cancel_task(self, task_id: str, *, session_key: str) -> str:
+        """Cooperatively cancel one owned task.
+
+        Returns ``cancelled``, ``not_owned``, ``done`` (already terminal) or
+        ``not_found``. Never kills external processes; cancellation is the
+        same cooperative task cancellation used by ``/stop``.
+        """
+        task = self._running_tasks.get(task_id)
+        if task is not None and not task.done():
+            owned_ids = self._session_tasks.get(session_key, set())
+            if task_id not in owned_ids:
+                return "not_owned"
+            task.cancel()
+            await asyncio.gather(*[task], return_exceptions=True)
+            await asyncio.sleep(0)
+            if self._finalizer_tasks:
+                await asyncio.gather(*list(self._finalizer_tasks), return_exceptions=True)
+            return "cancelled"
+        record = self.read_run_record(task_id)
+        if record is None:
+            return "not_found"
+        origin = record.get("origin") or {}
+        if origin.get("session_key") != session_key:
+            return "not_owned"
+        phase = str(record.get("phase") or "")
+        if phase in ("queued", "running"):
+            return "not_owned"  # live elsewhere in this process; defensive
+        return "done"
+
+    async def retry_task(
+        self,
+        task_id: str,
+        *,
+        session_key: str,
+        sender_id: str | None = None,
+    ) -> tuple[str, str]:
+        """Retry a terminal task as a NEW run with explicit lineage.
+
+        Returns ``(status, task_id)`` where status is ``created`` (new id),
+        ``not_found``, ``not_owned``, ``still_active`` or ``queue_full``.
+        The old record gains ``retried_by``; the new record carries
+        ``retry_of``. Never re-marks the failed record as running.
+        """
+        # Live tasks have no durable record until terminal; consult the
+        # in-process registry first so active runs are never retried.
+        task = self._running_tasks.get(task_id)
+        if task is not None and not task.done():
+            owned_ids = self._session_tasks.get(session_key, set())
+            if task_id not in owned_ids:
+                return "not_owned", task_id
+            return "still_active", task_id
+
+        record = self.read_run_record(task_id)
+        if record is None:
+            return "not_found", task_id
+        origin = record.get("origin") or {}
+        if origin.get("session_key") != session_key:
+            return "not_owned", task_id
+        rec_sender = origin.get("sender_id")
+        if (
+            sender_id is not None
+            and rec_sender
+            and str(rec_sender) != str(sender_id)
+        ):
+            return "not_owned", task_id
+
+        params = record.get("params") or {}
+        try:
+            spawned = await self.spawn(
+                task=record.get("task") or "",
+                label=record.get("label"),
+                origin_channel=origin.get("channel", "cli"),
+                origin_chat_id=origin.get("chat_id", "direct"),
+                session_key=session_key,
+                origin_sender_id=str(rec_sender) if rec_sender else None,
+                temperature=params.get("temperature"),
+                model_preset=params.get("model_preset"),
+                max_iterations=params.get("max_iterations"),
+                context_window_tokens=params.get("context_window_tokens"),
+                max_tokens=params.get("max_tokens"),
+                retry_of=task_id,
+            )
+        except QueueFullError:
+            return "queue_full", task_id
+        # ``spawn`` returns a human message; the new task id is embedded in it.
+        match = re.search(r"id: ([0-9a-f]+)", spawned)
+        new_id = match.group(1) if match else str(spawned)
+
+        # Append-only lineage on the old record (never overwrite history).
+        try:
+            record["retried_by"] = new_id
+            write_run_record(self.records_dir, task_id, record)
+        except OSError:
+            logger.warning("Subagent [{}] could not record retry lineage", task_id, exc_info=True)
+        return "created", new_id
+
     async def _announce_result(
         self,
         task_id: str,
@@ -885,6 +1069,7 @@ class SubagentManager:
             "tool_events": list(status.tool_events)[-MAX_PERSISTED_TOOL_EVENTS:],
             "context": dict(status.context_report),
             "result": result_text,
+            "retry_of": status.retry_of,
         }
         try:
             return write_run_record(self.records_dir, task_id, record)
