@@ -71,6 +71,12 @@ _MIMO_THINKING_MODELS: frozenset[str] = frozenset({
     "mimo-v2-pro",
     "mimo-v2-omni",
 })
+# Vision-capable DeepSeek models that accept OpenAI-compatible content blocks
+# (list form with text/image parts).  Text-only DeepSeek chat/reasoner models
+# still get message content coerced to a plain string.
+_DEEPSEEK_MULTIMODAL_MODELS: frozenset[str] = frozenset({
+    "deepseek-v4-flash-vision-exp",
+})
 _OPENAI_COMPAT_REQUEST_TIMEOUT_S = 120.0
 
 # Maps ProviderSpec.thinking_style → extra_body builder.
@@ -510,12 +516,20 @@ class OpenAICompatProvider(LLMProvider):
             dumped = str(content)
         return dumped or "(empty)"
 
-    def _sanitize_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _sanitize_messages(
+        self,
+        messages: list[dict[str, Any]],
+        model: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Strip non-standard keys, normalize tool_call IDs."""
         sanitized = LLMProvider._sanitize_request_messages(messages, _ALLOWED_MSG_KEYS)
         id_map: dict[str, str] = {}
         pending_tool_ids: dict[str, deque[str]] = {}
-        force_string_content = bool(self._spec and self._spec.name == "deepseek")
+        is_deepseek = bool(self._spec and self._spec.name == "deepseek")
+        model_name = model or self.default_model
+        force_string_content = (
+            is_deepseek and _model_slug(model_name) not in _DEEPSEEK_MULTIMODAL_MODELS
+        )
         normalize_tool_ids = self._should_normalize_tool_call_ids()
 
         def map_id(value: Any) -> Any:
@@ -650,7 +664,10 @@ class OpenAICompatProvider(LLMProvider):
 
         kwargs: dict[str, Any] = {
             "model": model_name,
-            "messages": self._sanitize_messages(self._sanitize_empty_content(messages)),
+            "messages": self._sanitize_messages(
+                self._sanitize_empty_content(messages),
+                model_name,
+            ),
         }
 
         # GPT-5 and reasoning models (o1/o3/o4) reject temperature when
@@ -850,7 +867,10 @@ class OpenAICompatProvider(LLMProvider):
         """Build a Responses API body for direct OpenAI requests."""
         model_name = model or self.default_model
         model_name = self._request_model_name(model_name)
-        sanitized_messages = self._sanitize_messages(self._sanitize_empty_content(messages))
+        sanitized_messages = self._sanitize_messages(
+            self._sanitize_empty_content(messages),
+            model_name,
+        )
         instructions, input_items = convert_messages(sanitized_messages)
 
         body: dict[str, Any] = {
