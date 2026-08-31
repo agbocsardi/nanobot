@@ -29,6 +29,7 @@ class RuntimeInspector:
             "runtime": self._runtime(),
             "config": self._config(),
             "session": self._session(session_key),
+            "telegram": self._telegram_reply_context(),
             "delegated_work": self._delegated_work(),
             "cron": self._cron(),
             "environment": self._environment(),
@@ -105,6 +106,86 @@ class RuntimeInspector:
             "available": session is not None,
             "key": session_key,
             "active_goal": goal,
+        }
+
+    def _telegram_reply_context(self) -> dict[str, Any]:
+        """Telegram reply-context reachability diagnostics (flags/lengths/ids only).
+
+        Resolves the active TelegramChannel through the runtime's channel
+        manager and relays the read-only observation buffer. Reports
+        ``available: False`` when the telegram channel is not active or does
+        not expose the observation accessor. Never includes raw message
+        content.
+        """
+        manager = getattr(self.runtime, "channel_manager", None)
+        channels = getattr(manager, "channels", None) if manager is not None else None
+        channel = channels.get("telegram", None) if isinstance(channels, dict) else None
+        if channel is None:
+            return {
+                "available": False,
+                "reason": "telegram channel not active",
+            }
+        accessor = getattr(channel, "reply_context_observations", None)
+        if not callable(accessor):
+            return {
+                "available": False,
+                "reason": "telegram channel lacks observations accessor",
+            }
+        try:
+            data = accessor()
+        except Exception as exc:
+            return {
+                "available": False,
+                "reason": f"observations accessor failed: {type(exc).__name__}",
+            }
+        entries = data.get("entries") if isinstance(data, dict) else None
+        if not isinstance(entries, list):
+            return {
+                "available": False,
+                "reason": "telegram observations accessor returned unexpected shape",
+            }
+
+        def _entry_summary(entry: dict) -> dict[str, Any]:
+            return {
+                "ts": self._primitive(entry.get("ts")),
+                "chat_id": self._primitive(entry.get("chat_id")),
+                "message_id": self._primitive(entry.get("message_id")),
+                "reply_to_message_id": self._primitive(
+                    entry.get("reply_to_message_id")
+                ),
+                "reply_id_present": bool(entry.get("reply_id_present", False)),
+                "replied_to_bot": entry.get("replied_to_bot"),
+                "has_reply_source": bool(entry.get("has_reply_source", False)),
+                "context_attached": bool(entry.get("context_attached", False)),
+                "text_len": entry.get("text_len"),
+                "caption_len": entry.get("caption_len"),
+                "quote_len": entry.get("quote_len"),
+                "media_count": entry.get("media_count"),
+                "media_file_id_present": bool(
+                    entry.get("media_file_id_present", False)
+                ),
+                "content_unavailable": bool(entry.get("content_unavailable", False)),
+            }
+
+        last_reply = None
+        for entry in reversed(entries):
+            if not isinstance(entry, dict):
+                continue
+            summary = _entry_summary(entry)
+            if summary["context_attached"]:
+                last_reply = summary
+                break
+        return {
+            "available": True,
+            "buffer_entries": len(entries),
+            "buffer_limit": self._primitive(data.get("limit")),
+            "replies_seen": sum(
+                1
+                for entry in entries
+                if isinstance(entry, dict) and entry.get("context_attached")
+            ),
+            "replies_seen_total": self._primitive(data.get("total_seen")),
+            "last_reply": last_reply,
         }
 
     def _delegated_work(self) -> dict[str, Any]:

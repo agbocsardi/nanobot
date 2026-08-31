@@ -950,6 +950,10 @@ def _run_gateway(
         cron_service=cron,
     )
 
+    # Diagnostics wiring (read-only): let the runtime inspector reach live
+    # channels (telegram reply-context observations). No chat behavior change.
+    agent.channel_manager = channels
+
     # Bind the Discord runtime handle to the live channel now that it exists.
     # The handle stays None-resolving until DiscordChannel.start() connects.
     if discord_runtime is not None:

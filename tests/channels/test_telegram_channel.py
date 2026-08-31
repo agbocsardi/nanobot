@@ -2001,6 +2001,141 @@ async def test_on_message_reply_to_caption_and_media(monkeypatch, tmp_path) -> N
 
 
 @pytest.mark.asyncio
+async def test_reply_context_observations_record_flags_lengths_media() -> None:
+    """The diagnostics buffer records flags/lengths/ids (never raw content)."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    handled = []
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+    channel._handle_message = capture_handle
+    channel._start_typing = lambda _chat_id: None
+
+    reply = SimpleNamespace(
+        text="Hello world",
+        caption=None,
+        message_id=42,
+        from_user=SimpleNamespace(id=1, username=None, first_name=None),
+    )
+    update = _make_telegram_update(text="translate this", reply_to_message=reply)
+    await channel._on_message(update, None)
+
+    assert len(handled) == 1
+    data = channel.reply_context_observations()
+    assert data["total_seen"] == 1
+    assert data["limit"] == 100
+    assert len(data["entries"]) == 1
+    entry = data["entries"][0]
+    assert entry["has_reply_source"] is True
+    assert entry["reply_to_message_id"] == 42
+    assert entry["reply_id_present"] is True
+    assert entry["replied_to_bot"] is False
+    assert entry["context_attached"] is True
+    assert entry["text_len"] == len("Hello world")
+    assert entry["caption_len"] == 0
+    assert entry["quote_len"] == 0
+    assert entry["media_count"] == 0
+    assert entry["media_file_id_present"] is False
+    assert entry["content_unavailable"] is False
+    assert entry["chat_id"] == "-100123"
+    assert entry["message_id"] == 1
+    assert isinstance(entry["ts"], float)
+    # No raw content anywhere in the record.
+    assert "Hello world" not in str(data)
+    assert "translate this" not in str(data)
+
+
+@pytest.mark.asyncio
+async def test_reply_context_observations_include_media_and_bot_flags() -> None:
+    """Media presence and replied-to-bot are captured from the reply details."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    channel._bot_user_id = 999
+    handled = []
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+    channel._handle_message = capture_handle
+    channel._start_typing = lambda _chat_id: None
+
+    reply = SimpleNamespace(
+        text=None,
+        caption="A cute cat",
+        photo=[SimpleNamespace(file_id="cat-fid", file_unique_id="cat-uid", mime_type="image/jpeg")],
+        from_user=SimpleNamespace(id=999, username=None, first_name=None),
+    )
+    update = _make_telegram_update(text="what breed is this?", reply_to_message=reply)
+    await channel._on_message(update, None)
+
+    assert len(handled) == 1
+    entry = channel.reply_context_observations()["entries"][0]
+    assert entry["replied_to_bot"] is True
+    assert entry["text_len"] == 0
+    assert entry["caption_len"] == len("A cute cat")
+    assert entry["media_count"] == 1
+    assert entry["media_file_id_present"] is True
+    assert "A cute cat" not in str(channel.reply_context_observations())
+
+
+@pytest.mark.asyncio
+async def test_reply_context_observations_buffer_is_bounded() -> None:
+    """The rolling buffer keeps only the most recent observations."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    handled = []
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+    channel._handle_message = capture_handle
+    channel._start_typing = lambda _chat_id: None
+
+    reply = SimpleNamespace(
+        text="x", message_id=2, from_user=SimpleNamespace(id=1)
+    )
+    for i in range(105):
+        update = _make_telegram_update(text="go", reply_to_message=reply)
+        update.message.message_id = i + 1
+        await channel._on_message(update, None)
+
+    data = channel.reply_context_observations()
+    assert data["total_seen"] == 105
+    assert len(data["entries"]) == 100
+    # Oldest 5 dropped; window retains messages 6..105 in arrival order.
+    assert data["entries"][0]["message_id"] == 6
+    assert data["entries"][-1]["message_id"] == 105
+
+
+@pytest.mark.asyncio
+async def test_on_message_without_reply_records_no_observation() -> None:
+    """Plain messages (no reply/quote) add nothing to the observations buffer."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    handled = []
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+    channel._handle_message = capture_handle
+    channel._start_typing = lambda _chat_id: None
+
+    update = _make_telegram_update(text="plain message")
+    await channel._on_message(update, None)
+
+    assert len(handled) == 1
+    data = channel.reply_context_observations()
+    assert data["total_seen"] == 0
+    assert data["entries"] == []
+
+
+@pytest.mark.asyncio
 async def test_forward_command_does_not_inject_reply_context() -> None:
     """Slash commands forwarded via _forward_command must not include reply context."""
     channel = TelegramChannel(

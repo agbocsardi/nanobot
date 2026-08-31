@@ -68,11 +68,16 @@ def test_snapshot_represents_absent_subsystems_and_repository_identity(tmp_path)
         "runtime",
         "config",
         "session",
+        "telegram",
         "delegated_work",
         "cron",
         "environment",
         "repository",
         "capabilities",
+    }
+    assert snapshot["telegram"] == {
+        "available": False,
+        "reason": "telegram channel not active",
     }
     assert snapshot["runtime"]["budgets"]["max_iterations"] == 40
     assert snapshot["config"]["drift_status"] == "current"
@@ -200,6 +205,118 @@ def test_snapshot_uses_live_goal_delegated_and_cron_state(tmp_path) -> None:
     cron = snapshot["cron"]["jobs"][0]
     assert cron["recent_terminal"]["status"] == "error"
     assert cron["delivery"] == {"available": True, "status": None, "error": None}
+
+
+def _telegram_channel_with_observations(entries, *, total_seen, limit=100):
+    return SimpleNamespace(
+        reply_context_observations=lambda: {
+            "total_seen": total_seen,
+            "limit": limit,
+            "entries": entries,
+        }
+    )
+
+
+def test_snapshot_telegram_diagnostics_renders_when_channel_active(tmp_path) -> None:
+    runtime = _runtime(tmp_path)
+    entries = [
+        {
+            "ts": 100.0,
+            "chat_id": "-100123",
+            "message_id": 1,
+            "has_reply_source": False,
+            "reply_to_message_id": None,
+            "reply_id_present": False,
+            "replied_to_bot": None,
+            "context_attached": False,
+            "text_len": 0,
+            "caption_len": 0,
+            "quote_len": 0,
+            "media_count": 0,
+            "media_file_id_present": False,
+            "content_unavailable": False,
+        },
+        {
+            "ts": 200.0,
+            "chat_id": "-100123",
+            "message_id": 2,
+            "has_reply_source": True,
+            "reply_to_message_id": 42,
+            "reply_id_present": True,
+            "replied_to_bot": False,
+            "context_attached": True,
+            "text_len": 11,
+            "caption_len": 0,
+            "quote_len": 7,
+            "media_count": 1,
+            "media_file_id_present": True,
+            "content_unavailable": False,
+        },
+    ]
+    runtime.channel_manager = SimpleNamespace(
+        channels={
+            "telegram": _telegram_channel_with_observations(
+                entries, total_seen=2
+            )
+        }
+    )
+
+    snapshot = RuntimeInspector(runtime).snapshot()
+
+    telegram = snapshot["telegram"]
+    assert telegram["available"] is True
+    assert telegram["buffer_entries"] == 2
+    assert telegram["buffer_limit"] == 100
+    assert telegram["replies_seen"] == 1
+    assert telegram["replies_seen_total"] == 2
+    assert telegram["last_reply"] == {
+        "ts": 200.0,
+        "chat_id": "-100123",
+        "message_id": 2,
+        "reply_to_message_id": 42,
+        "reply_id_present": True,
+        "replied_to_bot": False,
+        "has_reply_source": True,
+        "context_attached": True,
+        "text_len": 11,
+        "caption_len": 0,
+        "quote_len": 7,
+        "media_count": 1,
+        "media_file_id_present": True,
+        "content_unavailable": False,
+    }
+
+
+def test_snapshot_telegram_diagnostics_unavailable_without_accessor(tmp_path) -> None:
+    runtime = _runtime(tmp_path)
+    runtime.channel_manager = SimpleNamespace(
+        channels={"telegram": SimpleNamespace(name="telegram")}
+    )
+
+    snapshot = RuntimeInspector(runtime).snapshot()
+
+    assert snapshot["telegram"] == {
+        "available": False,
+        "reason": "telegram channel lacks observations accessor",
+    }
+
+
+def test_snapshot_telegram_diagnostics_empty_buffer_reports_no_last_reply(tmp_path) -> None:
+    runtime = _runtime(tmp_path)
+    runtime.channel_manager = SimpleNamespace(
+        channels={
+            "telegram": _telegram_channel_with_observations([], total_seen=0)
+        }
+    )
+
+    snapshot = RuntimeInspector(runtime).snapshot()
+
+    telegram = snapshot["telegram"]
+    assert telegram["available"] is True
+    assert telegram["buffer_entries"] == 0
+    assert telegram["replies_seen"] == 0
+    assert telegram["replies_seen_total"] == 0
+    assert telegram["last_reply"] is None
 
 
 @pytest.mark.asyncio
