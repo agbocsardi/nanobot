@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import sys
 import time
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 
 from nanobot import __version__
 from nanobot.bus.events import OutboundMessage
@@ -105,6 +108,13 @@ BUILTIN_COMMAND_SPECS: tuple[BuiltinCommandSpec, ...] = (
         "Restore memory",
         "Revert memory to a previous Dream snapshot.",
         "undo-2",
+    ),
+    BuiltinCommandSpec(
+        "/remember",
+        "Remember",
+        "Save a short note into curated topic memory under memory/.",
+        "bookmark",
+        arg_hint="[<topic>:] <text>",
     ),
     BuiltinCommandSpec(
         "/skill",
@@ -792,6 +802,117 @@ async def cmd_skill(ctx: CommandContext) -> OutboundMessage:
         metadata=dict(ctx.msg.metadata or {}),
     )
 
+DEFAULT_REMEMBER_TOPIC = "user-notes.md"
+"""Default curated topic file for /remember notes without an explicit topic."""
+
+
+def _remember_usage() -> str:
+    return "Usage: /remember <text>  |  /remember <topic>: <text>"
+
+
+def _parse_remember_args(args: str) -> tuple[str | None, str]:
+    """Split /remember args into (topic, text).
+
+    One rule: a leading ``<slug>:`` (ASCII letters/digits/_/, lowercased)
+    selects the topic; anything else is a note under the default topic.
+    """
+    raw = args.strip()
+    prefix, sep, rest = raw.partition(":")
+    topic = (
+        prefix.lower()
+        if (sep and re.fullmatch(r"[a-z][a-z0-9_-]*", prefix.lower()))
+        else None
+    )
+    return topic, (rest.strip() if topic is not None else raw)
+
+
+def _strip_frontmatter(content: str) -> str:
+    """Return the body below a ``---`` frontmatter block (local, minimal)."""
+    if not content.startswith("---\n"):
+        return content
+    end = content.find("\n---", 3)
+    if end == -1:
+        return content
+    return content[end + 4 :].lstrip("\n")
+
+
+def _remember_reply(ctx: CommandContext, content: str) -> OutboundMessage:
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content=content,
+        metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+    )
+
+
+async def cmd_remember(ctx: CommandContext) -> OutboundMessage:
+    """Append a dated note to curated topic memory under memory/.
+
+    ``/remember <text>`` -> ``memory/user-notes.md``; ``/remember <topic>:
+    <text>`` -> ``memory/<topic>.md``. Delegates the write to
+    ``MemoryWriteTool`` (path guardrails, frontmatter preservation, atomic
+    writes, read-back verification). Never fails the turn.
+    """
+    loop = ctx.loop
+    if loop is None or not hasattr(loop, "workspace"):
+        return _remember_reply(ctx, "Error: /remember is unavailable in this context.")
+    if not ctx.args.strip():
+        return _remember_reply(ctx, _remember_usage())
+
+    # Imported lazily: builtin.py is imported during agent boot, before the
+    # agent module graph is fully initialized (mirrors /pairing's lazy import).
+    from nanobot.agent.tools._memory_common import (
+        MAX_BODY_BYTES,
+        MemoryPathError,
+        resolve_topic_path,
+    )
+    from nanobot.agent.tools.memory_write import MemoryWriteTool
+
+    try:
+        topic, text = _parse_remember_args(ctx.args)
+        rel = topic + ".md" if topic is not None else DEFAULT_REMEMBER_TOPIC
+        if not text:
+            raise ValueError(f"Error: missing text after topic: {_remember_usage()}")
+
+        # Read the existing body so notes append; MemoryWriteTool preserves the
+        # existing frontmatter when title/description/tags are omitted.
+        existing_body = ""
+        resolved = resolve_topic_path(Path(loop.workspace), rel)
+        if resolved.exists() and resolved.is_dir():
+            return _remember_reply(
+                ctx, f"Error: memory/{rel} is a directory, not a topic memory file."
+            )
+        if resolved.exists():
+            try:
+                content = resolved.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as e:
+                return _remember_reply(ctx, f"Error: cannot read existing memory/{rel}: {e}")
+            existing_body = _strip_frontmatter(content)
+
+        heading = f"## {datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
+        note = text.strip() + "\n"
+        prefix = existing_body.rstrip() + "\n\n" if existing_body.strip() else ""
+        new_body = prefix + heading + "\n\n" + note
+        if len(new_body.encode("utf-8")) > MAX_BODY_BYTES:
+            return _remember_reply(
+                ctx,
+                f"Error: memory/{rel} would exceed the body cap; keep the note shorter.",
+            )
+
+        result = await MemoryWriteTool(workspace=Path(loop.workspace)).execute(rel, new_body)
+        if getattr(result, "status", "success") in ("success", "partial"):
+            verb = "appended to" if existing_body.strip() else "created"
+            return _remember_reply(ctx, f"remembered in memory/{rel} — {verb} topic memory.")
+        return _remember_reply(ctx, f"Error: {result}")
+    except MemoryPathError as e:
+        return _remember_reply(ctx, str(e))
+    except (ValueError, OSError) as e:
+        return _remember_reply(ctx, str(e))
+    except Exception as e:  # noqa: BLE001 - /remember must never fail the turn.
+        return _remember_reply(ctx, f"Error: {e}")
+
+
+
 async def cmd_help(ctx: CommandContext) -> OutboundMessage:
     """Return available slash commands."""
     return OutboundMessage(
@@ -832,6 +953,8 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.exact("/dream-restore", cmd_dream_restore)
     router.prefix("/dream-restore ", cmd_dream_restore)
     router.exact("/skill", cmd_skill)
+    router.exact("/remember", cmd_remember)
+    router.prefix("/remember ", cmd_remember)
     router.exact("/help", cmd_help)
     router.exact("/pairing", cmd_pairing)
     router.prefix("/pairing ", cmd_pairing)
