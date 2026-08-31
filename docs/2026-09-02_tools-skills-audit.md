@@ -81,3 +81,16 @@ doc/test coverage notes for tmux/clawhub if they stay.
    hints/disabled defaults, and add a loader test asserting the removal.
 3. Consider moving `memory_read`/`memory_write`/`approval` docs entries from
    the thin-list into the fork feature reference.
+
+## Live usage evidence (2026-09-02, read-only inspection)
+
+- Main bot workspace `~/.nanobot/workspace/skills`: **48 custom skills**
+  (add-to-lists, biometrics, cinema-scout, daily-reflection, vault, voice,
+  weekly-*, wiki-nearby, …). These are workspace skills in addition to the 14
+  built-ins — the built-in list above understates real usage.
+- Szárszó bot workspace `~/.nanobot-szarszo/workspace/skills`: discourse-diary,
+  memory.
+- Implication: built-in skills with zero static refs (tmux, clawhub,
+  long-goal, update-setup, memory-defrag) may still be invoked by the agent
+  via tool/context hints; **do not prune without checking session usage**.
+  Prune candidates stay: update-setup, long-goal (weakest traces).
