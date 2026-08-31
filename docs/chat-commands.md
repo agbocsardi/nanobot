@@ -15,6 +15,8 @@ These commands work inside chat channels and interactive agent sessions:
 | `/dream-log <sha>` | Show a specific Dream memory change |
 | `/dream-restore` | List recent Dream memory versions |
 | `/dream-restore <sha>` | Restore memory to the state before a specific change |
+| `/remember <text>` | Save a note into curated topic memory (appends with a dated heading to `memory/user-notes.md`) |
+| `/remember <topic>: <text>` | Same, but into `memory/<topic>.md` (topic must be a word slug, e.g. `projects: ...`) |
 | `/skill` | List enabled skills and their descriptions |
 | `/policy` | List pending tool-policy approvals |
 | `/policy approve <token\|rule-id>` | Approve a pending policy approval for this session |
