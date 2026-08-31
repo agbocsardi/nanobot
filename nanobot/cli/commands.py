@@ -67,6 +67,59 @@ from nanobot.utils.restart import (  # noqa: E402
 )
 
 
+def build_config_change_handler(agent: Any, config_path: Path) -> Callable[[], None]:
+    """Build the callback that hot-applies a config file change to a running loop.
+
+    Only the active model preset name is applied at runtime (mirroring the
+    ``/model`` command path). Provider/channel/cron/workspace settings are
+    constructed once at gateway startup, so any other change keeps the loaded
+    config fingerprint stale and logs that a manual restart is required.
+    """
+    from nanobot.agent.tools.runtime_inspector import fingerprint_file
+    from nanobot.config.loader import load_config
+
+    def on_config_change() -> None:
+        try:
+            fresh = load_config(config_path)
+        except Exception:
+            logger.exception("Config watcher: failed to reload config after change")
+            return
+
+        try:
+            current_preset = agent.model_preset
+            new_preset = fresh.agents.defaults.model_preset
+            if new_preset == current_preset:
+                logger.warning(
+                    "Config changed: manual restart required for provider/channel/cron changes"
+                )
+                return
+
+            # ``set_model_preset`` refuses None, so represent "no preset" as
+            # the implicit ``default`` preset that the loop always carries.
+            effective = new_preset or "default"
+            if effective not in agent.model_presets:
+                logger.warning(
+                    "Config changed: model preset {!r} is not part of the running loop's "
+                    "presets; manual restart required".format(effective)
+                )
+                return
+
+            agent.set_model_preset(effective)
+            # Succeeding here means the only drifted setting was hot-applied, so
+            # rebase the drift baseline and let the runtime inspector agree.
+            agent.loaded_config_fingerprint = fingerprint_file(config_path)
+            logger.info(
+                "Config changed: hot-applied model preset {!r} ({} -> {})",
+                effective,
+                current_preset or "default",
+                effective,
+            )
+        except Exception:
+            logger.exception("Config watcher: failed to apply config change")
+
+    return on_config_change
+
+
 class SafeFileHistory(FileHistory):
     """FileHistory subclass that sanitizes surrogate characters on write.
 
@@ -677,6 +730,8 @@ def _run_gateway(
     from nanobot.bus.queue import MessageBus
     from nanobot.bus.runtime_events import RuntimeEventBus
     from nanobot.channels.manager import ChannelManager
+    from nanobot.config.loader import get_config_path
+    from nanobot.config.watcher import watch_config_file
     from nanobot.cron.bound_runner import run_bound_cron_job, run_isolated_cron_job
     from nanobot.cron.service import CronJobSkippedError, CronService
     from nanobot.cron.session_turns import is_bound_cron_job
@@ -1051,7 +1106,21 @@ def _run_gateway(
     async def run():
         try:
             await cron.start()
+            # Watch the config file for changes. Only the active model preset
+            # is hot-applied via build_config_change_handler; provider, channel,
+            # cron, and workspace settings are constructed once at gateway
+            # startup, so other changes log a manual-restart warning and leave
+            # the runtime inspector's drift flag set.
+            config_path = get_config_path()
+            watcher_task = asyncio.create_task(
+                watch_config_file(
+                    config_path,
+                    build_config_change_handler(agent, config_path),
+                ),
+                name="nanobot-config-watcher",
+            )
             tasks = [
+                watcher_task,
                 agent.run(),
                 channels.start_all(),
             ]
