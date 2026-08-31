@@ -29,13 +29,10 @@ v3 additions (memory_search GitHub issue #1 continuation):
   * ``"local"`` — deterministic dependency-free scoring: token overlap
     (query tokens vs match text) + a mild recency boost; sorted by score
     desc, ties by timestamp desc (see ``nanobot/agent/tools/memory_ranking.py``).
-- Pluggable embeddings interface: ``EmbeddingScorer`` protocol in
-  ``memory_ranking``.  ``LocalOverlapScorer`` is the built-in implementation.
-  Provider scores are opt-in: set ``tools.memorySearch.embeddingScorer`` to a
-  fully-qualified ``package.module.ClassName`` (ranking ``"local"`` required);
-  ``ProviderEmbeddingScorer`` is a stub that raises ``NotImplementedError``
-  unless that concrete scorer is injected.  Retrieval-only — scoring never
-  promotes facts into memory.
+- Pluggable interface: the scorer protocol lives in ``memory_ranking`` and
+  ``LocalOverlapScorer`` is the only implementation — a deterministic,
+  dependency-free ``1.0 + term-frequency nudge`` scorer.  Retrieval-only —
+  scoring never promotes facts into memory.
 - Structured data: history results gain ``score`` (float for ``local``,
   ``null`` for ``recency``) and the data block gains ``ranking``; text output
   is unchanged for ``recency`` and shows scores for ``local``.  Memory-file
@@ -61,7 +58,7 @@ from typing import Any, Iterable
 from pydantic import field_validator
 
 from nanobot.agent.tools.base import Tool, ToolResult
-from nanobot.agent.tools.memory_ranking import EmbeddingScorer, resolve_scorer
+from nanobot.agent.tools.memory_ranking import LocalOverlapScorer
 from nanobot.config_base import Base
 
 # NOTE: ``nanobot.agent.memory`` is imported lazily inside the memory-file
@@ -95,8 +92,7 @@ class MemorySearchToolConfig(Base):
 
     enable_index: bool = True  # maintain memory/search_index.json cache
     include_system_files: bool = False  # also search memory/system/*.md + MEMORY.md
-    ranking: str = "recency"  # "recency" (v1/v2) | "local" (overlap + recency boost)
-    embedding_scorer: str | None = None  # opt-in provider scorer path (ranking "local")
+    ranking: str = "recency"  # "recency" (v1/v2) | "local" (1.0 + term-frequency nudge)
 
     @field_validator("ranking")
     @classmethod
@@ -263,8 +259,7 @@ class MemorySearchTool(Tool):
             "and topic memory files under memory/. Uses exact literal substring "
             "matching (no regex). Ranking defaults to recency (newest-first). "
             "tools.memorySearch.ranking='local' enables deterministic "
-            "dependency-free relevance scoring; an opt-in provider scorer can be "
-            "injected via tools.memorySearch.embeddingScorer. History entries "
+            "dependency-free relevance scoring. History entries "
             "prefer their LLM summary, then structured messages, then legacy "
             "content. Returns compact cited snippets — timestamps, session keys, "
             "entry ids, roles, scores — never whole sessions. Read-only."
@@ -346,7 +341,6 @@ class MemorySearchTool(Tool):
         enable_index: bool = True,
         include_system_files: bool = False,
         ranking: str = "recency",
-        embedding_scorer: str | None = None,
     ):
         if ranking not in _RANKING_MODES:
             raise ValueError(
@@ -356,10 +350,9 @@ class MemorySearchTool(Tool):
         self._enable_index = bool(enable_index)
         self._include_system_files = bool(include_system_files)
         self._ranking = ranking
-        # Scorer is resolved eagerly so a bad/missing provider injection fails
-        # fast at tool creation (explicit opt-in boundary), not mid-search.
-        self._scorer: EmbeddingScorer | None = (
-            resolve_scorer(embedding_scorer) if ranking == "local" else None
+        # Local scorer is a zero-dependency deterministic implementation.
+        self._scorer: LocalOverlapScorer | None = (
+            LocalOverlapScorer() if ranking == "local" else None
         )
         self._index_lock = threading.Lock()  # serialize index build/write
 
@@ -377,7 +370,6 @@ class MemorySearchTool(Tool):
             enable_index=cfg.enable_index,
             include_system_files=cfg.include_system_files,
             ranking=cfg.ranking,
-            embedding_scorer=cfg.embedding_scorer,
         )
 
     def _history_path(self) -> Path:
@@ -529,7 +521,7 @@ class MemorySearchTool(Tool):
         role: str | None,
         case_sensitive: bool,
         max_excerpt_chars: int,
-        scorer: EmbeddingScorer | None = None,
+        scorer: LocalOverlapScorer | None = None,
     ) -> list[dict[str, Any]]:
         """One result per matching summary / message / legacy content.
 
