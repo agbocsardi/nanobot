@@ -3,19 +3,48 @@
 v1 scope: exact (literal substring) matching only. No embeddings, no fuzzy
 matching — the semantic layer is deliberately backburnered.
 
-Read-only: opens ``memory/history.jsonl`` and topic memory files with ``r``
-mode only and never writes anything.
+v2 additions (memory_search GitHub issue #1 continuation):
+- Incremental append-only history index (``memory/search_index.json``).  The
+  index records per history.jsonl entry: byte offset, physical line number and
+  the timestamp/session_key/cursor metadata.  It lets searches (a) skip
+  re-parsing the head of history.jsonl on repeated searches and (b) iterate
+  newest-first straight from the tail.  Raw JSONL remains the source of truth;
+  the index is disposable and rebuilt from scratch when invalid or when the
+  history file is shorter (truncation) than the indexed size.  Index writes are
+  atomic (tmp+rename+fsync) and strictly limited to the index file.
+- Pagination: ``offset`` + ``max_results`` with ``history_offset`` and
+  ``history_has_more`` in the structured data; total match count stays accurate
+  across pages.
+- Config knob: ``tools.memorySearch.includeSystemFiles`` (bool, default false).
+  When true, memory/system/*.md and MEMORY.md are searched too, with the same
+  return shape.  Default behavior (flag off) is unchanged from v1.
+- Relevance ranking stays simple: newest-first, summary beats messages per
+  entry (v1 behavior).  No semantic embeddings.
+
+Read-only with respect to user data: history.jsonl and memory files are opened
+in ``r``/``rb`` mode only.  The only file this tool ever writes is the
+disposable sidecar index ``memory/search_index.json`` (skipped entirely when
+the index is disabled).
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
+import threading
 from pathlib import Path
 from typing import Any, Iterable
 
-from nanobot.agent.memory import MemoryStore
 from nanobot.agent.tools.base import Tool, ToolResult
+from nanobot.config_base import Base
+
+# NOTE: ``nanobot.agent.memory`` is imported lazily inside the memory-file
+# search path (not at module level).  ``nanobot.config.schema`` eagerly
+# forward-resolves tool config classes at import time, and a module-level
+# import here would re-enter ``memory.py`` while it is still half-imported
+# (memory.py -> session.manager -> config.loader -> config.schema), making the
+# eager resolution fail silently and dropping the schema re-exports.
 
 _DATE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2}))?$")
 _TS_HEAD_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
@@ -27,6 +56,32 @@ _MAX_LINES_PER_MEMORY_FILE = 25
 _MAX_MEMORY_FILES = 50
 _MAX_OUTPUT_CHARS = 64_000
 _MAX_MEMORY_FILE_BYTES = 2_000_000
+
+# --- history index -----------------------------------------------------------
+_INDEX_FILENAME = "search_index.json"
+_INDEX_VERSION = 1
+
+
+class MemorySearchToolConfig(Base):
+    """Configuration for the memory_search tool (tools.memorySearch.*)."""
+
+    enable_index: bool = True  # maintain memory/search_index.json cache
+    include_system_files: bool = False  # also search memory/system/*.md + MEMORY.md
+
+
+def _entry_meta(entry: dict[str, Any]) -> dict[str, Any]:
+    """Down-projected per-entry index metadata: timestamp/session_key/cursor."""
+    meta: dict[str, Any] = {}
+    ts = entry.get("timestamp")
+    if isinstance(ts, str) and ts:
+        meta["timestamp"] = ts
+    session_key = entry.get("session_key")
+    if isinstance(session_key, str) and session_key:
+        meta["session_key"] = session_key
+    cursor = _valid_cursor(entry.get("cursor"))
+    if cursor is not None:
+        meta["cursor"] = cursor
+    return meta
 
 
 def iter_history_entries(path: Path) -> Iterable[tuple[dict[str, Any], int]]:
@@ -52,6 +107,48 @@ def iter_history_entries(path: Path) -> Iterable[tuple[dict[str, Any], int]]:
             if not isinstance(entry, dict):
                 continue
             yield entry, line_no
+
+
+def _scan_history_entries(
+    history: Path,
+    *,
+    start_offset: int = 0,
+    start_line: int = 0,
+) -> tuple[list[dict[str, Any]], int, int]:
+    """Scan history.jsonl from ``start_offset`` and build index metadata.
+
+    Returns ``(entries, size, next_line)`` where ``size`` is the byte position
+    read up to (next resume point) and ``next_line`` the physical line count
+    reached.  Physically blank/corrupt lines bump ``line`` but are not indexed;
+    valid dict lines are indexed with their byte offset.
+    """
+    entries: list[dict[str, Any]] = []
+    pos = start_offset
+    line_no = start_line
+    try:
+        with open(history, "rb") as f:
+            f.seek(start_offset)
+            while True:
+                raw = f.readline()
+                if not raw:
+                    break
+                line_no += 1
+                line_start = pos
+                pos += len(raw)
+                if not raw.strip():
+                    continue
+                try:
+                    entry = json.loads(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                meta = {"offset": line_start, "line": line_no}
+                meta.update(_entry_meta(entry))
+                entries.append(meta)
+    except FileNotFoundError:
+        pos = 0
+    return entries, pos, line_no
 
 
 def _valid_cursor(value: Any) -> int | None:
@@ -113,6 +210,7 @@ def _frontmatter_line_span(content: str) -> int:
 class MemorySearchTool(Tool):
     """Search conversation history and topic memory files with literal matching."""
     _scopes = {"core", "subagent"}
+    config_key = "memory_search"
 
     @property
     def name(self) -> str:
@@ -179,27 +277,187 @@ class MemorySearchTool(Tool):
                     "minimum": 20,
                     "maximum": _MAX_EXCERPT_CHARS,
                 },
+                "offset": {
+                    "type": "integer",
+                    "description": "Number of history matches to skip (paging; default 0)",
+                    "minimum": 0,
+                    "default": 0,
+                },
                 "search_memory_files": {
                     "type": "boolean",
                     "description": (
                         "Also search topic memory files under memory/ (default true). "
-                        "memory/system/ and MEMORY.md are always excluded; memory/system/ "
-                        "files are already loaded into context in full."
+                        "memory/system/ files and MEMORY.md are only searched when "
+                        "tools.memorySearch.includeSystemFiles is enabled; otherwise "
+                        "they are excluded (already loaded into context in full)."
                     ),
                 },
             },
             "required": ["query"],
         }
 
-    def __init__(self, workspace: Path | None = None):
+    def __init__(
+        self,
+        workspace: Path | None = None,
+        *,
+        enable_index: bool = True,
+        include_system_files: bool = False,
+    ):
         self._workspace = workspace
+        self._enable_index = bool(enable_index)
+        self._include_system_files = bool(include_system_files)
+        self._index_lock = threading.Lock()  # serialize index build/write
+
+    @classmethod
+    def config_cls(cls) -> type[MemorySearchToolConfig]:
+        return MemorySearchToolConfig
 
     @classmethod
     def create(cls, ctx: Any) -> Tool:
-        return cls(workspace=Path(ctx.workspace))
+        cfg = getattr(ctx.config, "memory_search", None)
+        if cfg is None:
+            return cls(workspace=Path(ctx.workspace))
+        return cls(
+            workspace=Path(ctx.workspace),
+            enable_index=cfg.enable_index,
+            include_system_files=cfg.include_system_files,
+        )
 
     def _history_path(self) -> Path:
         return (self._workspace or Path(".")) / "memory" / "history.jsonl"
+
+    def _index_path(self) -> Path:
+        return (self._workspace or Path(".")) / "memory" / _INDEX_FILENAME
+
+    # ------------------------------------------------------------------
+    # history index (incremental, append-only)
+    # ------------------------------------------------------------------
+
+    def _load_index(self) -> dict[str, Any] | None:
+        """Read + structurally validate the sidecar index; None when unusable."""
+        path = self._index_path()
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None
+        if not isinstance(data, dict) or data.get("version") != _INDEX_VERSION:
+            return None
+        size = data.get("size")
+        entries = data.get("entries")
+        next_line = data.get("line")
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            return None
+        if not isinstance(next_line, int) or isinstance(next_line, bool) or next_line < 0:
+            return None
+        if not isinstance(entries, list):
+            return None
+        last_offset = -1
+        for ent in entries:
+            if not isinstance(ent, dict):
+                return None
+            offset = ent.get("offset")
+            line = ent.get("line")
+            if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+                return None
+            if not isinstance(line, int) or isinstance(line, bool) or line < 1:
+                return None
+            if offset <= last_offset:
+                return None
+            for key in ("timestamp", "session_key"):
+                value = ent.get(key)
+                if value is not None and not isinstance(value, str):
+                    return None
+            if "cursor" in ent:
+                cursor = ent["cursor"]
+                if not isinstance(cursor, int) or isinstance(cursor, bool) or cursor < 0:
+                    return None
+            last_offset = offset
+        if entries and last_offset >= size:
+            return None
+        if entries and entries[-1]["line"] > next_line:
+            return None
+        return {"size": size, "line": next_line, "entries": entries}
+
+    def _write_index(self, index: dict[str, Any]) -> None:
+        """Atomically persist the index (tmp + fsync + rename). Index file only."""
+        path = self._index_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return
+        payload = json.dumps(index, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            with open(tmp, "wb") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+            # Best-effort directory fsync for durability (unsupported on some platforms).
+            try:
+                dir_fd = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                pass
+        except OSError:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def ensure_index(self) -> tuple[int, list[dict[str, Any]]]:
+        """Build/verify the history index; return ``(size, entries)``.
+
+        Fast path: indexed size matches the current history size.  Append path:
+        scan only the tail after the last indexed byte.  Rebuild path: index
+        missing/invalid, or the history file is shorter than indexed (truncation)
+        or the resume boundary is mid-line — rescan the whole file from scratch.
+        """
+        with self._index_lock:
+            history = self._history_path()
+            try:
+                hist_size = history.stat().st_size
+            except OSError:
+                hist_size = 0
+
+            index = self._load_index()
+            valid = index is not None and index["size"] <= hist_size
+            if valid and index["size"] == hist_size:
+                return index["size"], index["entries"]
+
+            if valid and index["size"] > 0:
+                # Resume boundary must be a line start; otherwise fall back to rebuild.
+                try:
+                    with open(history, "rb") as f:
+                        f.seek(index["size"] - 1)
+                        if f.read(1) != b"\n":
+                            valid = False
+                except OSError:
+                    valid = False
+
+            if valid and index["size"] < hist_size:
+                added, size, next_line = _scan_history_entries(
+                    history, start_offset=index["size"], start_line=index["line"]
+                )
+                entries = [*index["entries"], *added]
+                self._write_index(
+                    {"version": _INDEX_VERSION, "size": size, "line": next_line, "entries": entries}
+                )
+                return size, entries
+
+            # Rebuild from scratch (missing/invalid index, truncation, mid-line).
+            entries, size, next_line = _scan_history_entries(history, start_offset=0, start_line=0)
+            self._write_index(
+                {"version": _INDEX_VERSION, "size": size, "line": next_line, "entries": entries}
+            )
+            return size, entries
 
     # ------------------------------------------------------------------
     # matching helpers
@@ -297,32 +555,78 @@ class MemorySearchTool(Tool):
         case_sensitive: bool,
         max_results: int,
         max_excerpt_chars: int,
+        offset: int,
     ) -> tuple[list[dict[str, Any]], int]:
-        """Return ``(capped_results, total_matches)``, newest first."""
+        """Return ``(page, total_matches)``, newest first, honoring offset."""
+        history_path = self._history_path()
         matches: list[dict[str, Any]] = []
-        for entry, line_no in iter_history_entries(self._history_path()):
-            if session_key is not None and entry.get("session_key") != session_key:
-                continue
-            ts = _normalize_ts(entry.get("timestamp"))
-            if (date_from is not None or date_to is not None) and ts is None:
-                continue
-            if date_from is not None and ts < date_from:
-                continue
-            if date_to is not None and ts > date_to:
-                continue
-            matches.extend(
-                self._match_entry(
-                    entry,
-                    line_no,
-                    query,
-                    role=role,
-                    case_sensitive=case_sensitive,
-                    max_excerpt_chars=max_excerpt_chars,
+
+        if self._enable_index:
+            _, entries = self.ensure_index()
+            # Newest-first: iterate the index from the tail, reading only the
+            # line bytes of filter-passing entries (metadata filters avoid the
+            # disk read entirely for rejected entries).
+            try:
+                with open(history_path, "rb") as f:
+                    for ent in reversed(entries):
+                        if session_key is not None and ent.get("session_key") != session_key:
+                            continue
+                        ts = _normalize_ts(ent.get("timestamp"))
+                        if (date_from is not None or date_to is not None) and ts is None:
+                            continue
+                        if date_from is not None and ts < date_from:
+                            continue
+                        if date_to is not None and ts > date_to:
+                            continue
+                        f.seek(ent["offset"])
+                        raw = f.readline()
+                        if not raw:
+                            continue
+                        try:
+                            entry = json.loads(raw)
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            continue
+                        if not isinstance(entry, dict):
+                            continue
+                        matches.extend(
+                            self._match_entry(
+                                entry,
+                                ent["line"],
+                                query,
+                                role=role,
+                                case_sensitive=case_sensitive,
+                                max_excerpt_chars=max_excerpt_chars,
+                            )
+                        )
+            except FileNotFoundError:
+                matches = []
+        else:
+            # Index disabled: full forward scan (v1 behavior), and never touch
+            # the index file.
+            for entry, line_no in iter_history_entries(history_path):
+                if session_key is not None and entry.get("session_key") != session_key:
+                    continue
+                ts = _normalize_ts(entry.get("timestamp"))
+                if (date_from is not None or date_to is not None) and ts is None:
+                    continue
+                if date_from is not None and ts < date_from:
+                    continue
+                if date_to is not None and ts > date_to:
+                    continue
+                matches.extend(
+                    self._match_entry(
+                        entry,
+                        line_no,
+                        query,
+                        role=role,
+                        case_sensitive=case_sensitive,
+                        max_excerpt_chars=max_excerpt_chars,
+                    )
                 )
-            )
+
         matches.sort(key=lambda m: m.get("timestamp") or "", reverse=True)
         total = len(matches)
-        return matches[:max_results], total
+        return matches[offset : offset + max_results], total
 
     def _search_memory_files(
         self,
@@ -331,12 +635,29 @@ class MemorySearchTool(Tool):
         case_sensitive: bool,
         max_excerpt_chars: int,
     ) -> tuple[list[dict[str, Any]], int]:
-        """Search topic memory files; returns (file_results, skipped_count)."""
+        """Search topic memory files; returns (file_results, skipped_count).
+
+        When ``include_system_files`` is enabled, memory/system/*.md and
+        MEMORY.md are searched with the same per-file (path, line, text) shape.
+        """
+        from nanobot.agent.memory import MemoryStore  # deferred: see module note
+
         workspace = self._workspace or Path(".")
         files = [
             Path(workspace) / rel
             for rel in MemoryStore._topic_files(workspace)
         ]
+        if self._include_system_files:
+            memory_dir = Path(workspace) / "memory"
+            system_dir = memory_dir / "system"
+            try:
+                system_files = sorted(p for p in system_dir.rglob("*.md"))
+            except OSError:
+                system_files = []
+            files.extend(system_files)
+            mem_md = memory_dir / "MEMORY.md"
+            if mem_md.exists():
+                files.append(mem_md)
         file_results: list[dict[str, Any]] = []
         skipped = 0
         for path in files[: _MAX_MEMORY_FILES]:
@@ -413,11 +734,18 @@ class MemorySearchTool(Tool):
         case_sensitive: bool = False,
         max_results: int | None = None,
         max_excerpt_chars: int | None = None,
+        offset: int | None = None,
         search_memory_files: bool = True,
         **kwargs: Any,
     ) -> ToolResult:
         if not query.strip():
             return ToolResult.retryable_error("Error: query must not be empty")
+        if not isinstance(offset, (int, type(None))) or isinstance(offset, bool):
+            return ToolResult.retryable_error("Error: offset must be a non-negative integer")
+        if offset is None:
+            offset = 0
+        if offset < 0:
+            return ToolResult.retryable_error("Error: offset must be a non-negative integer")
         try:
             from_ts = _parse_date_filter(date_from, "date_from") if date_from is not None else None
             to_ts = _parse_date_filter(date_to, "date_to") if date_to is not None else None
@@ -440,6 +768,7 @@ class MemorySearchTool(Tool):
             case_sensitive=case_sensitive,
             max_results=limit,
             max_excerpt_chars=excerpt_chars,
+            offset=offset,
         )
         memory_results: list[dict[str, Any]] = []
         skipped_memory = 0
@@ -450,12 +779,16 @@ class MemorySearchTool(Tool):
                 max_excerpt_chars=excerpt_chars,
             )
 
+        has_more = offset + len(history_results) < history_total
         data: dict[str, Any] = {
             "query": query,
             "case_sensitive": case_sensitive,
+            "offset": offset,
             "history": history_results,
             "history_total_matches": history_total,
-            "history_truncated": history_total > len(history_results),
+            "history_offset": offset,
+            "history_has_more": has_more,
+            "history_truncated": has_more,
             "memory_files": memory_results,
             "skipped_memory_files": skipped_memory,
         }
@@ -469,10 +802,10 @@ class MemorySearchTool(Tool):
             "memory files:\n" + self._format_memory_results(memory_results),
         ])
         notes: list[str] = []
-        if history_total > len(history_results):
+        if has_more:
             notes.append(
-                f"(showing {len(history_results)} of {history_total} history matches; "
-                "raise max_results for more)"
+                f"(showing {offset + len(history_results)} of {history_total} history matches; "
+                "raise max_results or use offset for more)"
             )
         if skipped_memory:
             notes.append(f"(skipped {skipped_memory} unreadable/oversized/extra memory files)")
