@@ -132,6 +132,27 @@ BUILTIN_COMMAND_SPECS: tuple[BuiltinCommandSpec, ...] = (
         arg_hint="<execution-id>",
     ),
     BuiltinCommandSpec(
+        "/steer",
+        "Steer",
+        "Inject guidance into the current run at its next safe boundary.",
+        "navigation",
+        arg_hint="<text>",
+    ),
+    BuiltinCommandSpec(
+        "/after",
+        "Follow-up",
+        "Run a message as a fresh turn after the current run finishes.",
+        "skip-forward",
+        arg_hint="<text>",
+    ),
+    BuiltinCommandSpec(
+        "/interrupt",
+        "Interrupt",
+        "Cancel the current run and start a replacement request.",
+        "octagon-alert",
+        arg_hint="<text>",
+    ),
+    BuiltinCommandSpec(
         "/tasks",
         "Background tasks",
         "List queued/running/waiting and recent background tasks.",
