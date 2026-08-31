@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from nanobot.agent.loop import AgentLoop
+from nanobot.agent.tools.file_state import MAX_FILE_STATE_SESSIONS, FileStateStore
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.command.builtin import cmd_new, register_builtin_commands
@@ -237,10 +238,16 @@ class TestCmdNewUnifiedSession:
         # _schedule_background is a *sync* method that schedules a coroutine via
         # asyncio.create_task().  Mirror that exactly so the coroutine is consumed
         # and no RuntimeWarning is emitted.
+        file_state_store = FileStateStore()
+        previous_file_state = file_state_store.for_session("unified:default")
+        tracked_file = tmp_path / "tracked.txt"
+        tracked_file.write_text("tracked", encoding="utf-8")
+        previous_file_state.record_read(tracked_file)
         loop = SimpleNamespace(
             sessions=sessions,
             consolidator=SimpleNamespace(archive=AsyncMock(return_value=True)),
             _cancel_active_tasks=AsyncMock(return_value=0),
+            discard_session_file_state=file_state_store.discard,
         )
         loop._schedule_background = lambda coro: asyncio.ensure_future(coro)
 
@@ -257,6 +264,9 @@ class TestCmdNewUnifiedSession:
         sessions.invalidate("unified:default")
         reloaded = sessions.get_or_create("unified:default")
         assert reloaded.messages == []
+        reset_file_state = file_state_store.for_session("unified:default")
+        assert reset_file_state is not previous_file_state
+        assert reset_file_state.is_unchanged(tracked_file) is False
 
     @pytest.mark.asyncio
     async def test_cmd_new_in_unified_mode_does_not_affect_other_sessions(self, tmp_path: Path):
@@ -275,6 +285,7 @@ class TestCmdNewUnifiedSession:
             sessions=sessions,
             consolidator=SimpleNamespace(archive=AsyncMock(return_value=True)),
             _cancel_active_tasks=AsyncMock(return_value=0),
+            discard_session_file_state=MagicMock(),
         )
         loop._schedule_background = lambda coro: asyncio.ensure_future(coro)
 
@@ -289,6 +300,35 @@ class TestCmdNewUnifiedSession:
         sessions.invalidate("discord:999")
         assert sessions.get_or_create("unified:default").messages == []
         assert len(sessions.get_or_create("discord:999").messages) == 1
+
+
+# ---------------------------------------------------------------------------
+# TestDiscardSessionFileState — loop-level file-state discard
+# ---------------------------------------------------------------------------
+
+class TestDiscardSessionFileState:
+    """AgentLoop.discard_session_file_state() forgets the session's state."""
+
+    @pytest.mark.asyncio
+    async def test_discard_session_file_state_forgets_session_state(self, tmp_path: Path):
+        """Calling discard_session_file_state drops that session's tracker."""
+        loop = _make_loop(tmp_path)
+        key = "telegram:111"
+
+        previous_state = loop._file_state_store.for_session(key)
+        loop.discard_session_file_state(key)
+
+        assert loop._file_state_store.for_session(key) is not previous_state
+
+    @pytest.mark.asyncio
+    async def test_loop_file_state_store_is_bounded(self, tmp_path: Path):
+        """The loop's store evicts least-recently-used sessions at the bound."""
+        loop = _make_loop(tmp_path)
+        store = loop._file_state_store
+        first_state = store.for_session("telegram:first")
+        for i in range(MAX_FILE_STATE_SESSIONS + 1):
+            store.for_session(f"telegram:{i}")
+        assert store.for_session("telegram:first") is not first_state
 
 
 # ---------------------------------------------------------------------------
