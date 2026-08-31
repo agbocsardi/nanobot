@@ -358,6 +358,20 @@ class AskUserTool(Tool, ContextAware):
             expires_at_ms=_now_ms() + ttl_s * 1000,
         )
 
+        # Durable wait-and-resume (issue #29): persist the envelope closure
+        # for this question BEFORE rendering anything, so a crash in either
+        # order stays recoverable and an answer can resume exactly once.
+        from nanobot.agent.tools.waiting_runs import WaitingRunStore
+
+        WaitingRunStore(self._workspace).create(
+            question_id=pending.question_id,
+            sender_id=self._sender_id,
+            channel=self._channel,
+            chat_id=self._chat_id,
+            session_key=self._session_key,
+            expires_at_ms=pending.expires_at_ms,
+        )
+
         buttons = [
             [
                 {

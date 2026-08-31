@@ -958,11 +958,48 @@ async def cmd_tasks(ctx: CommandContext) -> OutboundMessage:
         )
     lines = ["## Tasks"]
     lines.extend(f"- {_task_command_line(r)}" for r in records)
+    waiting_store = getattr(loop, "waiting_runs", None)
+    if waiting_store is not None:
+        waiting = [
+            w for w in waiting_store.list_for_owner(
+                ctx.key, sender_id=getattr(msg, "sender_id", None)
+            )
+            if w.status in ("waiting", "resuming")
+        ]
+        if waiting:
+            lines.append("waiting:")
+            for w in waiting[:10]:
+                label = _waiting_run_line(w)
+                lines.append(f"- {label}")
     return OutboundMessage(
         channel=msg.channel, chat_id=msg.chat_id,
         content="\n".join(lines),
         metadata=dict(msg.metadata or {}),
     )
+
+
+def _waiting_run_line(run) -> str:
+    """One compact waiting-run line."""
+    label = SubagentManager._truncate_chat(str(run.note or "awaiting answer"), 60)
+    return f"[{run.status}] {run.run_id} {label} (question {run.question_id})"
+
+
+def _waiting_run_detail_lines(run) -> list[str]:
+    """Bounded detail for a waiting/resumed run (issue #29)."""
+    lines = [
+        f"run: {run.run_id}",
+        f"status: {run.status}",
+        f"question: {run.question_id}",
+    ]
+    if run.note:
+        lines.append("note: " + SubagentManager._truncate_chat(run.note, 300))
+    if run.completed_tool_names:
+        lines.append("completed tools: " + ", ".join(run.completed_tool_names[:10]))
+    if run.budgets:
+        parts = [f"{k}={v}" for k, v in run.budgets.items() if v is not None]
+        if parts:
+            lines.append("budgets: " + " ".join(parts))
+    return lines
 
 
 def _task_detail_lines(record: dict, result_limit: int = 400) -> list[str]:
@@ -1038,7 +1075,17 @@ async def cmd_task(ctx: CommandContext) -> OutboundMessage:
             elif result == "done":
                 content = f"Task {task_id} already finished."
             else:
-                content = f"Task {task_id} not found."
+                waiting_store = getattr(loop, "waiting_runs", None)
+                cancelled_waiting = (
+                    waiting_store.cancel(task_id, session_key=ctx.key)
+                    if waiting_store is not None
+                    else False
+                )
+                content = (
+                    f"Cancelled waiting run {task_id}."
+                    if cancelled_waiting
+                    else f"Task {task_id} not found."
+                )
         elif action == "retry":
             status, new_id = await loop.subagents.retry_task(
                 task_id, session_key=ctx.key, sender_id=sender_id
@@ -1071,19 +1118,33 @@ async def cmd_task(ctx: CommandContext) -> OutboundMessage:
             metadata=dict(msg.metadata or {}),
         )
 
-    # Bare task id -> detail view (session + recorded-sender gated).
+    # Bare task id -> detail view (session + recorded-sender gated), with a
+    # fallback to durable waiting runs from the ask_user wait/resume surface.
     record, _ = loop.subagents.owned_record(
         action, session_key=ctx.key, sender_id=sender_id
     )
-    if record is None:
+    if record is not None:
         return OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id,
-            content=f"Task {action} not found.",
+            content="\n".join(_task_detail_lines(record)),
             metadata=dict(msg.metadata or {}),
         )
+    waiting_store = getattr(loop, "waiting_runs", None)
+    if waiting_store is not None:
+        run = waiting_store.get(action)
+        if run is not None:
+            origin_ok = run.session_key == ctx.key
+            if origin_ok and sender_id and run.sender_id and run.sender_id != sender_id:
+                origin_ok = False
+            if origin_ok:
+                return OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content="\n".join(_waiting_run_detail_lines(run)),
+                    metadata=dict(msg.metadata or {}),
+                )
     return OutboundMessage(
         channel=msg.channel, chat_id=msg.chat_id,
-        content="\n".join(_task_detail_lines(record)),
+        content=f"Task {action} not found.",
         metadata=dict(msg.metadata or {}),
     )
 
