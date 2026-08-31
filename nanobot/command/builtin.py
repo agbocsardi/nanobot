@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from nanobot import __version__
+from nanobot.agent.subagent import SubagentManager
 from nanobot.bus.events import OutboundMessage
 from nanobot.command.router import CommandContext, CommandRouter
 from nanobot.utils.helpers import build_status_content
@@ -116,6 +117,19 @@ BUILTIN_COMMAND_SPECS: tuple[BuiltinCommandSpec, ...] = (
         "Save a short note into curated topic memory under memory/.",
         "bookmark",
         arg_hint="[<topic>:] <text>",
+    ),
+    BuiltinCommandSpec(
+        "/tasks",
+        "Background tasks",
+        "List queued/running/waiting and recent background tasks.",
+        "list-tree",
+    ),
+    BuiltinCommandSpec(
+        "/task",
+        "Task control",
+        "Inspect, stop, retrieve, or retry one background task.",
+        "workflow",
+        arg_hint="[stop|result|retry] <id>",
     ),
     BuiltinCommandSpec(
         "/skill",
@@ -892,6 +906,204 @@ def _policy_unknown_token_message(store, token: str) -> str:
     return "\n".join(lines)
 
 
+
+# ---------------------------------------------------------------------------
+# background task control (issue #27): /tasks and /task
+# ---------------------------------------------------------------------------
+
+
+def _task_command_line(record: dict) -> str:
+    """One compact, deterministic line for /tasks output."""
+    status = SubagentManager.task_status_vocabulary(record)
+    created = int(record.get("created_at_ms") or 0)
+    updated = int(record.get("updated_at_ms") or created)
+    label = SubagentManager._truncate_chat(str(record.get("label") or ""), 60)
+    if status in ("queued", "waiting", "running"):
+        return f"[{status}] {record.get('task_id')} {label} (started {_format_utc_ms(created)})"
+    return (
+        f"[{status}] {record.get('task_id')} {label} "
+        f"(started {_format_utc_ms(created)} -> ended {_format_utc_ms(updated)})"
+    )
+
+
+def _owned_task_record(loop, task_id: str, session_key: str, sender_id: str | None) -> dict | None:
+    """Return a record only when the session (and sender, when recorded) owns it."""
+    try:
+        record = loop.subagents.read_run_record(task_id)
+    except Exception:
+        return None
+    if record is None:
+        return None
+    origin = record.get("origin") or {}
+    if origin.get("session_key") != session_key:
+        return None
+    rec_sender = origin.get("sender_id")
+    if sender_id and rec_sender and str(rec_sender) != str(sender_id):
+        return None
+    return record
+
+
+async def cmd_tasks(ctx: CommandContext) -> OutboundMessage:
+    """List queued/running/waiting tasks first, then a small recent terminal list."""
+    loop = ctx.loop
+    msg = ctx.msg
+    if loop is None or not hasattr(loop, "subagents"):
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content="Task control is not available here.",
+            metadata=dict(msg.metadata or {}),
+        )
+    try:
+        records = loop.subagents.list_session_task_records(
+            ctx.key, sender_id=getattr(msg, "sender_id", None)
+        )
+    except Exception:
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content="Error listing tasks.",
+            metadata=dict(msg.metadata or {}),
+        )
+    if not records:
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content="No background tasks for this session.",
+            metadata=dict(msg.metadata or {}),
+        )
+    active = [
+        r for r in records
+        if SubagentManager.task_status_vocabulary(r) in ("queued", "waiting", "running")
+    ]
+    terminal = [r for r in records if r not in active][:10]
+    lines = ["## Tasks"]
+    lines.extend(f"- {_task_command_line(r)}" for r in active)
+    if terminal:
+        lines.append("recent:")
+        lines.extend(f"- {_task_command_line(r)}" for r in terminal)
+    return OutboundMessage(
+        channel=msg.channel, chat_id=msg.chat_id,
+        content="\n".join(lines),
+        metadata=dict(msg.metadata or {}),
+    )
+
+
+def _task_detail_lines(record: dict, result_limit: int = 400) -> list[str]:
+    status = SubagentManager.task_status_vocabulary(record)
+    created = int(record.get("created_at_ms") or 0)
+    updated = int(record.get("updated_at_ms") or created)
+    params = record.get("params") or {}
+    lines = [
+        f"task: {record.get('task_id')}",
+        f"label: {SubagentManager._truncate_chat(str(record.get('label') or ''), 80)}",
+        f"status: {status}",
+        f"started: {_format_utc_ms(created)}",
+    ]
+    if status not in ("queued", "waiting", "running"):
+        lines.append(f"ended: {_format_utc_ms(updated)}")
+    budgets = []
+    if params.get("max_iterations") is not None:
+        budgets.append(f"iterations={params.get('max_iterations')}")
+    if params.get("context_window_tokens") is not None:
+        budgets.append(f"context={params.get('context_window_tokens')}")
+    if params.get("max_tokens") is not None:
+        budgets.append(f"max_tokens={params.get('max_tokens')}")
+    if params.get("model_preset"):
+        budgets.append(f"preset={params.get('model_preset')}")
+    if budgets:
+        lines.append("budgets: " + " ".join(budgets))
+    if record.get("iterations") is not None:
+        lines.append(f"iterations used: {record.get('iterations')}")
+    if record.get("retry_of"):
+        lines.append(f"retry of: {record.get('retry_of')}")
+    if record.get("retried_by"):
+        lines.append(f"retried as: {record.get('retried_by')}")
+    if record.get("error"):
+        lines.append("error: " + SubagentManager._truncate_chat(str(record.get("error")), 200))
+    result = record.get("result")
+    if status not in ("queued", "waiting", "running") and result:
+        lines.append("result: " + SubagentManager._truncate_chat(str(result), result_limit))
+    return lines
+
+
+async def cmd_task(ctx: CommandContext) -> OutboundMessage:
+    """Inspect, stop, retrieve, or retry ONE background task."""
+    loop = ctx.loop
+    msg = ctx.msg
+    if loop is None or not hasattr(loop, "subagents"):
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content="Task control is not available here.",
+            metadata=dict(msg.metadata or {}),
+        )
+    parts = ctx.args.strip().split()
+    if not parts:
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content="Usage: `/task <id>` | `/task stop|result|retry <id>`",
+            metadata=dict(msg.metadata or {}),
+        )
+    action = parts[0]
+    sender_id = getattr(msg, "sender_id", None)
+
+    if action in ("stop", "result", "retry"):
+        if len(parts) < 2:
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=f"Usage: `/task {action} <id>`",
+                metadata=dict(msg.metadata or {}),
+            )
+        task_id = parts[1]
+        if action == "stop":
+            result = await loop.subagents.cancel_task(task_id, session_key=ctx.key)
+            if result == "cancelled":
+                content = f"Cancelled task {task_id}."
+            elif result == "done":
+                content = f"Task {task_id} already finished."
+            else:
+                content = f"Task {task_id} not found."
+        elif action == "retry":
+            status, new_id = await loop.subagents.retry_task(
+                task_id, session_key=ctx.key, sender_id=sender_id
+            )
+            if status == "created":
+                content = f"Retried {task_id} as {new_id} (same bounded model settings)."
+            elif status == "still_active":
+                content = f"Task {task_id} is still running."
+            elif status == "queue_full":
+                content = "Retry rejected: the delegated queue is full. Try later."
+            else:
+                content = f"Task {task_id} not found or not retryable."
+        else:  # result
+            record = _owned_task_record(loop, task_id, ctx.key, sender_id)
+            if record is None:
+                content = f"Task {task_id} not found."
+            else:
+                status = SubagentManager.task_status_vocabulary(record)
+                if status in ("queued", "waiting", "running"):
+                    content = f"Task {task_id} is still {status}; use `/task {task_id}` for live state."
+                elif record.get("result"):
+                    content = SubagentManager._truncate_chat(str(record.get("result")), 800)
+                else:
+                    error = SubagentManager._truncate_chat(str(record.get("error")), 800)
+                    content = f"Task {task_id} ended with no result." + (f"\n{error}" if error else "")
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id, content=content,
+            metadata=dict(msg.metadata or {}),
+        )
+
+    # Bare task id -> detail view (session + recorded-sender gated).
+    record = _owned_task_record(loop, action, ctx.key, sender_id)
+    if record is None:
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content=f"Task {action} not found.",
+            metadata=dict(msg.metadata or {}),
+        )
+    return OutboundMessage(
+        channel=msg.channel, chat_id=msg.chat_id,
+        content="\n".join(_task_detail_lines(record)),
+        metadata=dict(msg.metadata or {}),
+    )
+
 async def cmd_skill(ctx: CommandContext) -> OutboundMessage:
     """List all enabled skills (name and description only)."""
     loop = ctx.loop
@@ -1064,6 +1276,9 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.exact("/skill", cmd_skill)
     router.exact("/remember", cmd_remember)
     router.prefix("/remember ", cmd_remember)
+    router.exact("/tasks", cmd_tasks)
+    router.exact("/task", cmd_task)
+    router.prefix("/task ", cmd_task)
     router.exact("/help", cmd_help)
     router.exact("/pairing", cmd_pairing)
     router.prefix("/pairing ", cmd_pairing)
