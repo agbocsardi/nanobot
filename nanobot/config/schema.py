@@ -319,6 +319,16 @@ class ToolPolicyRuleConfig(Base):
     reason: str = ""
 
 
+class PolicyApprovalConfig(Base):
+    """Timeouts for interactive ``ask`` approvals (per session)."""
+
+    # How long a pending approval stays valid before it must be re-requested.
+    timeout_s: float = 300.0
+    # How long an approved/denied decision is cached so the same call is not
+    # re-prompted within a session.
+    cache_ttl_s: float = 600.0
+
+
 def _lazy_default(module_path: str, class_name: str) -> Any:
     """Deferred import helper for ToolsConfig default factories."""
     import importlib
@@ -346,6 +356,14 @@ class ToolsConfig(Base):
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
     ssrf_whitelist: list[str] = Field(default_factory=list)  # CIDR ranges to exempt from SSRF blocking (e.g. ["100.64.0.0/10"] for Tailscale)
     policies: list[ToolPolicyRuleConfig] = Field(default_factory=list)
+    approval: PolicyApprovalConfig = Field(default_factory=PolicyApprovalConfig)
+    # Install a default catch-all denying write (state-mutating) tool calls in
+    # audit mode unless an earlier explicit rule allows them. No effect when no
+    # policies are configured: audit mode is only enforced when enabled.
+    audit_mode_read_only: bool = False
+    # Deny state-mutating tool calls in exploration mode (same catch-all
+    # pattern as audit mode). No effect when disabled.
+    exploration_mode_deny_mutations: bool = False
 
 
 class Config(BaseSettings):

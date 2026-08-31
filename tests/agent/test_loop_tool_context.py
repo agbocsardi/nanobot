@@ -81,9 +81,8 @@ async def test_loop_hook_preserves_metadata_when_resetting_tool_context(tmp_path
         session_key="slack:C123:111.222",
     )
 
-    assert cron.contexts[-1] == {
-        "channel": "slack",
-        "chat_id": "C123",
-        "metadata": metadata,
-        "session_key": "slack:C123:111.222",
-    }
+    assert cron.contexts[-1]["channel"] == "slack"
+    assert cron.contexts[-1]["chat_id"] == "C123"
+    assert cron.contexts[-1]["session_key"] == "slack:C123:111.222"
+    # The loop stamps the deterministic interaction mode onto the tool context.
+    assert cron.contexts[-1]["metadata"] == {**metadata, "interaction_mode": "foreground"}

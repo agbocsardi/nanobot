@@ -168,22 +168,33 @@ class ToolRegistry:
         if decision.outcome != "allow":
             action = "requires explicit approval" if decision.outcome == "ask" else "was denied"
             reason = f": {decision.reason}" if decision.reason else ""
+            approval_hint = ""
+            if decision.outcome == "ask" and decision.approval_token:
+                approval_hint = (
+                    f" Approve with `/policy approve {decision.approval_token}` "
+                    f"or deny with `/policy deny {decision.approval_token}`."
+                )
             message = (
                 f"Policy {action} for tool '{name}' "
-                f"(rule: {decision.rule_id or 'unnamed'}){reason}"
+                f"(rule: {decision.rule_id or 'unnamed'}){reason}.{approval_hint}"
             )
+            data: dict[str, Any] = {
+                "decision": decision.outcome,
+                "rule_id": decision.rule_id,
+                "resource": decision.resource,
+            }
+            evidence: dict[str, Any] = {
+                "kind": "tool_policy",
+                "decision": decision.outcome,
+                "rule_id": decision.rule_id,
+            }
+            if decision.approval_token:
+                data["approval_token"] = decision.approval_token
+                evidence["approval_token"] = decision.approval_token
             return ToolResult.policy_block(
                 message,
-                data={
-                    "decision": decision.outcome,
-                    "rule_id": decision.rule_id,
-                    "resource": decision.resource,
-                },
-                evidence=[{
-                    "kind": "tool_policy",
-                    "decision": decision.outcome,
-                    "rule_id": decision.rule_id,
-                }],
+                data=data,
+                evidence=[evidence],
             )
 
         try:

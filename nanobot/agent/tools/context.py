@@ -3,7 +3,10 @@ from __future__ import annotations
 
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
-from typing import Any, Callable, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Callable, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from nanobot.agent.tools.approval import ApprovalStore
 
 _CURRENT_REQUEST_CONTEXT: ContextVar["RequestContext | None"] = ContextVar(
     "nanobot_tool_request_context",
@@ -19,6 +22,10 @@ class RequestContext:
     message_id: str | None = None
     session_key: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Session-scoped interactive approval store consulted by the policy engine
+    # for ask outcomes. None outside interactive agent turns (e.g. standalone
+    # registry use), where ask keeps blocking without an approval surface.
+    approvals: "ApprovalStore | None" = None
 
 
 @runtime_checkable

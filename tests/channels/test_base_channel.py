@@ -110,3 +110,44 @@ async def test_transcribe_audio_skips_openai_without_api_key() -> None:
 
     result = await channel.transcribe_audio("/tmp/fake.ogg")
     assert result == ""
+
+
+@pytest.mark.asyncio
+async def test_handle_message_stamps_foreground_interaction_mode() -> None:
+    """Chat turns publish a deterministic foreground mode for policy rules."""
+    channel = _DummyChannel({"allow_from": ["*"]}, MessageBus())
+
+    received: list = []
+
+    async def capture(msg):
+        received.append(msg)
+
+    channel.bus.publish_inbound = capture  # type: ignore[method-assign]
+
+    await channel._handle_message(
+        sender_id="alice", chat_id="chat1", content="hello", is_dm=False
+    )
+
+    assert len(received) == 1
+    assert received[0].metadata.get("_interaction_mode") == "foreground"
+
+
+@pytest.mark.asyncio
+async def test_handle_message_preserves_explicit_interaction_mode() -> None:
+    channel = _DummyChannel({"allow_from": ["*"]}, MessageBus())
+    received: list = []
+
+    async def capture(msg):
+        received.append(msg)
+
+    channel.bus.publish_inbound = capture  # type: ignore[method-assign]
+
+    await channel._handle_message(
+        sender_id="alice",
+        chat_id="chat1",
+        content="hello",
+        is_dm=False,
+        metadata={"_interaction_mode": "audit"},
+    )
+
+    assert received[0].metadata.get("_interaction_mode") == "audit"

@@ -16,6 +16,9 @@ These commands work inside chat channels and interactive agent sessions:
 | `/dream-restore` | List recent Dream memory versions |
 | `/dream-restore <sha>` | Restore memory to the state before a specific change |
 | `/skill` | List enabled skills and their descriptions |
+| `/policy` | List pending tool-policy approvals |
+| `/policy approve <token\|rule-id>` | Approve a pending policy approval for this session |
+| `/policy deny <token\|rule-id>` | Deny a pending policy approval (same block as a deny rule) |
 | `/pairing` | List pending pairing requests |
 | `/pairing approve <code>` | Approve a pairing code |
 | `/pairing deny <code>` | Deny a pending pairing request |

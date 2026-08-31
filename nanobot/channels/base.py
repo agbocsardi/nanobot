@@ -229,9 +229,12 @@ class BaseChannel(ABC):
                 )
             return
 
-        meta = metadata or {}
+        meta = dict(metadata or {})
+        # Chat turns are foreground interaction by default; policy rules can
+        # match mode="foreground" deterministically.
+        meta.setdefault("_interaction_mode", "foreground")
         if self.supports_streaming:
-            meta = {**meta, "_wants_stream": True}
+            meta["_wants_stream"] = True
 
         msg = InboundMessage(
             channel=self.name,

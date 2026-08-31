@@ -13,10 +13,15 @@ from loguru import logger
 from nanobot.agent import model_presets as preset_helpers
 from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.agent.runner import AgentRunner, AgentRunSpec
-from nanobot.agent.tools.context import ToolContext
+from nanobot.agent.tools.context import (
+    RequestContext,
+    ToolContext,
+    bind_request_context,
+    reset_request_context,
+)
 from nanobot.agent.tools.file_state import FileStates
 from nanobot.agent.tools.loader import ToolLoader
-from nanobot.agent.tools.policy import ToolPolicy
+from nanobot.agent.tools.policy import ToolPolicy, effective_policy_rules
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
@@ -180,6 +185,9 @@ class SubagentManager:
             web=self.tools_config.web,
             file=self.tools_config.file,
             policies=list(self.tools_config.policies),
+            approval=self.tools_config.approval,
+            audit_mode_read_only=self.tools_config.audit_mode_read_only,
+            exploration_mode_deny_mutations=self.tools_config.exploration_mode_deny_mutations,
             restrict_to_workspace=self.restrict_to_workspace,
         )
 
@@ -194,7 +202,11 @@ class SubagentManager:
         root = self.workspace if workspace is None else workspace
         cfg = tools_config if tools_config is not None else self._subagent_tools_config()
         registry = ToolRegistry(policy=ToolPolicy(
-            cfg.policies,
+            effective_policy_rules(
+                cfg.policies,
+                audit_mode_read_only=cfg.audit_mode_read_only,
+                exploration_mode_deny_mutations=cfg.exploration_mode_deny_mutations,
+            ),
             default_context=lambda: {
                 "mode": "delegated",
                 "model": policy_model or self.run_model or self.model,
@@ -506,7 +518,16 @@ class SubagentManager:
                 if self._llm_wall_timeout_for_session
                 else None
             )
-            token = bind_workspace_scope(workspace_scope) if workspace_scope is not None else None
+            workspace_token = bind_workspace_scope(workspace_scope) if workspace_scope is not None else None
+            # Delegated runs carry a deterministic interaction mode so policy
+            # rules can match them (mode=delegated). Subagents are autonomous:
+            # no approval store is attached, so ask outcomes keep blocking.
+            request_token = bind_request_context(RequestContext(
+                channel=origin.get("channel") or "system",
+                chat_id=origin.get("chat_id") or "direct",
+                session_key=sess_key,
+                metadata={"interaction_mode": "delegated"},
+            ))
             try:
                 dedicated = (
                     provider_override is not None
@@ -534,8 +555,9 @@ class SubagentManager:
                     llm_timeout_s=llm_timeout,
                 ))
             finally:
-                if token is not None:
-                    reset_workspace_scope(token)
+                if workspace_token is not None:
+                    reset_workspace_scope(workspace_token)
+                reset_request_context(request_token)
             status.stop_reason = result.stop_reason
             status.tool_events = list(result.tool_events)
             status.activity = "terminal"

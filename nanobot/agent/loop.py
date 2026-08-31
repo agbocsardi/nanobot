@@ -25,10 +25,15 @@ from nanobot.agent.memory import Consolidator
 from nanobot.agent.progress_hook import AgentProgressHook
 from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
 from nanobot.agent.subagent import SubagentManager
+from nanobot.agent.tools.approval import ApprovalStore
 from nanobot.agent.tools.context import RequestContext, bind_request_context, reset_request_context
 from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, reset_file_states
 from nanobot.agent.tools.message import MessageTool
-from nanobot.agent.tools.policy import ToolPolicy
+from nanobot.agent.tools.policy import (
+    ToolPolicy,
+    effective_policy_rules,
+    interaction_mode_from_metadata,
+)
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.self import MyTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
@@ -40,7 +45,7 @@ from nanobot.bus.runtime_events import (
     ensure_runtime_event_publisher,
 )
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
-from nanobot.config.schema import AgentDefaults, ModelPresetConfig
+from nanobot.config.schema import AgentDefaults, ModelPresetConfig, PolicyApprovalConfig
 from nanobot.cron.session_turns import (
     CRON_RUN_SNAPSHOT_META,
     cron_history_overrides,
@@ -300,13 +305,20 @@ class AgentLoop:
         )
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry(policy=ToolPolicy(
-            _tc.policies,
+            effective_policy_rules(
+                _tc.policies,
+                audit_mode_read_only=_tc.audit_mode_read_only,
+                exploration_mode_deny_mutations=_tc.exploration_mode_deny_mutations,
+            ),
             default_context=lambda: {
                 "mode": "foreground",
                 "model": self.model,
                 "preset": self.model_preset,
             },
         ))
+        # One interactive approval store per session (bounded, TTL-evicted).
+        self._approval_stores: dict[str, ApprovalStore] = {}
+        self._approval_cfg = _tc.approval
         # One file-read/write tracker per logical session. The tool registry is
         # shared by this loop, so tools resolve the active state via contextvars.
         self._file_state_store = FileStateStore()
@@ -602,6 +614,45 @@ class AgentLoop:
         """Connect configured MCP servers."""
         await agent_context.connect_mcp(self, self.tools)
 
+    def _effective_turn_metadata(self, metadata: dict | None) -> dict:
+        """Copy message metadata with a deterministic interaction mode stamped.
+
+        The mode drives policy matching (rules filter on ``mode=audit``,
+        ``mode=cron``, ...) and is derived from entry-point metadata or legacy
+        signals when not explicitly set.
+        """
+        effective = dict(metadata or {})
+        effective.setdefault("interaction_mode", interaction_mode_from_metadata(effective))
+        return effective
+
+    def approval_store(self, session_key: str | None) -> ApprovalStore:
+        """Get (or lazily create) the interactive approval store for a session."""
+        stores = getattr(self, "_approval_stores", None)
+        if stores is None:
+            stores = self._approval_stores = {}
+        cfg = getattr(self, "_approval_cfg", None)
+        if cfg is None:
+            cfg = self._approval_cfg = PolicyApprovalConfig()
+        key = session_key or "default"
+        store = stores.get(key)
+        if store is not None:
+            return store
+        store = ApprovalStore(
+            timeout_s=cfg.timeout_s,
+            cache_ttl_s=cfg.cache_ttl_s,
+        )
+        # Bound memory: evict expired stores first, then the oldest beyond cap.
+        if len(self._approval_stores) >= 1024:
+            for candidate_key in list(self._approval_stores):
+                candidate = self._approval_stores[candidate_key]
+                candidate.prune()
+                if not candidate.pending_list():
+                    self._approval_stores.pop(candidate_key, None)
+            if len(self._approval_stores) >= 1024:
+                self._approval_stores.pop(next(iter(self._approval_stores)), None)
+        self._approval_stores[key] = store
+        return store
+
     def _set_tool_context(
         self, channel: str, chat_id: str,
         message_id: str | None = None, metadata: dict | None = None,
@@ -620,7 +671,8 @@ class AgentLoop:
             chat_id=chat_id,
             message_id=message_id,
             session_key=effective_key,
-            metadata=dict(metadata or {}),
+            metadata=self._effective_turn_metadata(metadata),
+            approvals=self.approval_store(effective_key),
         )
 
         for name in self.tools.tool_names:
@@ -860,6 +912,10 @@ class AgentLoop:
         """
         self._sync_subagent_runtime_limits()
 
+        # Stamp the deterministic interaction mode once so policy evaluation,
+        # progress hooks, and session bookkeeping all agree on the run kind.
+        effective_metadata = self._effective_turn_metadata(metadata)
+
         loop_hook = AgentProgressHook(
             on_progress=on_progress,
             on_stream=on_stream,
@@ -867,7 +923,7 @@ class AgentLoop:
             channel=channel,
             chat_id=chat_id,
             message_id=message_id,
-            metadata=metadata,
+            metadata=effective_metadata,
             session_key=session_key,
             tool_hint_max_length=self.tool_hint_max_length,
             set_tool_context=self._set_tool_context,
@@ -936,7 +992,7 @@ class AgentLoop:
         active_session_key = session.key if session else session_key
         effective_scope = self.workspace_scopes.for_turn(
             channel=channel,
-            message_metadata=metadata,
+            message_metadata=effective_metadata,
             session_metadata=session.metadata if session is not None else None,
         )
         request_ctx = RequestContext(
@@ -944,7 +1000,8 @@ class AgentLoop:
             chat_id=chat_id,
             message_id=message_id,
             session_key=active_session_key,
-            metadata=dict(metadata or {}),
+            metadata=effective_metadata,
+            approvals=self.approval_store(active_session_key),
         )
         file_state_token = bind_file_states(self._file_state_store.for_session(active_session_key))
         request_token = bind_request_context(request_ctx)
@@ -968,7 +1025,7 @@ class AgentLoop:
             self.sessions,
             session.key if session is not None else session_key,
             metadata=session_metadata,
-            message_metadata=metadata,
+            message_metadata=effective_metadata,
         )
         try:
             result = await runner.run(AgentRunSpec(
@@ -998,7 +1055,7 @@ class AgentLoop:
                 finalize_on_max_iterations=turn_continuation.should_finalize_on_max_iterations(
                     pending_queue_available=pending_queue is not None and session is not None,
                     session_metadata=session_metadata,
-                    message_metadata=metadata,
+                    message_metadata=effective_metadata,
                 ),
                 vision_handoff=self.vision_handoff,
             ))
@@ -1019,7 +1076,7 @@ class AgentLoop:
                 stop_reason=result.stop_reason,
                 pending_queue_available=pending_queue is not None and session is not None,
                 session_metadata=session_metadata,
-                message_metadata=metadata,
+                message_metadata=effective_metadata,
             )
             # Push final content through stream so streaming channels (e.g. Feishu)
             # update the card instead of leaving it empty.
@@ -2033,12 +2090,19 @@ class AgentLoop:
         run_max_iterations: int | None = None,
         run_max_tool_result_chars: int | None = None,
         run_llm_timeout_s: int | None = None,
+        metadata: dict | None = None,
     ) -> OutboundMessage | None:
-        """Process a message directly and return the outbound payload."""
+        """Process a message directly and return the outbound payload.
+
+        ``metadata`` is stamped onto the inbound message; ``interaction_mode``
+        (or the legacy ``run_type``/heartbeat/cron signals) may be set here to
+        select a policy interaction mode for the run (e.g. audit/exploration).
+        """
         await self._connect_mcp()
         msg = InboundMessage(
             channel=channel, sender_id="user", chat_id=chat_id,
             content=content, media=media or [],
+            metadata=dict(metadata or {}),
         )
         # Share the dispatch lock so direct calls serialize with bus turns.
         lock = self._session_locks.setdefault(session_key, asyncio.Lock())
