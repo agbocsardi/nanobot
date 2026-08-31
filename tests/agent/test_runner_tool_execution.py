@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from nanobot.agent.runner import AgentRunner, AgentRunSpec
+from nanobot.agent.tools.action_receipts import ActionReceiptStore
 from nanobot.agent.tools.base import Tool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.config.schema import AgentDefaults
@@ -363,3 +364,38 @@ async def test_runner_blocks_repeated_external_fetches():
         if msg.get("role") == "tool" and msg.get("tool_call_id") == "call_3"
     ][0]
     assert "repeated external lookup blocked" in blocked_tool_message["content"]
+
+
+@pytest.mark.asyncio
+async def test_runner_routes_local_side_effect_tool_through_receipt_store(tmp_path):
+    tools = ToolRegistry(receipt_store=ActionReceiptStore(tmp_path))
+    events: list[str] = []
+    tool = _DelayTool(
+        "write_a",
+        delay=0,
+        read_only=False,
+        shared_events=events,
+    )
+    tool.effect = "external"
+    tools.register(tool)
+
+    runner = AgentRunner(MagicMock())
+    results, _events, error = await runner._execute_tools(
+        AgentRunSpec(
+            initial_messages=[],
+            tools=tools,
+            model="test-model",
+            max_iterations=1,
+            max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        ),
+        [ToolCallRequest(id="write-1", name="write_a", arguments={})],
+        {},
+        {},
+    )
+
+    receipt = tools.receipt_store.get("write-1")
+    assert receipt is not None
+    assert receipt.status == "succeeded"
+    assert error is None
+    assert results == ["write_a"]
+    assert events == ["start:write_a", "end:write_a"]

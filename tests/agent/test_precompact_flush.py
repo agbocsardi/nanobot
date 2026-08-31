@@ -140,6 +140,32 @@ async def test_model_failure_is_recorded_and_does_not_block(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_later_flush_preserves_facts_from_earlier_flush(tmp_path) -> None:
+    provider = _FakeProvider()
+    session = _session(tmp_path, [
+        {"role": "user", "content": "remember that the office is on floor 5"},
+        {"role": "assistant", "content": "noted"},
+    ])
+    con = _consolidator(tmp_path, provider)
+    con.sessions = _bind_session(con, session)
+
+    first = await con.flush_before_compaction(session)
+    assert first["result"] == "changed"
+    session.messages.extend([
+        {"role": "user", "content": "remember that the lab is on floor 2"},
+        {"role": "assistant", "content": "noted"},
+    ])
+    second = await con.flush_before_compaction(session)
+
+    assert second["result"] == "changed"
+    saved = (tmp_path / "memory" / "flush-notes.md").read_text()
+    assert saved.count("- user prefers dark mode") == 2
+    assert saved.count("## Pre-compaction flush") == 2
+    assert "## Pre-compaction flush 0-2" in saved
+    assert "## Pre-compaction flush 2-4" in saved
+
+
+@pytest.mark.asyncio
 async def test_flush_skipped_while_in_flight(tmp_path) -> None:
     provider = _FakeProvider()
     session = _session(tmp_path, [

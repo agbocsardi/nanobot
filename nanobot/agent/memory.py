@@ -1884,21 +1884,22 @@ class Consolidator:
                                   destinations=[destination])
 
     def _append_facts(self, session, start: int, total: int, facts: list[str]) -> str:
-        """Append bounded facts to a topic memory file (guarded paths)."""
-        from nanobot.agent.tools._memory_common import resolve_topic_path
+        """Append bounded facts without replacing facts from earlier flushes."""
+        from filelock import FileLock
+
+        from nanobot.agent.tools._memory_common import atomic_write_text, resolve_topic_path
 
         rel = "flush-notes.md"
-        Path(self.store.workspace).joinpath("memory").mkdir(parents=True, exist_ok=True)
-        resolved = resolve_topic_path(Path(self.store.workspace), rel)
+        workspace = Path(self.store.workspace)
+        workspace.joinpath("memory").mkdir(parents=True, exist_ok=True)
+        resolved = resolve_topic_path(workspace, rel)
         heading = f"## Pre-compaction flush {start}-{total}\n"
         body = "\n".join("- " + f[:300] for f in facts) + "\n"
-        content = f"# {rel}\n\n" + heading + body
-        tmp = resolved.with_suffix(resolved.suffix + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(content)
-            fh.flush()
-            os.fsync(fh.fileno())
-        tmp.replace(resolved)
+        lock = FileLock(str(resolved) + ".lock", timeout=10)
+        with lock:
+            existing = resolved.read_text(encoding="utf-8") if resolved.exists() else "# Flush notes\n"
+            separator = "" if existing.endswith("\n\n") else ("\n" if existing.endswith("\n") else "\n\n")
+            atomic_write_text(resolved, existing + separator + heading + body)
         return f"memory/{rel}"
 
     def _record_flush(

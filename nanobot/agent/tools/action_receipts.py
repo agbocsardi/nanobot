@@ -95,7 +95,7 @@ class ActionReceipt:
 
 
 class ActionReceiptStore:
-    """Durable receipt ledger under ``workspace/action_receipts.json``."""
+    """Durable audit receipt ledger under ``workspace/action_receipts.json``."""
 
     def __init__(self, workspace: Path | None = None):
         self._path = (workspace or Path(".")) / "action_receipts.json"

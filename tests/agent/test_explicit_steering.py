@@ -91,6 +91,24 @@ async def test_after_without_active_publishes_now(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_completed_run_drains_after_queue_before_idle(tmp_path, monkeypatch) -> None:
+    loop = _make_loop(tmp_path)
+    key = "telegram:11"
+    loop._followup_queues[key] = [
+        {"content": "next", "sender_id": "11", "chat_id": "11", "channel": "telegram"},
+    ]
+    monkeypatch.setattr(loop, "_process_message", AsyncMock(return_value=None))
+
+    msg = InboundMessage(channel="telegram", sender_id="11", chat_id="11", content="hello")
+    await loop._dispatch(msg)
+
+    assert key not in loop._followup_queues
+    queued = await loop.bus.consume_inbound()
+    assert queued.content == "next"
+    assert queued.session_key_override == key
+
+
+@pytest.mark.asyncio
 async def test_interrupt_cancels_then_replaces(tmp_path) -> None:
     loop = _make_loop(tmp_path)
     outbound = []

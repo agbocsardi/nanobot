@@ -1742,6 +1742,16 @@ class AgentLoop:
                                 leftover, session_key,
                             )
                     if not turn_continuation.internal_continuation_pending(msg.metadata):
+                        followups = self._drain_followups(session_key)
+                        for item in followups:
+                            await self.bus.publish_inbound(InboundMessage(
+                                channel=str(item.get("channel") or msg.channel),
+                                sender_id=str(item.get("sender_id") or msg.sender_id),
+                                chat_id=str(item.get("chat_id") or msg.chat_id),
+                                content=str(item.get("content") or ""),
+                                metadata=dict(item.get("metadata") or {}),
+                                session_key_override=session_key,
+                            ))
                         await self._runtime_events().run_status_changed(
                             msg, session_key, "idle"
                         )
