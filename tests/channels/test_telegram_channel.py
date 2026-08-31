@@ -2215,6 +2215,28 @@ async def test_forward_command_preserves_dream_log_args_and_strips_bot_suffix() 
 
 
 @pytest.mark.asyncio
+async def test_forward_command_routes_remember_and_policy_to_bus() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+
+    await channel._forward_command(
+        _make_telegram_update(text="/remember@nanobot_test topic: test note", reply_to_message=None), None
+    )
+    await channel._forward_command(_make_telegram_update(text="/policy list", reply_to_message=None), None)
+
+    assert [h["content"] for h in handled] == ["/remember topic: test note", "/policy list"]
+
+
+@pytest.mark.asyncio
 async def test_forward_command_normalizes_telegram_safe_dream_aliases() -> None:
     channel = TelegramChannel(
         TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
@@ -2247,6 +2269,14 @@ def test_telegram_bus_slash_command_regex_matches_agent_loop_commands() -> None:
     assert pat.fullmatch("/skill@nanobot_bot")
     assert pat.fullmatch("/new@nanobot_bot")
     assert pat.fullmatch("/goal@nanobot_bot refine objective")
+    assert pat.fullmatch("/remember")
+    assert pat.fullmatch("/remember laundry detergent")
+    assert pat.fullmatch("/remember projects/foo: bar is decided")
+    assert pat.fullmatch("/remember@nanobot_bot topic: note text")
+    assert pat.fullmatch("/policy")
+    assert pat.fullmatch("/policy list")
+    assert pat.fullmatch("/policy approve abc123")
+    assert pat.fullmatch("/unknowncmd") is None
     assert pat.fullmatch("/dream-log deadbeef") is None
     assert pat.fullmatch("/dream-restore deadbeef") is None
 
