@@ -8,6 +8,8 @@ import sys
 import time
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any
 
 from nanobot import __version__
 from nanobot.bus.events import OutboundMessage
@@ -191,23 +193,130 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
     task_count = sum(1 for t in active_tasks if not t.done())
     with suppress(Exception):
         task_count += loop.subagents.get_running_count_by_session(ctx.key)
+    base_content = build_status_content(
+        version=__version__, model=loop.model,
+        start_time=loop._start_time, last_usage=loop._last_usage,
+        context_window_tokens=loop.context_window_tokens,
+        session_msg_count=len(session.get_history(max_messages=0)),
+        context_tokens_estimate=ctx_est,
+        search_usage_text=search_usage_text,
+        active_task_count=task_count,
+        max_completion_tokens=getattr(
+            getattr(loop.provider, "generation", None), "max_tokens", 8192
+        ),
+    )
+    # Operational sections (best-effort; /status must never fail the turn).
+    extra: list[str] = []
+    with suppress(Exception):
+        cron_section = _status_cron_section(loop)
+        if cron_section:
+            extra.append(cron_section)
+    with suppress(Exception):
+        extra.append(_status_model_chain(loop))
+    content = base_content + ("\n\n" + "\n\n".join(extra) if extra else "")
     return OutboundMessage(
         channel=ctx.msg.channel,
         chat_id=ctx.msg.chat_id,
-        content=build_status_content(
-            version=__version__, model=loop.model,
-            start_time=loop._start_time, last_usage=loop._last_usage,
-            context_window_tokens=loop.context_window_tokens,
-            session_msg_count=len(session.get_history(max_messages=0)),
-            context_tokens_estimate=ctx_est,
-            search_usage_text=search_usage_text,
-            active_task_count=task_count,
-            max_completion_tokens=getattr(
-                getattr(loop.provider, "generation", None), "max_tokens", 8192
-            ),
-        ),
+        content=content,
         metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
     )
+
+
+
+def _format_utc_ms(ts_ms: int | None) -> str:
+    """Format an epoch-ms timestamp as a compact UTC string."""
+    if not ts_ms:
+        return "never"
+    return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _format_cron_schedule(schedule: Any) -> str:
+    """Human-readable schedule, mirroring the cron tool's timing format."""
+    kind = getattr(schedule, "kind", "?")
+    if kind == "cron":
+        tz = f" ({schedule.tz})" if getattr(schedule, "tz", None) else ""
+        return f"cron: {getattr(schedule, 'expr', '?')}{tz}"
+    if kind == "every" and getattr(schedule, "every_ms", None):
+        ms = schedule.every_ms
+        if ms % 3_600_000 == 0:
+            return f"every {ms // 3_600_000}h"
+        if ms % 60_000 == 0:
+            return f"every {ms // 60_000}m"
+        if ms % 1000 == 0:
+            return f"every {ms // 1000}s"
+        return f"every {ms}ms"
+    if kind == "at" and getattr(schedule, "at_ms", None):
+        return f"at {_format_utc_ms(schedule.at_ms)}"
+    return kind
+
+
+def _status_cron_section(loop: Any) -> str:
+    """Operational cron view: enabled jobs, schedule, last + next run.
+
+    Run history and exit state come from the persisted cron store
+    (``jobs.json`` state.runHistory); jobs without a recorded run render as
+    ``never``. Returns an empty string when no cron service is attached
+    (e.g. REPL mode).
+    """
+    cron = getattr(loop, "cron_service", None)
+    if cron is None:
+        return ""
+    lines = ["## Cron jobs"]
+    try:
+        enabled = cron.list_jobs()
+        all_jobs = cron.list_jobs(include_disabled=True)
+    except Exception:
+        return "## Cron jobs\ncron store unavailable"
+    if not all_jobs:
+        lines.append("no scheduled jobs")
+        return "\n".join(lines)
+    for job in enabled:
+        state = job.state
+        if state.last_run_at_ms:
+            last_line = (
+                f"  last run: {_format_utc_ms(state.last_run_at_ms)} "
+                f"({state.last_status or 'unknown'})"
+            )
+        else:
+            last_line = "  last run: never"
+        if state.last_error:
+            last_line += f" — {state.last_error[:100]}"
+        lines.append(f"- {job.name} — {_format_cron_schedule(job.schedule)}")
+        lines.append(last_line)
+        lines.append(f"  next: {_format_utc_ms(state.next_run_at_ms)}")
+    disabled = len(all_jobs) - len(enabled)
+    if disabled:
+        lines.append(f"({disabled} disabled)")
+    return "\n".join(lines)
+
+
+def _snapshot_model(loop: Any, attr: str) -> str | None:
+    snap = getattr(loop, attr, None)
+    if snap is None:
+        return None
+    model = getattr(snap, "model", None)
+    return str(model) if model else None
+
+
+def _status_model_chain(loop: Any) -> str:
+    """Effective model chain: foreground, cron, subagents, dream/consolidator.
+
+    Never prints tokens, keys, or provider credentials — only preset/model
+    names.
+    """
+    active_preset = getattr(loop, "model_preset", None) or "default"
+    foreground_model = getattr(loop, "model", None) or "?"
+    consolidator = getattr(loop, "consolidator", None)
+    consolidator_model = getattr(consolidator, "model", None)
+    return "\n".join([
+        "## Model chain",
+        f"- foreground: {active_preset} ({foreground_model})",
+        f"- cron: {_snapshot_model(loop, '_cron_run_snapshot') or 'foreground preset'}",
+        f"- subagents: {_snapshot_model(loop, '_subagent_run_snapshot') or 'foreground preset'}",
+        f"- dream/consolidator: {consolidator_model or 'foreground provider'}",
+        "- fallback order: per-job override -> runPresets[kind] -> active modelPreset -> default",
+    ])
+
 
 
 async def cmd_new(ctx: CommandContext) -> OutboundMessage:
