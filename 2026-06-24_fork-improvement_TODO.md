@@ -88,3 +88,19 @@ opaque prompt stuffing.
 - Restored LLM consolidation summaries while preserving structured conversation evidence.
 - Switched new conversation archives to contentless v3 (`messages` + optional `summary`).
 - Pushed all completed work to `origin/main` through `f7940c9d`.
+
+## M2 hybrid trigger design
+
+### 2026-09-02
+
+- Designed the M2 Dream hybrid trigger policy (item from `2026-06-16_decouple_TODO.md`):
+  cron + every-N-user-turns + idle timer + manual, compaction as optional bonus.
+- Wrote `docs/dream-trigger-design.md`: current trigger audit (gateway cron system job,
+  `/dream` manual, both funneling into the M1b-M1d guarded `MemoryStore.run_dream`),
+  proposed `dream.triggers.*` config (defaults preserve pure cron behavior, others off),
+  per-loop counter/idle-tick trigger state, single-flight + cooldown dedup rules, and edge
+  cases (restarts reset counters, deferral around active user turns, bounded budget via
+  no-turn-in-flight gate, M1b-M1d rollback interplay incl. a CancelledError hardening gap).
+- Implementation plan covers schema, new `DreamTriggerCoordinator`, loop/cron/builtin hooks,
+  and a test list; open decisions flagged for Gergő.
+- Docs only — no runtime code changes, nothing committed.
