@@ -78,3 +78,24 @@ def unused_tools() -> MagicMock:
     tools.get_definitions.return_value = []
     tools.execute = AsyncMock()
     return tools
+
+
+# --- persistence helpers ------------------------------------------------------
+# AgentLoop appends the runner's message list to session history and the
+# memory archive; the final assistant message is therefore the persisted
+# user-visible record of a run. Harness fixtures assert on it directly so the
+# suppression behavior is verified on the persisted surface, not only on the
+# in-memory AgentRunResult.
+
+
+def final_assistant_message(result: Any) -> dict[str, Any]:
+    """Return the last assistant message of a run (what the loop persists)."""
+    for message in reversed(result.messages):
+        if message.get("role") == "assistant" and not message.get("tool_calls"):
+            return message
+    raise AssertionError("run result has no final assistant message")
+
+
+def persisted_final_content(result: Any) -> str:
+    """Content of the final assistant message the loop would persist."""
+    return str(final_assistant_message(result).get("content") or "")
