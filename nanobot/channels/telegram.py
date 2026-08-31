@@ -12,7 +12,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from html import unescape
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 from urllib.parse import urlparse
 
 from pydantic import Field, field_validator, model_validator
@@ -24,11 +24,12 @@ from telegram import (
     ReplyParameters,
     Update,
 )
-from telegram.error import BadRequest, NetworkError, TimedOut
+from telegram.error import BadRequest, InvalidToken, NetworkError, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
     ContextTypes,
+    ExtBot,
     MessageHandler,
     MessageReactionHandler,
     filters,
@@ -54,6 +55,18 @@ TELEGRAM_REPLY_CONTEXT_MAX_LEN = TELEGRAM_MAX_MESSAGE_LEN  # Max length for repl
 # Bounded rolling buffer of reply-context observations for runtime diagnostics.
 # Records only flags/lengths/ids — never raw message content.
 TELEGRAM_REPLY_OBSERVATION_LIMIT = 100
+# Long-poll liveness: a healthy getUpdates long poll completes one round trip
+# every ~10s even when idle (Updater.start_polling uses a 10s timeout by
+# default). The watchdog bot stamps each completed round trip; when none lands
+# for TELEGRAM_POLL_STALL_SECONDS the supervisor treats polling as stalled and
+# rebuilds the application (including its HTTPX pools). Recovery attempts back
+# off exponentially after failures so the bot self-heals once the network
+# recovers, and never spam the log.
+TELEGRAM_POLL_STALL_SECONDS = 120.0
+TELEGRAM_POLL_WATCH_INTERVAL = 1.0
+TELEGRAM_RECOVERY_BACKOFF_INITIAL = 1.0
+TELEGRAM_RECOVERY_BACKOFF_MAX = 60.0
+TELEGRAM_RECOVERY_BACKOFF_FACTOR = 2
 
 
 def _split_telegram_markdown(content: str, max_len: int) -> list[str]:
@@ -406,6 +419,32 @@ class TelegramConfig(Base):
         return self
 
 
+class _StallWatchBot(ExtBot):
+    """ExtBot whose ``get_updates`` stamps a channel-level completion timestamp.
+
+    A healthy long poll completes one ``getUpdates`` round trip roughly every
+    10s even when idle, so the timestamp is a cheap liveness probe: both a
+    successful poll and a poll that raised prove the attempt finished. The
+    supervisor compares this stamp against the clock to distinguish a silently
+    stalled polling loop (hung TCP connection) from a healthy one.
+    """
+
+    def __init__(
+        self,
+        on_get_updates_done: Callable[[], None],
+        **bot_kwargs: Any,
+    ) -> None:
+        super().__init__(**bot_kwargs)
+        self._on_get_updates_done = on_get_updates_done
+
+    async def get_updates(self, *args: Any, **kwargs: Any) -> tuple[Update, ...]:
+        try:
+            return await super().get_updates(*args, **kwargs)
+        finally:
+            # Completion and exception both count as a finished round trip.
+            self._on_get_updates_done()
+
+
 class TelegramChannel(BaseChannel):
     """
     Telegram channel using long polling or webhook mode.
@@ -469,6 +508,14 @@ class TelegramChannel(BaseChannel):
         )
         self._reply_observations_total = 0
 
+        # Polling stall recovery state (see _supervise_polling).
+        self._last_get_updates_finished_at: float | None = None
+        self._recovery_requested = False
+        self._recovering = False  # Single-flight guard for recovery
+        self._recovery_backoff = TELEGRAM_RECOVERY_BACKOFF_INITIAL
+        self._supervisor: asyncio.Task | None = None
+        self._failed = False  # Terminal failure (e.g. rejected token): no retry
+
     def is_allowed(self, sender_id: str) -> bool:
         """Preserve Telegram's legacy id|username allowlist matching."""
         if super().is_allowed(sender_id):
@@ -500,13 +547,50 @@ class TelegramChannel(BaseChannel):
         return content
 
     async def start(self) -> None:
-        """Start the Telegram bot."""
+        """Start the Telegram bot, rebuilding the app whenever polling stalls."""
         if not self.config.token:
             self.logger.error("bot token not configured")
             return
 
         self._running = True
+        self._failed = False
+        self._last_get_updates_finished_at = None
+        self._recovery_requested = False
+        self._recovery_backoff = TELEGRAM_RECOVERY_BACKOFF_INITIAL
+        self._supervisor = asyncio.create_task(self._supervise_polling())
 
+        try:
+            try:
+                await self._start_app()
+            except InvalidToken:
+                # A rejected token is a config error, not a transient network
+                # failure - retrying forever would only spam the log. The
+                # scrubbed message keeps PTB's token-bearing text out of logs.
+                self._failed = True
+                self._running = False
+                self.logger.error("bot token rejected by Telegram")
+                raise RuntimeError("Telegram bot token was rejected by the server") from None
+            except Exception as e:
+                if self._is_transient_startup_error(e):
+                    self.logger.error(
+                        "startup failed: {}; supervisor will retry with backoff",
+                        self._format_telegram_error(e),
+                    )
+                else:
+                    self._failed = True
+                    self._running = False
+                    self.logger.error("startup failed: {}", self._format_telegram_error(e))
+                    raise
+
+            # Keep running until stopped
+            while self._running:
+                await asyncio.sleep(1)
+        finally:
+            await self._teardown_app()
+            await self._cancel_supervisor()
+
+    def _build_app(self) -> Application:
+        """Build the Telegram application: pools, watchdog bot, handlers."""
         proxy = self.config.proxy or None
 
         # Separate pools so long-polling (getUpdates) never starves outbound sends.
@@ -524,13 +608,18 @@ class TelegramChannel(BaseChannel):
             read_timeout=30.0,
             proxy=proxy,
         )
-        builder = (
-            Application.builder()
-            .token(self.config.token)
-            .request(api_request)
-            .get_updates_request(poll_request)
+        # The watchdog bot records every getUpdates round trip so the supervisor
+        # can tell a silent stall apart from a healthy (idle) long poll.
+        watchdog_bot = _StallWatchBot(
+            token=self.config.token,
+            request=api_request,
+            get_updates_request=poll_request,
+            on_get_updates_done=self._note_poll_ok,
         )
-        self._app = builder.build()
+        app = Application.builder().bot(watchdog_bot).build()
+        # Set early so a later failure in this method still tears down the
+        # freshly built app instead of leaking it.
+        self._app = app
         self._app.add_error_handler(self._on_error)
 
         # Add command handlers (using Regex to support @username suffixes before bot initialization)
@@ -564,7 +653,7 @@ class TelegramChannel(BaseChannel):
         # Conditionally register inline keyboard callback handler
         if self.config.inline_keyboards:
             self._app.add_handler(CallbackQueryHandler(self._on_callback_query))
-            allowed_updates = [
+            self._allowed_updates = [
                 "message",
                 "edited_message",
                 "message_reaction",
@@ -572,53 +661,186 @@ class TelegramChannel(BaseChannel):
             ]
             self.logger.debug("inline keyboards enabled")
         else:
-            allowed_updates = ["message", "edited_message", "message_reaction"]
+            self._allowed_updates = ["message", "edited_message", "message_reaction"]
+        return app
 
-        if self.config.mode == "webhook":
-            self.logger.info("Starting bot (webhook mode)...")
-        else:
-            self.logger.info("Starting bot (polling mode)...")
-
-        # Initialize and start receiving updates
-        await self._app.initialize()
-        await self._app.start()
-
-        # Get bot info and register command menu
-        bot_info = await self._app.bot.get_me()
-        self._bot_user_id = getattr(bot_info, "id", None)
-        self._bot_username = getattr(bot_info, "username", None)
-        self.logger.info("bot @{} connected", bot_info.username)
-
+    async def _start_app(self) -> None:
+        """Build, initialize and start the application; never leak a half-built one."""
         try:
-            await self._app.bot.set_my_commands(self.BOT_COMMANDS)
-            self.logger.debug("bot commands registered")
+            app = self._build_app()
+
+            if self.config.mode == "webhook":
+                self.logger.info("Starting bot (webhook mode)...")
+            else:
+                self.logger.info("Starting bot (polling mode)...")
+
+            # Initialize and start receiving updates
+            await app.initialize()
+            await app.start()
+
+            # Get bot info and register command menu
+            bot_info = await app.bot.get_me()
+            self._bot_user_id = getattr(bot_info, "id", None)
+            self._bot_username = getattr(bot_info, "username", None)
+            self.logger.info("bot @{} connected", bot_info.username)
+
+            try:
+                await app.bot.set_my_commands(self.BOT_COMMANDS)
+                self.logger.debug("bot commands registered")
+            except Exception as e:
+                self.logger.warning("Failed to register bot commands: {}", e)
+
+            if self.config.mode == "webhook":
+                # ``url_path`` is the local HTTP route. ``webhook_url`` is the
+                # public HTTPS URL Telegram calls; reverse proxies may rewrite it.
+                await app.updater.start_webhook(
+                    listen=self.config.webhook_listen_host,
+                    port=self.config.webhook_listen_port,
+                    url_path=self.config.webhook_path.lstrip("/"),
+                    webhook_url=self.config.webhook_url.strip(),
+                    allowed_updates=self._allowed_updates,
+                    drop_pending_updates=False,
+                    secret_token=self.config.webhook_secret_token.strip(),
+                    max_connections=self.config.webhook_max_connections,
+                )
+            else:
+                # Seed the watchdog so a brand-new app is not treated as stalled
+                # before its first poll round trip completes.
+                self._note_poll_ok()
+                # Start polling (this runs until stopped)
+                await app.updater.start_polling(
+                    allowed_updates=self._allowed_updates,
+                    drop_pending_updates=False,  # Process pending messages on startup
+                    error_callback=self._on_polling_error,
+                )
+        except BaseException:
+            # Tear down even partial state (initialize/start may not have
+            # finished); CancelledError is BaseException so stop() cancelling a
+            # mid-startup recovery cannot leak the app either.
+            await self._teardown_app()
+            raise
+
+    async def _teardown_app(self) -> None:
+        """Shut down the application, tolerating partially started state."""
+        app, self._app = self._app, None
+        if not app:
+            return
+        for step in (app.updater.stop, app.stop, app.shutdown):
+            try:
+                await step()
+            except Exception as e:
+                self.logger.debug("teardown step failed: {}", e)
+        # Application.shutdown() skips the HTTPX pools when initialize() never
+        # finished, so a failed startup would leak one pool per retry.
+        # Bot.shutdown() closes them explicitly (idempotent).
+        try:
+            await app.bot.shutdown()
         except Exception as e:
-            self.logger.warning("Failed to register bot commands: {}", e)
+            self.logger.debug("bot shutdown failed: {}", e)
 
+    def _note_poll_ok(self) -> None:
+        """Stamp the last completed getUpdates round trip (success or failure)."""
+        self._last_get_updates_finished_at = time.monotonic()
+
+    def _needs_recovery(self) -> bool:
+        """True when polling needs a rebuild: stall, lost app, or explicit request."""
+        if self._recovery_requested:
+            return True
         if self.config.mode == "webhook":
-            # ``url_path`` is the local HTTP route. ``webhook_url`` is the
-            # public HTTPS URL Telegram calls; reverse proxies may rewrite it.
-            await self._app.updater.start_webhook(
-                listen=self.config.webhook_listen_host,
-                port=self.config.webhook_listen_port,
-                url_path=self.config.webhook_path.lstrip("/"),
-                webhook_url=self.config.webhook_url.strip(),
-                allowed_updates=allowed_updates,
-                drop_pending_updates=False,
-                secret_token=self.config.webhook_secret_token.strip(),
-                max_connections=self.config.webhook_max_connections,
-            )
-        else:
-            # Start polling (this runs until stopped)
-            await self._app.updater.start_polling(
-                allowed_updates=allowed_updates,
-                drop_pending_updates=False,  # Process pending messages on startup
-                error_callback=self._on_polling_error,
-            )
+            return False  # webhooks have no getUpdates heartbeat to watch
+        if self._last_get_updates_finished_at is None:
+            # No round trip ever completed: either startup is still in flight
+            # (an app exists) or the last one failed (no app). Only the latter
+            # needs recovery.
+            return self._app is None
+        return time.monotonic() - self._last_get_updates_finished_at > TELEGRAM_POLL_STALL_SECONDS
 
-        # Keep running until stopped
-        while self._running:
-            await asyncio.sleep(1)
+    async def _supervise_polling(self) -> None:
+        """Watch long-poll liveness and rebuild the app when polling stalls.
+
+        Recovery is single-flight by construction: the polling error callback
+        only sets ``_recovery_requested`` and this task performs the actual
+        teardown/rebuild, so a burst of errors cannot double-recover.
+        """
+        with suppress(asyncio.CancelledError):
+            while self._running and not self._failed:
+                await asyncio.sleep(TELEGRAM_POLL_WATCH_INTERVAL)
+                if self._recovering or not self._needs_recovery():
+                    continue
+                self._recovery_requested = False
+                try:
+                    await self._recover()
+                except Exception as e:
+                    self.logger.error("polling recovery failed: {}", self._format_telegram_error(e))
+
+    async def _recover(self) -> None:
+        """Tear down and rebuild the app, backing off between attempts.
+
+        Single-flight: the polling error callback only sets
+        ``_recovery_requested``, and even if two triggers arrive at once, only
+        the first recovery runs.
+        """
+        if self._recovering:
+            return
+        self._recovering = True
+        try:
+            await self._teardown_app()
+            if not self._running or self._failed:
+                return
+            await self._idle(self._recovery_backoff)
+            if not self._running or self._failed:
+                return
+            try:
+                await self._start_app()
+            except InvalidToken:
+                self._failed = True
+                self._running = False
+                self.logger.error("bot token rejected by Telegram")
+            except Exception as e:
+                if not self._is_transient_startup_error(e):
+                    self._failed = True
+                    self._running = False
+                    self.logger.error("recovery failed: {}", self._format_telegram_error(e))
+                else:
+                    self._recovery_backoff = min(
+                        self._recovery_backoff * TELEGRAM_RECOVERY_BACKOFF_FACTOR,
+                        TELEGRAM_RECOVERY_BACKOFF_MAX,
+                    )
+                    self.logger.warning(
+                        "recovery failed: {}; backing off to {:.0f}s",
+                        self._format_telegram_error(e),
+                        self._recovery_backoff,
+                    )
+            else:
+                # A successful rebuild means fresh getUpdates round trips;
+                # reset the backoff for the next healthy period.
+                self._recovery_backoff = TELEGRAM_RECOVERY_BACKOFF_INITIAL
+        finally:
+            self._recovering = False
+
+    async def _idle(self, seconds: float) -> None:
+        """Sleep in short steps so stop() stays responsive."""
+        deadline = time.monotonic() + seconds
+        while self._running and not self._failed and time.monotonic() < deadline:
+            await asyncio.sleep(TELEGRAM_POLL_WATCH_INTERVAL)
+
+    @staticmethod
+    def _is_transient_startup_error(exc: Exception) -> bool:
+        """Report whether a startup failure is worth retrying.
+
+        HTTPXRequest wraps every httpx failure into NetworkError/TimedOut, so
+        anything else is terminal: a bad proxy raises ValueError, an already
+        bound webhook port raises OSError.
+        """
+        return isinstance(exc, NetworkError | TimedOut | asyncio.TimeoutError)
+
+    async def _cancel_supervisor(self) -> None:
+        """Cancel and await the supervisor task (idempotent)."""
+        task, self._supervisor = self._supervisor, None
+        if task is not None and not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
 
     async def stop(self) -> None:
         """Stop the Telegram bot."""
@@ -638,12 +860,13 @@ class TelegramChannel(BaseChannel):
         self._inbound_workers.clear()
         self._inbound_buffers.clear()
 
+        # Stop the supervisor first so it cannot rebuild the app we tear down
+        # right after; the supervisor itself never leaks a mid-startup app.
+        await self._cancel_supervisor()
+
         if self._app:
             self.logger.info("Stopping bot...")
-            await self._app.updater.stop()
-            await self._app.stop()
-            await self._app.shutdown()
-            self._app = None
+            await self._teardown_app()
 
     @staticmethod
     def _get_media_type(path: str) -> str:
@@ -2218,6 +2441,9 @@ class TelegramChannel(BaseChannel):
     @staticmethod
     def _format_telegram_error(exc: Exception) -> str:
         """Return a short, readable error summary for logs."""
+        if isinstance(exc, InvalidToken):
+            # PTB embeds the token itself in InvalidToken text; never log it.
+            return "bot token rejected by Telegram"
         text = str(exc).strip()
         if text:
             return text
@@ -2230,12 +2456,19 @@ class TelegramChannel(BaseChannel):
         return exc.__class__.__name__
 
     def _on_polling_error(self, exc: Exception) -> None:
-        """Keep long-polling network failures to a single readable line."""
+        """Log long-poll failures; network errors trigger a supervised rebuild."""
+        if isinstance(exc, InvalidToken):
+            # A rejected token is a config error: fail the channel and stop the
+            # recovery loop instead of retrying (and spamming) forever.
+            self.logger.error("polling error: bot token rejected by Telegram (InvalidToken)")
+            self._failed = True
+            self._running = False
+            return
         summary = self._format_telegram_error(exc)
+        self.logger.error("polling error: {} ({})", summary, exc.__class__.__name__)
         if isinstance(exc, (NetworkError, TimedOut)):
-            self.logger.warning("polling network issue: {}", summary)
-        else:
-            self.logger.error("polling error: {}", summary)
+            # Network-class failures recover by rebuilding the connection pools.
+            self._recovery_requested = True
 
     async def _on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Log polling / handler errors instead of silently swallowing them."""
