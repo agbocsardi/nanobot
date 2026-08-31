@@ -1291,6 +1291,7 @@ class AgentLoop:
         session: Session | None = None,
         channel: str = "cli",
         chat_id: str = "direct",
+        sender_id: str | None = None,
         message_id: str | None = None,
         metadata: dict[str, Any] | None = None,
         session_key: str | None = None,
@@ -1363,11 +1364,13 @@ class AgentLoop:
                 return {"role": "user", "content": user_content}
 
             items: list[dict[str, Any]] = []
+            last_msg: InboundMessage | None = None
             while len(items) < limit:
                 try:
-                    items.append(_to_user_message(pending_queue.get_nowait()))
+                    last_msg = pending_queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
+                items.append(_to_user_message(last_msg))
 
             # Block if nothing drained but sub-agents spawned in this dispatch
             # are still running.  Keeps the runner loop alive so subsequent
@@ -1384,12 +1387,26 @@ class AgentLoop:
                     )
                     return items
                 items.append(_to_user_message(msg))
+                last_msg = msg
                 while len(items) < limit:
                     try:
-                        items.append(_to_user_message(pending_queue.get_nowait()))
+                        last_msg = pending_queue.get_nowait()
                     except asyncio.QueueEmpty:
                         break
+                    items.append(_to_user_message(last_msg))
 
+            if last_msg is not None:
+                # Follow-up injection continues the same run without a fresh
+                # dispatch, so re-stamp the tool context (sender identity
+                # included) from the injected message.
+                self._set_tool_context(
+                    channel=last_msg.channel,
+                    chat_id=last_msg.chat_id,
+                    message_id=last_msg.metadata.get("message_id"),
+                    metadata=last_msg.metadata,
+                    session_key=session.key if session is not None else session_key,
+                    sender_id=last_msg.sender_id,
+                )
             return items
 
         active_session_key = session.key if session else session_key
@@ -1401,6 +1418,7 @@ class AgentLoop:
         request_ctx = RequestContext(
             channel=channel,
             chat_id=chat_id,
+            sender_id=sender_id,
             message_id=message_id,
             session_key=active_session_key,
             metadata=effective_metadata,
@@ -2239,6 +2257,7 @@ class AgentLoop:
             session=ctx.session,
             channel=ctx.msg.channel,
             chat_id=ctx.msg.chat_id,
+            sender_id=ctx.msg.sender_id,
             message_id=ctx.msg.metadata.get("message_id"),
             metadata=ctx.msg.metadata,
             session_key=ctx.session_key,

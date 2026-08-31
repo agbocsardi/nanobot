@@ -31,7 +31,11 @@ from typing import Any, Awaitable, Callable
 
 from nanobot.agent.tools._durable_store import DurableJsonStore
 from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
-from nanobot.agent.tools.context import ContextAware, RequestContext
+from nanobot.agent.tools.context import (
+    ContextAware,
+    RequestContext,
+    current_request_context,
+)
 from nanobot.agent.tools.schema import (
     ArraySchema,
     IntegerSchema,
@@ -324,6 +328,13 @@ class AskUserTool(Tool, ContextAware):
             return ToolResult.retryable_error(
                 "Error: outbound message bus unavailable."
             )
+        if not self._sender_id:
+            # Follow-up injections and turn continuations keep the same run
+            # alive without a fresh dispatch, so the stamped tool context can
+            # go stale. Fall back to the run-bound request context.
+            bound_ctx = current_request_context()
+            if bound_ctx is not None and bound_ctx.sender_id:
+                self._sender_id = str(bound_ctx.sender_id)
         if not self._sender_id:
             return ToolResult.retryable_error(
                 "Error: ask_user requires a known user (no sender identity)."
