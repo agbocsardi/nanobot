@@ -415,6 +415,10 @@ class ReadFileTool(_FsTool):
 )
 class WriteFileTool(_FsTool):
     """Write content to a file."""
+
+    # Opt-in for durable action receipts: local writes are side-effectful.
+    effect = "local_write"
+    replay = "never"
     _scopes = {"core", "subagent", "memory"}
 
     @property

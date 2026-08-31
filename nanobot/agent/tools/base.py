@@ -225,6 +225,12 @@ class Tool(ABC):
     _BOOL_TRUE = frozenset(("true", "1", "yes"))
     _BOOL_FALSE = frozenset(("false", "0", "no"))
 
+    # Side-effect capability + replay semantics (issue #31). Conservative
+    # defaults: unannotated tools are treated as read-only for receipts and
+    # never replay-suppressed (a receipt key is required to participate).
+    effect: str = "read"  # read | local_write | external_write
+    replay: str = "never"  # safe | idempotency_key | reconcile | never
+
     @staticmethod
     def _resolve_type(t: Any) -> str | None:
         """Pick first non-null type from JSON Schema unions like ``['string','null']``."""

@@ -312,7 +312,11 @@ class AgentLoop:
             context_retrieval=context_retrieval,
         )
         self.sessions = session_manager or SessionManager(workspace)
-        self.tools = ToolRegistry(policy=ToolPolicy(
+        from nanobot.agent.tools.action_receipts import ActionReceiptStore
+
+        self._receipt_store = ActionReceiptStore(workspace)
+        self.tools = ToolRegistry(
+            policy=ToolPolicy(
             effective_policy_rules(
                 _tc.policies,
                 audit_mode_read_only=_tc.audit_mode_read_only,
@@ -323,7 +327,7 @@ class AgentLoop:
                 "model": self.model,
                 "preset": self.model_preset,
             },
-        ))
+        ), receipt_store=self._receipt_store)
         # One interactive approval store per session (bounded, TTL-evicted).
         self._approval_stores: dict[str, ApprovalStore] = {}
         self._approval_cfg = _tc.approval
