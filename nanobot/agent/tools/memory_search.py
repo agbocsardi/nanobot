@@ -21,6 +21,28 @@ v2 additions (memory_search GitHub issue #1 continuation):
 - Relevance ranking stays simple: newest-first, summary beats messages per
   entry (v1 behavior).  No semantic embeddings.
 
+v3 additions (memory_search GitHub issue #1 continuation):
+
+- Ranking modes behind ``tools.memorySearch.ranking``.
+  * ``"recency"`` (default) — v1/v2 behavior, unchanged: newest-first,
+    summary beats messages per entry.
+  * ``"local"`` — deterministic dependency-free scoring: token overlap
+    (query tokens vs match text) + a mild recency boost; sorted by score
+    desc, ties by timestamp desc (see ``nanobot/agent/tools/memory_ranking.py``).
+- Pluggable embeddings interface: ``EmbeddingScorer`` protocol in
+  ``memory_ranking``.  ``LocalOverlapScorer`` is the built-in implementation.
+  Provider scores are opt-in: set ``tools.memorySearch.embeddingScorer`` to a
+  fully-qualified ``package.module.ClassName`` (ranking ``"local"`` required);
+  ``ProviderEmbeddingScorer`` is a stub that raises ``NotImplementedError``
+  unless that concrete scorer is injected.  Retrieval-only — scoring never
+  promotes facts into memory.
+- Structured data: history results gain ``score`` (float for ``local``,
+  ``null`` for ``recency``) and the data block gains ``ranking``; text output
+  is unchanged for ``recency`` and shows scores for ``local``.  Memory-file
+  results keep their v2 shape (line snippets, no per-line scores).
+- Index semantics unchanged: ranking applies post-search, after the literal
+  match + metadata filters.
+
 Read-only with respect to user data: history.jsonl and memory files are opened
 in ``r``/``rb`` mode only.  The only file this tool ever writes is the
 disposable sidecar index ``memory/search_index.json`` (skipped entirely when
@@ -36,7 +58,10 @@ import threading
 from pathlib import Path
 from typing import Any, Iterable
 
+from pydantic import field_validator
+
 from nanobot.agent.tools.base import Tool, ToolResult
+from nanobot.agent.tools.memory_ranking import EmbeddingScorer, resolve_scorer
 from nanobot.config_base import Base
 
 # NOTE: ``nanobot.agent.memory`` is imported lazily inside the memory-file
@@ -62,11 +87,26 @@ _INDEX_FILENAME = "search_index.json"
 _INDEX_VERSION = 1
 
 
+_RANKING_MODES = ("recency", "local")
+
+
 class MemorySearchToolConfig(Base):
     """Configuration for the memory_search tool (tools.memorySearch.*)."""
 
     enable_index: bool = True  # maintain memory/search_index.json cache
     include_system_files: bool = False  # also search memory/system/*.md + MEMORY.md
+    ranking: str = "recency"  # "recency" (v1/v2) | "local" (overlap + recency boost)
+    embedding_scorer: str | None = None  # opt-in provider scorer path (ranking "local")
+
+    @field_validator("ranking")
+    @classmethod
+    def _validate_ranking(cls, value: str) -> str:
+        value = value or "recency"
+        if value not in _RANKING_MODES:
+            raise ValueError(
+                f"tools.memorySearch.ranking must be one of {_RANKING_MODES}, got {value!r}"
+            )
+        return value
 
 
 def _entry_meta(entry: dict[str, Any]) -> dict[str, Any]:
@@ -221,10 +261,13 @@ class MemorySearchTool(Tool):
         return (
             "Search the agent's archived conversation history (memory/history.jsonl) "
             "and topic memory files under memory/. Uses exact literal substring "
-            "matching (no regex, no semantic search). History entries prefer their "
-            "LLM summary, then structured messages, then legacy content. Returns "
-            "compact cited snippets — timestamps, session keys, entry ids, roles — "
-            "never whole sessions. Read-only."
+            "matching (no regex). Ranking defaults to recency (newest-first). "
+            "tools.memorySearch.ranking='local' enables deterministic "
+            "dependency-free relevance scoring; an opt-in provider scorer can be "
+            "injected via tools.memorySearch.embeddingScorer. History entries "
+            "prefer their LLM summary, then structured messages, then legacy "
+            "content. Returns compact cited snippets — timestamps, session keys, "
+            "entry ids, roles, scores — never whole sessions. Read-only."
         )
 
     @property
@@ -302,10 +345,22 @@ class MemorySearchTool(Tool):
         *,
         enable_index: bool = True,
         include_system_files: bool = False,
+        ranking: str = "recency",
+        embedding_scorer: str | None = None,
     ):
+        if ranking not in _RANKING_MODES:
+            raise ValueError(
+                f"tools.memorySearch.ranking must be one of {_RANKING_MODES}, got {ranking!r}"
+            )
         self._workspace = workspace
         self._enable_index = bool(enable_index)
         self._include_system_files = bool(include_system_files)
+        self._ranking = ranking
+        # Scorer is resolved eagerly so a bad/missing provider injection fails
+        # fast at tool creation (explicit opt-in boundary), not mid-search.
+        self._scorer: EmbeddingScorer | None = (
+            resolve_scorer(embedding_scorer) if ranking == "local" else None
+        )
         self._index_lock = threading.Lock()  # serialize index build/write
 
     @classmethod
@@ -321,6 +376,8 @@ class MemorySearchTool(Tool):
             workspace=Path(ctx.workspace),
             enable_index=cfg.enable_index,
             include_system_files=cfg.include_system_files,
+            ranking=cfg.ranking,
+            embedding_scorer=cfg.embedding_scorer,
         )
 
     def _history_path(self) -> Path:
@@ -472,6 +529,7 @@ class MemorySearchTool(Tool):
         role: str | None,
         case_sensitive: bool,
         max_excerpt_chars: int,
+        scorer: EmbeddingScorer | None = None,
     ) -> list[dict[str, Any]]:
         """One result per matching summary / message / legacy content.
 
@@ -480,6 +538,10 @@ class MemorySearchTool(Tool):
         summary suppresses message-level results for that entry (compactness,
         summary wins). A role filter skips summary and legacy matches since
         those have no role.
+
+        ``scorer`` attaches a relevance score to each result (local/provider
+        ranking).  When ``None`` (recency ranking) every result carries
+        ``"score": None``.
         """
         results: list[dict[str, Any]] = []
         cursor = _valid_cursor(entry.get("cursor"))
@@ -487,6 +549,11 @@ class MemorySearchTool(Tool):
         session_key = entry.get("session_key") if isinstance(entry.get("session_key"), str) else None
         entry_ts = _normalize_ts(entry.get("timestamp"))
         display_ts = (entry.get("timestamp") if isinstance(entry.get("timestamp"), str) else None) or "?"
+
+        def scored(full_text: str, ts: str | None) -> float | None:
+            if scorer is None:
+                return None
+            return round(float(scorer.score(query, full_text, ts)), 6)
 
         summary = entry.get("summary")
         has_summary = isinstance(summary, str) and bool(summary.strip())
@@ -500,6 +567,7 @@ class MemorySearchTool(Tool):
                 "session_key": session_key,
                 "role": None,
                 "excerpt": _truncate(summary.strip(), max_excerpt_chars),
+                "score": scored(summary, entry_ts),
             })
             return results
 
@@ -526,6 +594,7 @@ class MemorySearchTool(Tool):
                     "session_key": session_key,
                     "role": msg_role if isinstance(msg_role, str) else None,
                     "excerpt": _truncate(msg_content.strip(), max_excerpt_chars),
+                    "score": scored(msg_content, msg_ts),
                 })
             if results:
                 return results
@@ -541,6 +610,7 @@ class MemorySearchTool(Tool):
                 "session_key": session_key,
                 "role": None,
                 "excerpt": _truncate(content.strip(), max_excerpt_chars),
+                "score": scored(content, entry_ts),
             })
         return results
 
@@ -557,9 +627,16 @@ class MemorySearchTool(Tool):
         max_excerpt_chars: int,
         offset: int,
     ) -> tuple[list[dict[str, Any]], int]:
-        """Return ``(page, total_matches)``, newest first, honoring offset."""
+        """Return ``(page, total_matches)``, honoring offset.
+
+        Recency ranking (default): newest first (v1/v2 order, unchanged).
+        Local/provider ranking: score desc, ties by timestamp desc.  Ranking
+        applies post-search — the literal + metadata filters run unchanged
+        and the scorer only reorders the matched results.
+        """
         history_path = self._history_path()
         matches: list[dict[str, Any]] = []
+        scorer = self._scorer
 
         if self._enable_index:
             _, entries = self.ensure_index()
@@ -596,6 +673,7 @@ class MemorySearchTool(Tool):
                                 role=role,
                                 case_sensitive=case_sensitive,
                                 max_excerpt_chars=max_excerpt_chars,
+                                scorer=scorer,
                             )
                         )
             except FileNotFoundError:
@@ -621,10 +699,17 @@ class MemorySearchTool(Tool):
                         role=role,
                         case_sensitive=case_sensitive,
                         max_excerpt_chars=max_excerpt_chars,
+                        scorer=scorer,
                     )
                 )
 
-        matches.sort(key=lambda m: m.get("timestamp") or "", reverse=True)
+        if scorer is not None:
+            matches.sort(
+                key=lambda m: (m.get("score") or 0.0, m.get("timestamp") or ""),
+                reverse=True,
+            )
+        else:
+            matches.sort(key=lambda m: m.get("timestamp") or "", reverse=True)
         total = len(matches)
         return matches[offset : offset + max_results], total
 
@@ -698,7 +783,12 @@ class MemorySearchTool(Tool):
     # execution + formatting
     # ------------------------------------------------------------------
 
-    def _format_history_results(self, results: list[dict[str, Any]]) -> str:
+    def _format_history_results(
+        self,
+        results: list[dict[str, Any]],
+        *,
+        show_scores: bool = False,
+    ) -> str:
         if not results:
             return "no history matches"
         lines: list[str] = []
@@ -709,6 +799,10 @@ class MemorySearchTool(Tool):
             if match.get("role"):
                 bits.append(f"role={match['role']}")
             bits.append(match["kind"])
+            if show_scores:
+                score = match.get("score")
+                score_text = f"{score:.3f}" if isinstance(score, (int, float)) else "?"
+                bits.append(f"score={score_text}")
             lines.append(f"[{idx}] {' | '.join(bits)}")
             lines.append(f"    {match['excerpt']}")
         return "\n".join(lines)
@@ -784,6 +878,7 @@ class MemorySearchTool(Tool):
             "query": query,
             "case_sensitive": case_sensitive,
             "offset": offset,
+            "ranking": self._ranking,
             "history": history_results,
             "history_total_matches": history_total,
             "history_offset": offset,
@@ -798,7 +893,8 @@ class MemorySearchTool(Tool):
             f"{len(memory_results)} memory file(s) with matches"
         )
         body = "\n\n".join([
-            "history:\n" + self._format_history_results(history_results),
+            "history:\n"
+            + self._format_history_results(history_results, show_scores=self._ranking == "local"),
             "memory files:\n" + self._format_memory_results(memory_results),
         ])
         notes: list[str] = []
