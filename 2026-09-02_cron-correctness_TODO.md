@@ -71,3 +71,15 @@
 - Finished #20: closed; merged as b9e1c4e5 (6f6489ea).
 - #1: v1 memory_search shipped; issue stays open for semantic/ranking/indexing follow-ups.
 - Cleaned up worktrees and local topic branches; CI green on all merged pushes.
+
+### Merged to main (Gergo go-ahead)
+
+- `1b0d7764` merge: Telegram reply diagnostics (#18)
+- `e2069c47` merge: interactive policy approvals + mode wiring (#22)
+- `b6ac6882` merge: incident-derived harness regressions (#23)
+- `531e1f9b` merge: subagent run record path + enriched tool events (#11)
+- `dd38634a` merge: memory_search v2 (index, paging, config) (#1)
+- `3b2bdf87` merge: memory_read/memory_write tools (Phase A)
+- `5958f20f` merge: Dream guardrails M1b-M1d
+- Post-merge validation: Ruff clean; full suite 3129 passed, 1 warning.
+- Topic branches deleted locally and remotely; main clean.
