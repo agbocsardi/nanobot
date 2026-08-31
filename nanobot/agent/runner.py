@@ -1261,10 +1261,13 @@ class AgentRunner:
                 ) for file_edit_tracker in file_edit_trackers],
             )
         try:
+            exec_call_kwargs: dict[str, Any] = {}
+            if getattr(spec.tools, "receipt_store", None) is not None:
+                exec_call_kwargs["exec_id"] = tool_call.id
             if tool is not None:
                 result = await tool.execute(**params)
             else:
-                result = await spec.tools.execute(tool_call.name, params)
+                result = await spec.tools.execute(tool_call.name, params, **exec_call_kwargs)
         except asyncio.CancelledError:
             raise
         except BaseException as exc:

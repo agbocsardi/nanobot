@@ -125,6 +125,13 @@ BUILTIN_COMMAND_SPECS: tuple[BuiltinCommandSpec, ...] = (
         "message-square",
     ),
     BuiltinCommandSpec(
+        "/receipt",
+        "Action receipt",
+        "Inspect the durable receipt of one side-effectful tool call.",
+        "receipt",
+        arg_hint="<execution-id>",
+    ),
+    BuiltinCommandSpec(
         "/tasks",
         "Background tasks",
         "List queued/running/waiting and recent background tasks.",
@@ -932,6 +939,76 @@ def _task_command_line(record: dict) -> str:
     )
 
 
+def _owned_task_record(loop, task_id: str, session_key: str, sender_id: str | None) -> dict | None:
+    """Return a record only when the session (and sender, when recorded) owns it."""
+    try:
+        record = loop.subagents.read_run_record(task_id)
+    except Exception:
+        return None
+    if record is None:
+        return None
+    origin = record.get("origin") or {}
+    if origin.get("session_key") != session_key:
+        return None
+    rec_sender = origin.get("sender_id")
+    if sender_id and rec_sender and str(rec_sender) != str(sender_id):
+        return None
+    return record
+
+
+async def cmd_receipt(ctx: CommandContext) -> OutboundMessage:
+    """Read-only detail for one durable action receipt (issue #31)."""
+    loop = ctx.loop
+    msg = ctx.msg
+    recipient = (ctx.args or "").strip()
+    if not recipient:
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content="Usage: `/receipt <execution-id>`",
+            metadata=dict(msg.metadata or {}),
+        )
+    store = getattr(loop, "_receipt_store", None) if loop is not None else None
+    if store is None:
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content="Receipts are not available here.",
+            metadata=dict(msg.metadata or {}),
+        )
+    receipt = store.get(recipient)
+    if receipt is None:
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content=f"Receipt {recipient} not found.",
+            metadata=dict(msg.metadata or {}),
+        )
+    if receipt.session_key != ctx.key:
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content=f"Receipt {recipient} not found.",
+            metadata=dict(msg.metadata or {}),
+        )
+    sender_id = getattr(msg, "sender_id", None)
+    if sender_id and receipt.sender_id and receipt.sender_id != sender_id:
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content=f"Receipt {recipient} not found.",
+            metadata=dict(msg.metadata or {}),
+        )
+    lines = [
+        f"receipt: {receipt.exec_id}",
+        f"tool: {receipt.tool}",
+        f"status: {receipt.status}",
+        f"attempts: {receipt.attempts}",
+    ]
+    if receipt.outcome:
+        lines.append("outcome: " + SubagentManager._truncate_chat(receipt.outcome, 500))
+    return OutboundMessage(
+        channel=msg.channel, chat_id=msg.chat_id,
+        content="\n".join(lines),
+        metadata=dict(msg.metadata or {}),
+    )
+
+
 async def cmd_tasks(ctx: CommandContext) -> OutboundMessage:
     """List the most recent owned background tasks (newest first).
 
@@ -1326,6 +1403,8 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.exact("/skill", cmd_skill)
     router.exact("/remember", cmd_remember)
     router.prefix("/remember ", cmd_remember)
+    router.exact("/receipt", cmd_receipt)
+    router.prefix("/receipt ", cmd_receipt)
     router.exact("/tasks", cmd_tasks)
     router.exact("/task", cmd_task)
     router.prefix("/task ", cmd_task)

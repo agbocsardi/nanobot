@@ -14,10 +14,16 @@ class ToolRegistry:
     Allows dynamic registration and execution of tools.
     """
 
-    def __init__(self, policy: ToolPolicy | None = None):
+    def __init__(
+        self,
+        policy: ToolPolicy | None = None,
+        receipt_store: Any | None = None,
+    ):
         self._tools: dict[str, Tool] = {}
         self._cached_definitions: list[dict[str, Any]] | None = None
         self.policy = policy or ToolPolicy()
+        # Durable action-receipt ledger for side-effectful tools (issue #31).
+        self.receipt_store = receipt_store
 
     def register(self, tool: Tool) -> None:
         """Register a tool."""
@@ -156,8 +162,12 @@ class ToolRegistry:
             return params
         return cls._coerce_argument_value(params.get("arguments"))
 
-    async def execute(self, name: str, params: Any) -> Any:
-        """Execute a tool by name with given parameters."""
+    async def execute(self, name: str, params: Any, *, exec_id: str | None = None) -> Any:
+        """Execute a tool by name with given parameters.
+
+        ``exec_id`` is the stable run/tool-call identity used for durability
+        receipts; side-effectful tools opt in implicitly by ``effect``.
+        """
         hint = "\n\n[Analyze the error above and try a different approach.]"
         tool, params, error = self.prepare_call(name, params)
         if error:
@@ -197,12 +207,69 @@ class ToolRegistry:
                 evidence=[evidence],
             )
 
+        receipt = None
+        if (
+            exec_id is not None
+            and self.receipt_store is not None
+            and getattr(tool, "effect", "read") != "read"
+        ):
+            from nanobot.agent.tools.action_receipts import canonical_arg_hash, redact_preview
+            from nanobot.agent.tools.context import current_request_context
+
+            ctx = current_request_context()
+            session_key = (ctx.session_key if ctx is not None else None) or f"{name}:{exec_id}"
+            sender_id = str(ctx.sender_id) if ctx is not None and ctx.sender_id else ""
+            arg_hash = canonical_arg_hash(params)
+            replay_decision, receipt = self.receipt_store.begin(
+                exec_id=exec_id,
+                session_key=session_key,
+                sender_id=sender_id,
+                tool=tool.name,
+                arg_hash=arg_hash,
+                effect=str(getattr(tool, "effect", "read")),
+                replay=str(getattr(tool, "replay", "never")),
+            )
+            if replay_decision == "mismatch":
+                return ToolResult.retryable_error(
+                    f"Error: execution id {exec_id} was reused with different "
+                    "tool/arguments; receipt mismatch."
+                )
+            if replay_decision == "already_succeeded":
+                return ToolResult(
+                    "Replayed from receipt (not re-executed): "
+                    + (receipt.outcome or "completed previously"),
+                    status="success",
+                    data={"receipt": "replayed", "exec_id": exec_id},
+                    evidence=[{"kind": "action_receipt", "exec_id": exec_id, "replayed": True}],
+                    postcondition="unchecked",
+                )
+            if replay_decision == "in_flight":
+                return ToolResult.partial(
+                    f"Execution {exec_id} is already in progress; not dispatched twice."
+                )
+            if replay_decision == "unknown":
+                return ToolResult.partial(
+                    f"Execution {exec_id} ended in an unknown state (crash after dispatch) "
+                    "- manual review required; not auto-repeated."
+                )
+
         try:
             outcome = adapt_legacy_tool_result(await tool.execute(**params))
+            if receipt is not None:
+                ok = outcome.status in ("success", "partial")
+                self.receipt_store.complete(
+                    exec_id,
+                    status="succeeded" if ok else "failed",
+                    outcome=redact_preview(str(outcome)) if ok else redact_preview(str(outcome)),
+                    ok=ok,
+                )
             if outcome.retryable and str(outcome).startswith("Error"):
                 return self._replace_content(outcome, str(outcome) + hint)
             return outcome
         except Exception as e:
+            if receipt is not None:
+                self.receipt_store.complete(exec_id, status="failed", ok=False,
+                                            outcome=redact_preview(f"exception: {e}"))
             return ToolResult.retryable_error(f"Error executing {name}: {str(e)}" + hint)
 
     @staticmethod

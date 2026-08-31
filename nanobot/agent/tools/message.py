@@ -46,6 +46,10 @@ from nanobot.security.workspace_access import current_tool_workspace
     )
 )
 class MessageTool(Tool, ContextAware):
+    # Opt-in for durable action receipts: outbound chat sends are external.
+    effect = "external_write"
+    replay = "never"
+
     """Tool to send messages to users on chat channels."""
 
     def __init__(
