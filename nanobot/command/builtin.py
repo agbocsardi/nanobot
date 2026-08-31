@@ -119,6 +119,12 @@ BUILTIN_COMMAND_SPECS: tuple[BuiltinCommandSpec, ...] = (
         arg_hint="[<topic>:] <text>",
     ),
     BuiltinCommandSpec(
+        "/btw",
+        "Side question",
+        "Ask a quick ephemeral side question without disturbing active work.",
+        "message-square",
+    ),
+    BuiltinCommandSpec(
         "/tasks",
         "Background tasks",
         "List queued/running/waiting and recent background tasks.",

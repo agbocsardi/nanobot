@@ -472,6 +472,7 @@ class TelegramChannel(BaseChannel):
         BotCommand("policy", "List, approve or deny pending tool approvals"),
         BotCommand("tasks", "List background tasks"),
         BotCommand("task", "Inspect/stop/result/retry one task"),
+        BotCommand("btw", "Ask a quick ephemeral side question"),
         BotCommand("dream", "Run Dream memory consolidation now"),
         BotCommand("dream_log", "Show the latest Dream memory change"),
         BotCommand("dream_restore", "Restore Dream memory to an earlier version"),
@@ -481,7 +482,7 @@ class TelegramChannel(BaseChannel):
     # Regex for slash commands routed to AgentLoop via ``_forward_command``.
     # Hyphenated ``dream-*`` commands stay on a separate handler (below).
     TELEGRAM_BUS_SLASH_COMMAND_RE = re.compile(
-        r"^/(?:new|stop|restart|status|dream|history|goal|pairing|model|skill|remember|policy|tasks|task)(?:@\w+)?(?:\s+.*)?$"
+        r"^/(?:new|stop|restart|status|dream|history|goal|pairing|model|skill|remember|policy|tasks|task|btw)(?:@\w+)?(?:\s+.*)?$"
     )
 
     @classmethod

@@ -159,6 +159,25 @@ class TurnContext:
     trace: list[StateTraceEntry] = field(default_factory=list)
 
 
+def _btw_message_text(entry: dict[str, Any]) -> str:
+    """Compact text for one history entry (role-prefixed)."""
+    if isinstance(entry, dict):
+        role = entry.get("role") or ""
+        content = entry.get("content") or entry.get("text") or ""
+        if isinstance(content, str) and content.strip():
+            if role in ("user", "assistant"):
+                return f"{role}: {content.strip()}"
+            return content.strip()
+        tool_calls = entry.get("tool_calls")
+        if isinstance(tool_calls, list) and tool_calls:
+            return "assistant: [tool call]"
+    return ""
+
+
+async def _btw_noop(*_args: Any, **_kwargs: Any) -> None:
+    """No-op progress/stream callback for ephemeral /btw runs."""
+
+
 class AgentLoop:
     """
     The agent loop is the core processing engine.
@@ -331,6 +350,11 @@ class AgentLoop:
         # shared by this loop, so tools resolve the active state via contextvars.
         self._file_state_store = FileStateStore(max_sessions=MAX_FILE_STATE_SESSIONS)
         self._standing_intents = StandingIntentStore(workspace)
+        # /btw: bounded concurrent ephemeral side questions (#30).
+        self._btw_slots = asyncio.Semaphore(2)
+        self._btw_wall_timeout_s = 90.0
+        self._btw_llm_timeout_s = 60
+        self._btw_max_output_chars = 2000
         self.runner = AgentRunner(provider)
         self.subagents = SubagentManager(
             provider=provider,
@@ -738,6 +762,129 @@ class AgentLoop:
                     ),
                 },
             )
+
+    @staticmethod
+    def _is_btw_request(raw: str) -> bool:
+        """``/btw`` or ``/btw <question>`` (channel-agnostic)."""
+        lower = (raw or "").strip().lower()
+        return lower == "/btw" or lower.startswith("/btw ") or lower.startswith("/btw@")
+
+    async def _btw_publish(self, msg: InboundMessage, content: str) -> None:
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id, content=content,
+            metadata={**dict(msg.metadata or {}), "render_as": "text", "_btw": True},
+        ))
+
+    async def _handle_btw(self, msg: InboundMessage, session_key: str) -> None:
+        """Answer one ephemeral side question without touching the active run.
+
+        Lock-free and queue-free (handled in the bus loop before any session
+        lock); runs a single bounded, tool-less model request against a small
+        read-only snapshot of recent context; persists nothing (no session
+        history, history.jsonl, memory, or Dream input writes).
+        """
+        parts = (msg.content or "").split(None, 1)
+        text = parts[1].strip() if len(parts) > 1 else ""
+        if not text:
+            await self._btw_publish(
+                msg,
+                "Usage: `/btw <question>` - a quick side question answered "
+                "without disturbing your active run. It is ephemeral: it is "
+                "not saved to history or memory.",
+            )
+            return
+        if self._btw_slots.locked():
+            return await self._btw_publish(
+                msg, "Busy - too many side questions right now; the main run is unaffected."
+            )
+        await self._btw_slots.acquire()
+        try:
+            content = await asyncio.wait_for(
+                self._run_btw_inference(text, session_key),
+                timeout=self._btw_wall_timeout_s,
+            )
+        except asyncio.TimeoutError:
+            content = "Side question timed out; your active run is unaffected."
+        except Exception:
+            logger.warning("BTW question failed for session {}", session_key, exc_info=True)
+            content = "Side question failed; your active run is unaffected."
+        finally:
+            self._btw_slots.release()
+        await self._btw_publish(msg, content)
+
+    async def _run_btw_inference(self, text: str, session_key: str) -> str:
+        """Bounded single-request inference: no tools, no persistence."""
+        from nanobot.agent.runner import AgentRunSpec
+
+        messages: list[dict[str, Any]] = [{
+            "role": "system",
+            "content": (
+                "You answer ONE quick side question briefly and concretely. "
+                "You have no tools; do not claim to take actions."
+            ),
+        }]
+        snapshot = self._btw_context_snapshot(session_key)
+        if snapshot:
+            messages.append({
+                "role": "system",
+                "content": "Recent conversation snapshot (read-only):\n" + snapshot,
+            })
+        task_line = self._btw_task_summary(session_key)
+        if task_line:
+            messages.append({"role": "system", "content": task_line})
+        messages.append({"role": "user", "content": text})
+
+        empty_tools = ToolRegistry()
+        spec = AgentRunSpec(
+            initial_messages=messages,
+            tools=empty_tools,
+            model=getattr(self, "model", None) or "default",
+            max_iterations=1,
+            max_tool_result_chars=8000,
+            context_window_tokens=min(
+                getattr(self, "context_window_tokens", None) or 64 * 1024,
+                16 * 1024,
+            ),
+            max_tokens=1024,
+            finalize_on_max_iterations=True,
+            llm_timeout_s=self._btw_llm_timeout_s,
+        )
+        result = await self.runner.run(spec)
+        content = (result.final_content or "").strip() or "No answer."
+        return content[: self._btw_max_output_chars]
+
+    def _btw_context_snapshot(self, session_key: str, *, max_chars: int = 2000) -> str:
+        """Bounded read-only snapshot of recent session context (no mutation)."""
+        try:
+            session = self.sessions.get_or_create(session_key)
+            history = session.get_history(max_messages=12, include_timestamps=False)
+        except Exception:
+            return ""
+        lines: list[str] = []
+        used = 0
+        for entry in history[-12:]:
+            text = _btw_message_text(entry)
+            if not text:
+                continue
+            text = text.replace("\n", " ")[:300]
+            used += len(text) + 2
+            if used > max_chars:
+                break
+            lines.append(text)
+        return "\n".join(lines)
+
+    def _btw_task_summary(self, session_key: str) -> str:
+        """Safe, non-mutable summary of active task state for this session."""
+        try:
+            running = self.subagents.get_running_count_by_session(session_key)
+        except Exception:
+            return ""
+        if running:
+            return (
+                f"Active background tasks in this session: {running} "
+                "(they continue; do not steer them)."
+            )
+        return ""
 
     @staticmethod
     def _runtime_chat_id(msg: InboundMessage) -> str:
@@ -1178,6 +1325,10 @@ class AgentLoop:
             raw = msg.content.strip()
             effective_key = self._effective_session_key(msg)
             if await agent_context.handle_runtime_control(self, msg, self.tools):
+                continue
+            # /btw is answered outside the session lock and pending queue.
+            if self._is_btw_request(raw):
+                await self._handle_btw(msg, effective_key)
                 continue
             if self.commands.is_priority(raw):
                 await self._dispatch_command_inline(
