@@ -27,7 +27,12 @@ from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRun
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.approval import ApprovalStore
 from nanobot.agent.tools.context import RequestContext, bind_request_context, reset_request_context
-from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, reset_file_states
+from nanobot.agent.tools.file_state import (
+    MAX_FILE_STATE_SESSIONS,
+    FileStateStore,
+    bind_file_states,
+    reset_file_states,
+)
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.policy import (
     ToolPolicy,
@@ -323,7 +328,7 @@ class AgentLoop:
         self._approval_cfg = _tc.approval
         # One file-read/write tracker per logical session. The tool registry is
         # shared by this loop, so tools resolve the active state via contextvars.
-        self._file_state_store = FileStateStore()
+        self._file_state_store = FileStateStore(max_sessions=MAX_FILE_STATE_SESSIONS)
         self.runner = AgentRunner(provider)
         self.subagents = SubagentManager(
             provider=provider,
@@ -837,6 +842,10 @@ class AgentLoop:
                 await t
         sub_cancelled = await self.subagents.cancel_by_session(key)
         return cancelled + sub_cancelled
+
+    def discard_session_file_state(self, key: str) -> None:
+        """Forget ephemeral file-read state for a reset or removed session."""
+        self._file_state_store.discard(key)
 
     def _effective_session_key(self, msg: InboundMessage) -> str:
         """Return the session key used for task routing and mid-turn injections."""
