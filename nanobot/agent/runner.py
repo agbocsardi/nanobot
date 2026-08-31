@@ -756,16 +756,19 @@ class AgentRunner:
             return "partial_completion"
         if "retryable_error" in statuses:
             return "partial_completion"
+        if "ask_user" in statuses:
+            return "ask_user"
         return None
 
     @staticmethod
     def _suppress_false_success(content: str, stop_reason: str) -> str:
-        prefix = (
-            _POLICY_BLOCK_PREFIX
-            if stop_reason == "policy_block"
-            else _PARTIAL_COMPLETION_PREFIX
-        )
-        return f"{prefix}\n\n{content}" if content else prefix
+        # Only false-success outcomes get a prefix; ask_user (a deliberate
+        # wait-for-user pause) and other terminal reasons pass content through.
+        if stop_reason == "policy_block":
+            return f"{_POLICY_BLOCK_PREFIX}\n\n{content}" if content else _POLICY_BLOCK_PREFIX
+        if stop_reason == "partial_completion":
+            return f"{_PARTIAL_COMPLETION_PREFIX}\n\n{content}" if content else _PARTIAL_COMPLETION_PREFIX
+        return content
 
     def _build_request_kwargs(
         self,

@@ -19,6 +19,7 @@ ToolOutcomeStatus = Literal[
     "retryable_error",
     "policy_block",
     "fatal_error",
+    "ask_user",
 ]
 PostconditionStatus = Literal["checked", "unchecked", "failed"]
 

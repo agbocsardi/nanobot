@@ -652,18 +652,17 @@ class TelegramChannel(BaseChannel):
             )
         )
 
-        # Conditionally register inline keyboard callback handler
+        # Always register the callback handler: ask_user buttons need it even
+        # when legacy message buttons are disabled (see inline_keyboards).
+        self._app.add_handler(CallbackQueryHandler(self._on_callback_query))
+        self._allowed_updates = [
+            "message",
+            "edited_message",
+            "message_reaction",
+            "callback_query",
+        ]
         if self.config.inline_keyboards:
-            self._app.add_handler(CallbackQueryHandler(self._on_callback_query))
-            self._allowed_updates = [
-                "message",
-                "edited_message",
-                "message_reaction",
-                "callback_query",
-            ]
             self.logger.debug("inline keyboards enabled")
-        else:
-            self._allowed_updates = ["message", "edited_message", "message_reaction"]
         return app
 
     async def _start_app(self) -> None:
@@ -2509,14 +2508,40 @@ class TelegramChannel(BaseChannel):
         return ""
 
     def _build_keyboard(self, buttons: list) -> InlineKeyboardMarkup | None:
-        """Build inline keyboard markup if inline_keyboards is enabled."""
-        if not buttons or not self.config.inline_keyboards:
+        """Build inline keyboard markup from the outbound button spec.
+
+        Structured buttons ``{"label", "callback_value"}`` (used by ask_user)
+        always render; their callback_value is an opaque id, never the visible
+        label, and is also passed through the 64-byte safety truncation.
+        Legacy plain-string rows (``message(..., buttons=...)``) render only
+        when ``inline_keyboards`` is enabled, preserving prior behavior.
+        """
+        if not buttons:
             return None
-        keyboard = [
-            [InlineKeyboardButton(label, callback_data=self._safe_callback_data(label)) for label in row]
-            for row in buttons
-        ]
-        return InlineKeyboardMarkup(keyboard)
+        rich_strings = self.config.inline_keyboards
+        keyboard: list[list[InlineKeyboardButton]] = []
+        for row in buttons:
+            rendered: list[InlineKeyboardButton] = []
+            for button in row:
+                if isinstance(button, dict):
+                    label = str(button.get("label") or "")
+                    callback = str(
+                        button.get("callback_value") or button.get("label") or ""
+                    )
+                    rendered.append(
+                        InlineKeyboardButton(
+                            label, callback_data=self._safe_callback_data(callback)
+                        )
+                    )
+                elif rich_strings:
+                    rendered.append(
+                        InlineKeyboardButton(
+                            str(button), callback_data=self._safe_callback_data(str(button))
+                        )
+                    )
+            if rendered:
+                keyboard.append(rendered)
+        return InlineKeyboardMarkup(keyboard) if keyboard else None
 
     @staticmethod
     def _safe_callback_data(label: str) -> str:
@@ -2544,7 +2569,16 @@ class TelegramChannel(BaseChannel):
             return
         if not self.is_allowed(sender_id):
             return
-        button_label = query.data or ""
+        from nanobot.agent.tools.ask_user import parse_question_callback
+
+        payload = query.data or ""
+        parsed = parse_question_callback(payload)
+        if parsed is not None:
+            await self._answer_question_callback(
+                query, sender_id=sender_id, chat_id=str(chat_id), payload=parsed,
+            )
+            return
+        button_label = payload
         await query.answer()
         if query.message:
             with suppress(Exception):
@@ -2563,4 +2597,70 @@ class TelegramChannel(BaseChannel):
                 "first_name": user.first_name,
                 "is_callback": True,
             },
+        )
+
+    async def _answer_question_callback(
+        self,
+        query: Any,
+        *,
+        sender_id: str,
+        chat_id: str,
+        payload: tuple[str, str],
+    ) -> None:
+        """Atomically claim a durable question answer and route it as a turn.
+
+        Wrong user/chat, duplicate taps, stale callbacks, and expired
+        questions receive a harmless acknowledgement and never create an agent
+        turn. The question owns its session key, so the answer lands in the
+        same session that asked it.
+        """
+        from nanobot.agent.tools.ask_user import PendingQuestionStore
+
+        question_id, option_id = payload
+        store = PendingQuestionStore(Path(self.workspace)) if self.workspace else None
+        if store is None:
+            self.logger.warning("Question callback without channel workspace")
+            await query.answer(text="Unavailable.", show_alert=False)
+            return
+        claimed, question = store.claim(
+            question_id,
+            option_id,
+            channel=self.name,
+            chat_id=chat_id,
+            sender_id=sender_id,
+        )
+        if question is None:
+            await query.answer(text="Question not found.", show_alert=False)
+            return
+        if not claimed:
+            if question.status == "answered":
+                await query.answer(text="Already answered.", show_alert=False)
+            elif question.status == "expired":
+                await query.answer(text="This question expired.", show_alert=False)
+            elif question.status == "cancelled":
+                await query.answer(text="This question was cancelled.", show_alert=False)
+            else:
+                await query.answer(text="Not available to you.", show_alert=False)
+            return
+
+        label = question.option_label(option_id) or option_id
+        await query.answer(text=f"Answered: {label}", show_alert=False)
+        if query.message:
+            with suppress(Exception):
+                await query.message.edit_reply_markup(reply_markup=None)
+        self.logger.info(
+            "Question {} answered by {} -> {}", question_id, sender_id, option_id
+        )
+        await self._handle_message(
+            sender_id=sender_id,
+            chat_id=chat_id,
+            content=f"Answered question {question_id}: {label}",
+            metadata={
+                "question_id": question_id,
+                "option_id": option_id,
+                "question_answer": True,
+                "question_answer_label": label,
+                "callback_query_id": query.id,
+            },
+            session_key=question.session_key,
         )
