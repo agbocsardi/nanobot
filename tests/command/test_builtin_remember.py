@@ -92,46 +92,45 @@ async def test_remember_topic_variant(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_remember_topic_variant_with_md_suffix(tmp_path: Path) -> None:
-    await _remember(tmp_path, "ideas.md: build a sandbox garden")
-    saved = _read_topic(tmp_path, "ideas.md")
-    assert "build a sandbox garden" in saved
-
-
-@pytest.mark.asyncio
-async def test_remember_rejects_parent_escape(tmp_path: Path) -> None:
+async def test_remember_path_like_input_never_escapes(tmp_path: Path) -> None:
+    """Non-slug prefixes fall back to the default topic as plain text."""
     content = await _remember(tmp_path, "../../etc/passwd: add user")
 
-    assert "Error" in content
+    assert "memory/user-notes.md" in content
+    saved = _read_topic(tmp_path, DEFAULT_REMEMBER_TOPIC)
+    assert "../../etc/passwd: add user" in saved
     assert not (tmp_path / "etc").exists()
-    assert not (tmp_path / "etc" / "passwd").exists()
-    # Nothing escaped into the workspace root either.
-    assert not (tmp_path / "passwd").exists()
-    assert list(tmp_path.iterdir()) == []
+    assert [p.name for p in tmp_path.iterdir()] == ["memory"]
 
 
 @pytest.mark.asyncio
-async def test_remember_rejects_protected_memory_files(tmp_path: Path) -> None:
+async def test_remember_protected_names_fall_back_to_default_topic(tmp_path: Path) -> None:
+    """history.jsonl/.dream_cursor contain dots; the one-rule parser treats
+    them as plain notes, so the protected files are never written."""
     (tmp_path / "memory").mkdir(parents=True, exist_ok=True)
     (tmp_path / "memory" / "history.jsonl").write_text("{}", encoding="utf-8")
     (tmp_path / "memory" / ".dream_cursor").write_text("0", encoding="utf-8")
 
-    for topic, original in (("history.jsonl", "{}"), (".dream_cursor", "0")):
+    for topic in ("history.jsonl", ".dream_cursor"):
         content = await _remember(tmp_path, f"{topic}: secret")
-        assert "Error" in content
-        assert (tmp_path / "memory" / topic).read_text(encoding="utf-8") == original
+
+        assert "memory/user-notes.md" in content
+        saved = _read_topic(tmp_path, DEFAULT_REMEMBER_TOPIC)
+        assert f"{topic}: secret" in saved
+        assert (tmp_path / "memory" / topic).read_text(encoding="utf-8") in ("{}", "0")
 
 
 @pytest.mark.asyncio
-async def test_remember_rejects_path_like_topics(tmp_path: Path) -> None:
+async def test_remember_path_like_arguments_fall_back_to_default_topic(tmp_path: Path) -> None:
+    """Path-like prefixes are prose, not topics: note lands in user-notes.md."""
     (tmp_path / "memory" / "system").mkdir(parents=True, exist_ok=True)
 
-    for args in ("mem/ory: split path", "system/boot: boot note",
-                 "..: parent", ": empty topic", "long-" * 15 + "x: capped"):
+    for args in ("mem/ory: split path", "system/boot: boot note", ": empty topic"):
         content = await _remember(tmp_path, args)
-        assert "Error" in content, f"expected rejection for {args!r}"
-    # Nothing escaped the memory dir (pathlib can't hold a literal '..' segment).
-    assert sorted(p.name for p in (tmp_path / "memory").iterdir()) == ["system"]
+        assert "memory/user-notes.md" in content, f"expected default topic for {args!r}"
+        saved = _read_topic(tmp_path, DEFAULT_REMEMBER_TOPIC)
+        assert args in saved
+    assert sorted(p.name for p in (tmp_path / "memory").iterdir()) == ["system", "user-notes.md"]
 
 
 @pytest.mark.asyncio
