@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import os
 from contextlib import suppress
 from copy import deepcopy
@@ -80,6 +81,37 @@ _PARTIAL_COMPLETION_PREFIX = (
     "Incomplete: one or more tool operations failed or could not be verified."
 )
 _POLICY_BLOCK_PREFIX = "Incomplete: one or more required operations were blocked by policy."
+# Recorded tool-event enrichment: when record_tool_details is set, each tool
+# event gains a truncated args map and a truncated rendered-result preview so
+# persisted run records stay small even across 100+ iteration runs.
+_RECORDED_ARG_MAX_CHARS = 200
+_RECORDED_PREVIEW_MAX_CHARS = 500
+
+
+def _truncate_recorded_text(text: str, max_chars: int) -> str:
+    """Collapse to one line and truncate a recorded field with an ellipsis."""
+    text = (text or "").replace("\n", " ").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1].rstrip() + "…"
+
+
+def _truncate_recorded_value(value: Any, max_chars: int) -> Any:
+    """Truncate one tool-call argument for a compact persisted event.
+
+    Scalars pass through untouched; strings and nested JSON-like structures
+    are collapsed to one line and truncated to ``max_chars``.
+    """
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return _truncate_recorded_text(value, max_chars)
+    try:
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        text = str(value)
+    return _truncate_recorded_text(text, max_chars)
+
 
 # Backward-compatible module attribute for tests/extensions that monkeypatch
 # the former single-file tracker hook. Runtime uses prepare_file_edit_trackers.
@@ -118,6 +150,9 @@ class AgentRunSpec:
     goal_continue_message: str | None = None
     finalize_on_max_iterations: bool = True
     vision_handoff: Any = None  # nanobot.agent.vision_handoff.VisionHandoff | None
+    # Persisted-run observability: enrich every tool event with a compact
+    # args map and a rendered-result preview (see _tool_event).
+    record_tool_details: bool = False
 
 
 @dataclass(slots=True)
@@ -1119,6 +1154,9 @@ class AgentRunner:
         workspace_violation_counts: dict[str, int],
     ) -> tuple[Any, dict[str, Any], BaseException | None]:
         hint = "\n\n[Analyze the error above and try a different approach.]"
+        # Enriched persistence for run records: capture compact args whenever
+        # the run opts in (subagents), leaving default runs byte-identical.
+        recorded_args = tool_call.arguments if spec.record_tool_details else None
         lookup_error = repeated_external_lookup_error(
             tool_call.name,
             tool_call.arguments,
@@ -1133,6 +1171,7 @@ class AgentRunner:
                 tool_call.name,
                 outcome,
                 detail="repeated external lookup blocked",
+                arguments=recorded_args,
             )
             if spec.fail_on_tool_error:
                 return lookup_error + hint, event, RuntimeError(lookup_error)
@@ -1151,6 +1190,7 @@ class AgentRunner:
                 outcome,
                 detail=prep_error.split(": ", 1)[-1][:120],
                 execution_succeeded=False,
+                arguments=recorded_args,
             )
             handled = self._classify_violation(
                 raw_text=prep_error,
@@ -1191,6 +1231,7 @@ class AgentRunner:
                     tool_call.name,
                     outcome,
                     execution_succeeded=False,
+                    arguments=recorded_args,
                 ), None
         emit_file_edit_events = (
             spec.progress_callback is not None
@@ -1242,6 +1283,7 @@ class AgentRunner:
                 outcome,
                 detail=str(exc),
                 execution_succeeded=False,
+                arguments=recorded_args,
             )
             handled = self._classify_violation(
                 raw_text=str(exc),
@@ -1267,7 +1309,9 @@ class AgentRunner:
                         for file_edit_tracker in file_edit_trackers
                     ],
                 )
-            event = self._tool_event(tool_call.name, outcome)
+            event = self._tool_event(
+                tool_call.name, outcome, arguments=recorded_args,
+            )
             handled = self._classify_violation(
                 raw_text=str(outcome),
                 soft_payload=str(outcome) + hint,
@@ -1293,7 +1337,9 @@ class AgentRunner:
             )
 
         payload = str(outcome) if isinstance(result, ToolResult) else result
-        return payload, self._tool_event(tool_call.name, outcome), None
+        return payload, self._tool_event(
+            tool_call.name, outcome, arguments=recorded_args,
+        ), None
 
     @staticmethod
     def _tool_event(
@@ -1302,6 +1348,7 @@ class AgentRunner:
         *,
         detail: str | None = None,
         execution_succeeded: bool = True,
+        arguments: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         rendered = detail if detail is not None else str(outcome)
         rendered = rendered.replace("\n", " ").strip()
@@ -1319,6 +1366,24 @@ class AgentRunner:
             "retryable": outcome.retryable,
             "postcondition": outcome.postcondition,
         }
+        if arguments is not None:
+            # Enriched persistence (subagent run records): compact args + a
+            # truncated preview of the rendered result. Additive keys; older
+            # consumers that only read name/status/detail are unaffected.
+            args: dict[str, Any] = {}
+            if isinstance(arguments, dict):
+                args = {
+                    str(key): _truncate_recorded_value(value, _RECORDED_ARG_MAX_CHARS)
+                    for key, value in arguments.items()
+                }
+            else:
+                args["raw"] = _truncate_recorded_text(
+                    str(arguments), _RECORDED_ARG_MAX_CHARS,
+                )
+            event["args"] = args
+            event["preview"] = _truncate_recorded_text(
+                str(outcome), _RECORDED_PREVIEW_MAX_CHARS,
+            )
         if outcome.data is not None:
             event["data"] = outcome.data
         if outcome.evidence:

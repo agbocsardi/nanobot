@@ -738,6 +738,7 @@ async def test_subagent_result_routes_to_live_parent_queue(tmp_path):
         "status": "ok",
         "stop_reason": "completed",
         "result": "finished",
+        "record_path": str(manager.records_dir / "sub-1.json"),
     }
 
 

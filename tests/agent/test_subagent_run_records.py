@@ -11,13 +11,14 @@ import asyncio
 import json
 import time
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from nanobot.agent.hook import AgentHookContext
 from nanobot.agent.runner import AgentRunResult
 from nanobot.agent.subagent import (
+    MAX_PERSISTED_TOOL_EVENTS,
     SubagentManager,
     SubagentStatus,
 )
@@ -345,3 +346,281 @@ class TestSubagentRunRecord:
         assert announcement.metadata["subagent_result"]["stop_reason"] == "cancelled"
         assert record["phase"] == "cancelled"
         assert sm._finalizer_tasks == set()
+
+
+# ---------------------------------------------------------------------------
+# Issue #11: record-path discoverability + enriched tool_events + bounded cap
+# ---------------------------------------------------------------------------
+
+
+class TestRunRecordDiscovery:
+    @pytest.mark.asyncio
+    async def test_record_contains_path_and_matches_written_file(self, tmp_path):
+        """The announce-referenced record path must equal the persisted file."""
+        sm = _manager(tmp_path)
+        sm.runner.run = AsyncMock(return_value=AgentRunResult(
+            final_content="Task done!",
+            messages=[],
+            stop_reason="completed",
+        ))
+        with patch.object(sm, "_announce_result", new_callable=AsyncMock):
+            await sm._run_subagent(
+                "t1", "do task", "label",
+                {"channel": "cli", "chat_id": "direct"}, _status(),
+            )
+
+        expected = sm.records_dir / "t1.json"
+        assert sm._record_path("t1") == expected
+        assert expected.exists()
+        assert _read_record(tmp_path, "t1")["run_id"] == "t1"
+
+    @pytest.mark.asyncio
+    async def test_announce_includes_record_path(self, tmp_path):
+        """The announce content + metadata carry the record path for read_file."""
+        sm = _manager(tmp_path)
+        published = []
+        sm.bus.publish_inbound = AsyncMock(side_effect=lambda msg: published.append(msg))
+
+        await sm._announce_result(
+            "t1", "label", "task", "result",
+            {"channel": "cli", "chat_id": "direct"}, "ok",
+        )
+
+        msg = published[0]
+        expected = str(sm.records_dir / "t1.json")
+        assert expected in msg.content
+        assert "Run record:" in msg.content
+        assert msg.metadata["subagent_result"]["record_path"] == expected
+
+
+class TestEnrichedToolEvents:
+    @pytest.mark.asyncio
+    async def test_runner_enriches_events_when_record_tool_details(self, tmp_path):
+        """With record_tool_details=True each event carries truncated args + preview."""
+        from nanobot.agent.runner import AgentRunner, AgentRunSpec
+        from nanobot.providers.base import LLMResponse, ToolCallRequest
+
+        provider = MagicMock()
+        provider.get_default_model.return_value = "test-model"
+        calls = {"n": 0}
+
+        async def chat_with_retry(*, messages, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return LLMResponse(
+                    content="running",
+                    tool_calls=[ToolCallRequest(
+                        id="call_1",
+                        name="web_fetch",
+                        arguments={"url": "https://example.com/" + "x" * 300, "query": "hello"},
+                    )],
+                    usage={},
+                )
+            return LLMResponse(content="done", tool_calls=[], usage={})
+
+        provider.chat_with_retry = chat_with_retry
+        tools = MagicMock()
+        tools.get_definitions.return_value = []
+        tools.execute = AsyncMock(return_value="ok" + "y" * 600)
+
+        runner = AgentRunner(provider)
+        result = await runner.run(AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "do task"}],
+            tools=tools,
+            model="test-model",
+            max_iterations=3,
+            max_tool_result_chars=16_000,
+            record_tool_details=True,
+        ))
+
+        assert len(result.tool_events) == 1
+        event = result.tool_events[0]
+        assert event["name"] == "web_fetch"
+        assert event["args"] is not None
+        # Long strings truncated to ~200 chars.
+        assert len(event["args"]["url"]) <= 202
+        assert event["args"]["query"] == "hello"
+        # Preview is the first ~500 chars of the rendered result.
+        assert len(event["preview"]) <= 502
+        assert event["preview"].startswith("ok")
+
+    @pytest.mark.asyncio
+    async def test_runner_events_unchanged_without_flag(self):
+        """Default runs (chat loop) keep the legacy event shape — no args/preview."""
+        from nanobot.agent.runner import AgentRunner, AgentRunSpec
+        from nanobot.providers.base import LLMResponse, ToolCallRequest
+
+        provider = MagicMock()
+        provider.get_default_model.return_value = "test-model"
+        calls = {"n": 0}
+
+        async def chat_with_retry(*, messages, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return LLMResponse(
+                    content="running",
+                    tool_calls=[ToolCallRequest(id="call_1", name="list_dir", arguments={"path": "/tmp"})],
+                    usage={},
+                )
+            return LLMResponse(content="done", tool_calls=[], usage={})
+
+        provider.chat_with_retry = chat_with_retry
+        tools = MagicMock()
+        tools.get_definitions.return_value = []
+        tools.execute = AsyncMock(return_value="tool result")
+
+        runner = AgentRunner(provider)
+        result = await runner.run(AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "do task"}],
+            tools=tools,
+            model="test-model",
+            max_iterations=3,
+            max_tool_result_chars=16_000,
+        ))
+
+        assert result.tool_events == [{
+            "name": "list_dir",
+            "status": "success",
+            "detail": "tool result",
+            "execution_succeeded": True,
+            "operational_success": True,
+            "verified": True,
+            "retryable": False,
+            "postcondition": None,
+            "data": "tool result",
+        }]
+
+    @pytest.mark.asyncio
+    async def test_subagent_record_persists_enriched_events(self, tmp_path):
+        """A run going through SubagentManager persists args + preview per event."""
+        sm = _manager(tmp_path)
+        events = [{
+            "name": "web_fetch",
+            "status": "success",
+            "detail": "fetched",
+            "args": {"url": "https://example.com", "query": "nanobot"},
+            "preview": "first 500 chars of page content",
+        }]
+        sm.runner.run = AsyncMock(return_value=AgentRunResult(
+            final_content="done",
+            messages=[],
+            stop_reason="completed",
+            tool_events=events,
+        ))
+        status = _status()
+        with patch.object(sm, "_announce_result", new_callable=AsyncMock):
+            await sm._run_subagent(
+                "t1", "do task", "label",
+                {"channel": "cli", "chat_id": "direct"}, status,
+            )
+
+        rec = _read_record(tmp_path, "t1")
+        assert rec["tool_events"][0]["args"] == {"url": "https://example.com", "query": "nanobot"}
+        assert rec["tool_events"][0]["preview"].startswith("first 500 chars")
+
+
+class TestBoundedToolEventCap:
+    @pytest.mark.asyncio
+    async def test_record_keeps_only_last_events(self, tmp_path):
+        sm = _manager(tmp_path)
+        events = [
+            {"name": f"tool_{i}", "status": "success", "detail": f"d{i}"}
+            for i in range(MAX_PERSISTED_TOOL_EVENTS + 20)
+        ]
+        sm.runner.run = AsyncMock(return_value=AgentRunResult(
+            final_content="done",
+            messages=[],
+            stop_reason="completed",
+            tool_events=events,
+        ))
+        status = _status()
+        with patch.object(sm, "_announce_result", new_callable=AsyncMock):
+            await sm._run_subagent(
+                "t1", "do task", "label",
+                {"channel": "cli", "chat_id": "direct"}, status,
+            )
+
+        rec = _read_record(tmp_path, "t1")
+        assert len(rec["tool_events"]) == MAX_PERSISTED_TOOL_EVENTS
+        # Keeps the *last* (most recent) events, not the first ones.
+        assert rec["tool_events"][0]["name"] == f"tool_{20}"
+        assert rec["tool_events"][-1]["name"] == f"tool_{MAX_PERSISTED_TOOL_EVENTS + 19}"
+
+    @pytest.mark.asyncio
+    async def test_record_under_cap_is_unchanged(self, tmp_path):
+        sm = _manager(tmp_path)
+        events = [
+            {"name": f"tool_{i}", "status": "success", "detail": f"d{i}"}
+            for i in range(3)
+        ]
+        sm.runner.run = AsyncMock(return_value=AgentRunResult(
+            final_content="done",
+            messages=[],
+            stop_reason="completed",
+            tool_events=events,
+        ))
+        status = _status()
+        with patch.object(sm, "_announce_result", new_callable=AsyncMock):
+            await sm._run_subagent(
+                "t1", "do task", "label",
+                {"channel": "cli", "chat_id": "direct"}, status,
+            )
+
+        rec = _read_record(tmp_path, "t1")
+        assert rec["tool_events"] == events
+
+
+class TestOldFormatRecordCompatibility:
+    def test_old_format_record_still_readable(self, tmp_path):
+        """Records written without enriched fields still parse and keep their data."""
+        from nanobot.utils.run_records import write_run_record
+
+        old_record = {
+            "kind": "subagent",
+            "task_id": "t9",
+            "label": "label",
+            "task": "old style run",
+            "model": "deepseek-v4-pro",
+            "tool_events": [
+                {"name": "read_file", "status": "success", "detail": "file content"},
+                {"name": "exec", "status": "error", "detail": "boom"},
+            ],
+            "result": "old result",
+        }
+        path = write_run_record(tmp_path / "subagents", "t9", old_record)
+        rec = json.loads(path.read_text(encoding="utf-8"))
+
+        assert rec["task_id"] == "t9"
+        assert rec["tool_events"] == old_record["tool_events"]
+        assert "args" not in rec["tool_events"][0]
+        assert "preview" not in rec["tool_events"][1]
+
+    @pytest.mark.asyncio
+    async def test_mixed_format_events_persist_without_error(self, tmp_path):
+        """Enriched and legacy-shaped events coexist in one record file."""
+        sm = _manager(tmp_path)
+        events = [
+            {"name": "read_file", "status": "success", "detail": "legacy"},
+            {
+                "name": "web_search",
+                "status": "success",
+                "detail": "enriched",
+                "args": {"query": "nanobot"},
+                "preview": "results...",
+            },
+        ]
+        sm.runner.run = AsyncMock(return_value=AgentRunResult(
+            final_content="done",
+            messages=[],
+            stop_reason="completed",
+            tool_events=events,
+        ))
+        status = _status()
+        with patch.object(sm, "_announce_result", new_callable=AsyncMock):
+            await sm._run_subagent(
+                "t1", "do task", "label",
+                {"channel": "cli", "chat_id": "direct"}, status,
+            )
+
+        rec = _read_record(tmp_path, "t1")
+        assert rec["tool_events"] == events
