@@ -331,6 +331,10 @@ class AgentLoop:
         # shared by this loop, so tools resolve the active state via contextvars.
         self._file_state_store = FileStateStore(max_sessions=MAX_FILE_STATE_SESSIONS)
         self._standing_intents = StandingIntentStore(workspace)
+        # /after follow-up turns queued per session (in-memory, FIFO, bounded).
+        self._followup_queues: dict[str, list[dict[str, Any]]] = {}
+        self._followup_limit = 20
+        self._followup_max_chars = 1000
         self.runner = AgentRunner(provider)
         self.subagents = SubagentManager(
             provider=provider,
@@ -738,6 +742,107 @@ class AgentLoop:
                     ),
                 },
             )
+
+    @staticmethod
+    def _split_control(raw: str, _prefix: str) -> str:
+        """Return the text after a control command token (may be empty)."""
+        parts = raw.split(None, 1)
+        if len(parts) < 2:
+            return ""
+        return parts[1].strip()
+
+    async def _control_ack(self, msg: InboundMessage, content: str) -> None:
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id, content=content,
+            metadata={**dict(msg.metadata or {}), "render_as": "text"},
+        ))
+
+    async def _handle_steer(self, msg: InboundMessage, session_key: str) -> None:
+        """Inject tagged guidance at the next safe boundary of the active run."""
+        text = self._split_control(msg.content, "steer")
+        if not text:
+            return await self._control_ack(
+                msg, "Usage: `/steer <text>` - nudge the current run at its next safe boundary."
+            )
+        if session_key not in self._pending_queues:
+            return await self._control_ack(msg, "No active run to steer in this session.")
+        payload = InboundMessage(
+            channel=msg.channel, sender_id=msg.sender_id, chat_id=msg.chat_id,
+            content=f"[steer] {text[: self._followup_max_chars]}",
+            metadata={
+                **dict(msg.metadata or {}),
+                "control": "steer",
+                "steer_text": text[: self._followup_max_chars],
+            },
+            session_key_override=session_key,
+        )
+        try:
+            self._pending_queues[session_key].put_nowait(payload)
+        except asyncio.QueueFull:
+            return await self._control_ack(
+                msg, "Steer rejected: the active turn's injection queue is full."
+            )
+        await self._control_ack(
+            msg, f"Steering the active run with your guidance ({len(text)} chars).",
+        )
+
+    async def _handle_after(self, msg: InboundMessage, session_key: str) -> None:
+        """Queue a follow-up turn that runs only after the current run finishes."""
+        text = self._split_control(msg.content, "after")
+        if not text:
+            return await self._control_ack(
+                msg, "Usage: `/after <text>` - I'll do this right after the current run finishes."
+            )
+        text = text[: self._followup_max_chars]
+        if session_key not in self._pending_queues:
+            await self.bus.publish_inbound(InboundMessage(
+                channel=msg.channel, sender_id=msg.sender_id, chat_id=msg.chat_id,
+                content=text, metadata=dict(msg.metadata or {}),
+                session_key_override=session_key,
+            ))
+            return await self._control_ack(msg, "No active run; sent as an ordinary message.")
+        queue = self._followup_queues.setdefault(session_key, [])
+        if len(queue) >= self._followup_limit:
+            return await self._control_ack(msg, "Follow-up queue for this session is full.")
+        queue.append({
+            "channel": msg.channel, "sender_id": msg.sender_id,
+            "chat_id": msg.chat_id, "text": text, "metadata": dict(msg.metadata or {}),
+        })
+        await self._control_ack(
+            msg, f"Follow-up queued ({len(queue)} waiting); it runs after the current run.",
+        )
+
+    async def _handle_interrupt(self, msg: InboundMessage, session_key: str) -> None:
+        """Cooperatively cancel the active run, then process replacement text."""
+        text = self._split_control(msg.content, "interrupt")
+        is_active = (
+            session_key in self._pending_queues
+            or bool(self._active_tasks.get(session_key))
+        )
+        if not is_active:
+            return await self._control_ack(msg, "No active run to interrupt in this session.")
+        try:
+            total = await asyncio.wait_for(
+                self._cancel_active_tasks(session_key), timeout=30.0
+            )
+        except asyncio.TimeoutError:
+            return await self._control_ack(
+                msg, "Interrupt timed out cancelling the run; not starting overlapping work."
+            )
+        if not text:
+            return await self._control_ack(msg, f"Stopped {total} task(s).")
+        await self.bus.publish_inbound(InboundMessage(
+            channel=msg.channel, sender_id=msg.sender_id, chat_id=msg.chat_id,
+            content=text[: self._followup_max_chars], metadata=dict(msg.metadata or {}),
+            session_key_override=session_key,
+        ))
+        await self._control_ack(
+            msg, f"Stopped the old run ({total} task(s)) and starting your replacement request.",
+        )
+
+    def _drain_followups(self, session_key: str) -> list[dict[str, Any]]:
+        """Remove and return this session's queued /after turns."""
+        return self._followup_queues.pop(session_key, [])
 
     @staticmethod
     def _runtime_chat_id(msg: InboundMessage) -> str:
@@ -1178,6 +1283,17 @@ class AgentLoop:
             raw = msg.content.strip()
             effective_key = self._effective_session_key(msg)
             if await agent_context.handle_runtime_control(self, msg, self.tools):
+                continue
+            # Explicit run controls are handled before ordinary pending-message
+            # behavior, outside the active session lock.
+            if raw == "/steer" or raw.startswith("/steer "):
+                await self._handle_steer(msg, effective_key)
+                continue
+            if raw == "/after" or raw.startswith("/after "):
+                await self._handle_after(msg, effective_key)
+                continue
+            if raw == "/interrupt" or raw.startswith("/interrupt "):
+                await self._handle_interrupt(msg, effective_key)
                 continue
             if self.commands.is_priority(raw):
                 await self._dispatch_command_inline(
