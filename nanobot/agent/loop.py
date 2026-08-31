@@ -237,10 +237,12 @@ class AgentLoop:
         loaded_config_path: Path | None = None,
         loaded_config_fingerprint: str | None = None,
         context_retrieval: Any | None = None,
+        dream_config: Any | None = None,
     ):
-        from nanobot.config.schema import ToolsConfig
+        from nanobot.config.schema import DreamConfig, ToolsConfig
 
         _tc = tools_config or ToolsConfig()
+        self.dream_config = dream_config or DreamConfig()
         defaults = AgentDefaults()
         self.bus = bus
         self.runtime_events = runtime_events or RuntimeEventBus()
@@ -481,6 +483,7 @@ class AgentLoop:
             loaded_config_path=loaded_config_path,
             loaded_config_fingerprint=loaded_config_fingerprint,
             context_retrieval=context_retrieval,
+            dream_config=defaults.dream,
             session_ttl_minutes=defaults.session_ttl_minutes,
             consolidation_ratio=defaults.consolidation_ratio,
             max_messages=defaults.max_messages,

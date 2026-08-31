@@ -327,49 +327,55 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
 
     async def _run_dream():
         from nanobot.agent.memory import MemoryStore
+        from nanobot.config.schema import DreamConfig
 
         dream_session_key = MemoryStore.dream_session_key
-        build_dream_commit_message = MemoryStore.build_dream_commit_message
         prune_dream_sessions = MemoryStore.prune_dream_sessions
 
         store = loop.context.memory
-        content = ""
-        resp = None
+        dream_cfg = getattr(loop, "dream_config", None) or DreamConfig()
         t0 = time.monotonic()
         try:
-            result = store.build_dream_prompt()
-            if result is None:
+            key = dream_session_key()
+            outcome = await store.run_dream(
+                run=lambda prompt: loop.process_direct(
+                    prompt,
+                    session_key=key,
+                    ephemeral=True,
+                    tools=store.build_dream_tools(),
+                    run_max_iterations=dream_cfg.max_iterations,
+                    run_llm_timeout_s=dream_cfg.timeout_s,
+                ),
+                max_batch_size=dream_cfg.max_batch_size,
+                max_iterations=dream_cfg.max_iterations,
+                timeout_s=dream_cfg.timeout_s,
+                max_changed_files=dream_cfg.max_changed_files,
+                max_diff_chars=dream_cfg.max_diff_chars,
+                model_label=loop.model,
+                commit_prefix="dream: manual run",
+                session_key=key,
+                session_manager=loop.sessions,
+            )
+            elapsed = time.monotonic() - t0
+            if outcome.reason == "nothing_to_process":
                 await loop.bus.publish_outbound(OutboundMessage(
                     channel=msg.channel, chat_id=msg.chat_id,
                     content="Dream: nothing to process.",
                 ))
                 return
-            prompt, last_cursor = result
-            key = dream_session_key()
-            resp = await loop.process_direct(
-                prompt,
-                session_key=key,
-                ephemeral=True,
-                tools=store.build_dream_tools(),
-            )
-            elapsed = time.monotonic() - t0
-            if MemoryStore.dream_run_completed(resp):
-                store.set_last_dream_cursor(last_cursor)
+            if outcome.completed:
                 content = f"Dream completed in {elapsed:.1f}s."
+                if outcome.commit_sha:
+                    content += f" (commit {outcome.commit_sha})"
             else:
                 content = (
-                    f"Dream did not complete after {elapsed:.1f}s; "
+                    f"Dream did not complete ({outcome.reason}) after {elapsed:.1f}s; "
                     "memory cursor was not advanced."
                 )
         except Exception as e:
             elapsed = time.monotonic() - t0
             content = f"Dream failed after {elapsed:.1f}s: {e}"
         finally:
-            if store.git.is_initialized():
-                commit_msg = build_dream_commit_message("dream: manual run", resp)
-                sha = store.git.auto_commit(commit_msg)
-                if sha:
-                    content += f" (commit {sha})"
             store.compact_history()
             prune_dream_sessions(loop.sessions.sessions_dir)
         await loop.bus.publish_outbound(OutboundMessage(

@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import json
 import os
 import re
 import threading
+import time
 import weakref
+from collections.abc import Awaitable
 from contextlib import suppress
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator
@@ -33,6 +37,42 @@ from nanobot.utils.usage import usage_delta, usage_snapshot
 if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
     from nanobot.session.manager import SessionManager
+
+
+# ---------------------------------------------------------------------------
+# Dream guardrail state
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DreamSnapshot:
+    """Pre-Dream working-tree state of the memory surfaces.
+
+    ``files`` maps workspace-relative paths to the exact bytes present before
+    the run. It covers the M1b memory surfaces (SOUL.md, USER.md,
+    ``memory/**/*.md``, ``skills/**/SKILL.md``) plus git-tracked files such as
+    ``memory/.dream_cursor`` so an incomplete run restores the pre-run state
+    byte-for-byte. Keeping bytes (rather than trusting git HEAD) preserves any
+    pre-existing dirty edits a user made outside Dream.
+    """
+
+    files: dict[str, bytes]
+    surface: list[str]
+
+
+@dataclass
+class DreamRunResult:
+    """Structured outcome of one guarded Dream pass (M1b/M1c observability)."""
+
+    completed: bool
+    reason: str  # completed | nothing_to_process | timeout | exception | stop reason | max_changed_files | max_diff_chars
+    stop_reason: str | None = None
+    changed_files: list[str] = field(default_factory=list)
+    diff_chars: int = 0
+    diff: str = ""
+    commit_sha: str | None = None
+    elapsed_s: float = 0.0
+    error: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -760,6 +800,346 @@ class MemoryStore:
             file_states=file_states,
         ))
         return tools
+
+    # -- Dream guardrails (M1b diff limits, M1c rollback, M1d observability) --
+
+    _DREAM_SURFACE_FILES = ("SOUL.md", "USER.md")
+    _DREAM_SURFACE_GLOBS = ("memory/**/*.md", "skills/**/SKILL.md")
+
+    def _dream_surface_paths(self) -> list[str]:
+        """Current memory-owned surface files under the M1b contract.
+
+        Only SOUL.md, USER.md, ``memory/**/*.md`` and ``skills/**/SKILL.md``
+        count toward Dream's changed-file/diff limits; ``history.jsonl`` and
+        cursor files are deliberately excluded.
+        """
+        paths: set[str] = set()
+        for name in self._DREAM_SURFACE_FILES:
+            if (self.workspace / name).is_file():
+                paths.add(name)
+        for pattern in self._DREAM_SURFACE_GLOBS:
+            for p in self.workspace.glob(pattern):
+                if p.is_file():
+                    paths.add(p.relative_to(self.workspace).as_posix())
+        return sorted(paths)
+
+    def capture_dream_snapshot(self) -> DreamSnapshot:
+        """Snapshot the pre-Dream state of memory surfaces and git-tracked files."""
+        surface = set(self._dream_surface_paths())
+        paths = set(surface)
+        for rel in self.git.tracked_files():
+            if (self.workspace / rel).is_file():
+                paths.add(rel)
+        files: dict[str, bytes] = {}
+        for rel in sorted(paths):
+            p = self.workspace / rel
+            try:
+                files[rel] = p.read_bytes()
+            except OSError:
+                logger.warning("Dream snapshot: failed to read {}", p)
+        return DreamSnapshot(files=files, surface=sorted(surface))
+
+    @staticmethod
+    def _diff_fragment(rel: str, old: bytes | None, new: bytes | None) -> str:
+        """Deterministic unified-diff fragment for one surface file."""
+        old_text = old.decode("utf-8", "replace") if old is not None else ""
+        new_text = new.decode("utf-8", "replace") if new is not None else ""
+        fromfile = "/dev/null" if old is None else f"a/{rel}"
+        tofile = f"b/{rel}" if new is not None else "/dev/null"
+        return "".join(difflib.unified_diff(
+            old_text.splitlines(keepends=True),
+            new_text.splitlines(keepends=True),
+            fromfile=fromfile,
+            tofile=tofile,
+            lineterm="",
+        ))
+
+    def measure_dream_delta(
+        self, snapshot: DreamSnapshot,
+    ) -> tuple[list[str], int, str]:
+        """Return ``(changed_files, diff_chars, diff_text)`` the run produced.
+
+        The measure is deliberately git-independent: it compares the current
+        working tree against the pre-run bytes, so new (untracked), deleted,
+        and modified files inside the memory surfaces all count toward the M1b
+        limits. Skipped files (cursors, history.jsonl) never appear.
+        """
+        current: dict[str, bytes] = {}
+        for rel in self._dream_surface_paths():
+            p = self.workspace / rel
+            if p.is_file():
+                try:
+                    current[rel] = p.read_bytes()
+                except OSError:
+                    logger.warning("Dream delta: failed to read {}", p)
+        changed: list[str] = []
+        fragments: list[str] = []
+        for rel in sorted(set(snapshot.surface) | set(current)):
+            old = snapshot.files.get(rel)
+            new = current.get(rel)
+            if old == new:
+                continue
+            changed.append(rel)
+            fragments.append(self._diff_fragment(rel, old, new))
+        diff_text = "\n".join(fragments)
+        return changed, len(diff_text), diff_text
+
+    def restore_dream_state(self, snapshot: DreamSnapshot) -> list[str]:
+        """Restore the pre-Dream working-tree state; return touched paths.
+
+        Writes every snapshotted file back byte-for-byte (covering both
+        git-tracked files and untracked additions, and working even when the
+        workspace has no git repo) and removes newly created files under the
+        memory surfaces.
+        """
+        touched: list[str] = []
+        for rel, content in snapshot.files.items():
+            p = self.workspace / rel
+            try:
+                if p.read_bytes() != content:
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_bytes(content)
+                    touched.append(rel)
+            except OSError:
+                logger.warning("Dream rollback: failed to restore {}", p)
+        for rel in self._dream_surface_paths():
+            if rel not in snapshot.files:
+                try:
+                    (self.workspace / rel).unlink()
+                    touched.append(rel)
+                except OSError:
+                    logger.warning("Dream rollback: failed to remove new file {}", rel)
+        return touched
+
+    def _log_dream_outcome(
+        self,
+        outcome: DreamRunResult,
+        *,
+        model_label: str,
+        max_batch_size: int,
+        max_iterations: int,
+        timeout_s: int,
+    ) -> None:
+        """M1d: log model, limits, stop reason, changed files and diff size."""
+        common = (
+            "model={} batch_size={} max_iterations={} timeout_s={} stop_reason={} "
+            "changed_files={} diff_chars={} elapsed_s={:.1f} cursor={}"
+        ).format(
+            model_label,
+            max_batch_size,
+            max_iterations,
+            timeout_s,
+            outcome.stop_reason,
+            outcome.changed_files,
+            outcome.diff_chars,
+            outcome.elapsed_s,
+            self.get_last_dream_cursor(),
+        )
+        if outcome.completed:
+            logger.info("Dream completed: {} commit={}", common, outcome.commit_sha)
+        else:
+            logger.warning("Dream incomplete (reason={}): {}", outcome.reason, common)
+
+    def _record_dream_outcome(
+        self,
+        outcome: DreamRunResult,
+        *,
+        resp: Any | None,
+        model_label: str,
+        max_batch_size: int,
+        max_iterations: int,
+        timeout_s: int,
+        session_key: str | None = None,
+        session_manager: Any | None = None,
+    ) -> None:
+        """M1d: log the outcome and attach it to the response/session metadata."""
+        self._log_dream_outcome(
+            outcome,
+            model_label=model_label,
+            max_batch_size=max_batch_size,
+            max_iterations=max_iterations,
+            timeout_s=timeout_s,
+        )
+        meta = {
+            "result": "completed" if outcome.completed else "incomplete",
+            "reason": outcome.reason,
+            "stop_reason": outcome.stop_reason,
+            "model": model_label,
+            "batch_size": max_batch_size,
+            "max_iterations": max_iterations,
+            "timeout_s": timeout_s,
+            "changed_files": outcome.changed_files,
+            "diff_chars": outcome.diff_chars,
+            "commit_sha": outcome.commit_sha,
+            "elapsed_s": round(outcome.elapsed_s, 2),
+        }
+        if resp is not None and isinstance(getattr(resp, "metadata", None), dict):
+            resp.metadata["_dream_run"] = meta
+        if session_manager is not None and session_key:
+            try:
+                session = session_manager.get_or_create(session_key)
+                session.metadata["_last_dream_run"] = meta
+                session_manager.save(session)
+            except Exception:
+                logger.warning("Dream: failed to record outcome in session metadata")
+
+    async def run_dream(
+        self,
+        run: Callable[[str], Awaitable[Any]],
+        *,
+        max_batch_size: int = 20,
+        max_iterations: int = 10,
+        timeout_s: int = 300,
+        max_changed_files: int = 8,
+        max_diff_chars: int = 32_000,
+        model_label: str = "unknown",
+        commit_prefix: str = "dream: memory consolidation",
+        session_key: str | None = None,
+        session_manager: Any | None = None,
+    ) -> DreamRunResult:
+        """Run one guarded Dream pass: snapshot, run, validate, commit/roll back.
+
+        ``run`` is an async callable receiving the Dream prompt; it is
+        responsible for invoking ``process_direct`` with the caller's runtime
+        kwargs. M1c rollback is applied for timeouts, exceptions, unexpected
+        stop reasons (including max iterations), and M1b limit violations; the
+        cursor only advances on a fully validated, committed run.
+
+        Never raises for LLM/tool failures — those are recorded on the result.
+        """
+        start = time.monotonic()
+        built = self.build_dream_prompt(max_entries=max_batch_size)
+        if built is None:
+            outcome = DreamRunResult(completed=False, reason="nothing_to_process")
+            self._log_dream_outcome(
+                outcome,
+                model_label=model_label,
+                max_batch_size=max_batch_size,
+                max_iterations=max_iterations,
+                timeout_s=timeout_s,
+            )
+            return outcome
+        prompt, last_cursor = built
+
+        snapshot = self.capture_dream_snapshot()
+        resp: Any | None = None
+        try:
+            resp = await asyncio.wait_for(run(prompt), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            outcome = DreamRunResult(
+                completed=False, reason="timeout", stop_reason="timeout",
+                elapsed_s=time.monotonic() - start,
+            )
+            return self._finish_incomplete_dream(
+                snapshot, resp, outcome,
+                model_label=model_label, max_batch_size=max_batch_size,
+                max_iterations=max_iterations, timeout_s=timeout_s,
+                session_key=session_key, session_manager=session_manager,
+            )
+        except Exception as exc:
+            outcome = DreamRunResult(
+                completed=False, reason="exception", stop_reason="exception",
+                error=str(exc), elapsed_s=time.monotonic() - start,
+            )
+            return self._finish_incomplete_dream(
+                snapshot, resp, outcome,
+                model_label=model_label, max_batch_size=max_batch_size,
+                max_iterations=max_iterations, timeout_s=timeout_s,
+                session_key=session_key, session_manager=session_manager,
+            )
+
+        stop_reason = None
+        if resp is not None:
+            metadata = getattr(resp, "metadata", None)
+            if isinstance(metadata, dict):
+                stop_reason = metadata.get("_stop_reason")
+        elapsed = time.monotonic() - start
+        if not self.dream_run_completed(resp):
+            outcome = DreamRunResult(
+                completed=False,
+                reason=stop_reason or "incomplete",
+                stop_reason=stop_reason,
+                elapsed_s=elapsed,
+            )
+            return self._finish_incomplete_dream(
+                snapshot, resp, outcome,
+                model_label=model_label, max_batch_size=max_batch_size,
+                max_iterations=max_iterations, timeout_s=timeout_s,
+                session_key=session_key, session_manager=session_manager,
+            )
+
+        changed_files, diff_chars, diff_text = self.measure_dream_delta(snapshot)
+        if len(changed_files) > max_changed_files:
+            outcome = DreamRunResult(
+                completed=False, reason="max_changed_files", stop_reason=stop_reason,
+                changed_files=changed_files, diff_chars=diff_chars,
+                diff=diff_text, elapsed_s=elapsed,
+            )
+            return self._finish_incomplete_dream(
+                snapshot, resp, outcome,
+                model_label=model_label, max_batch_size=max_batch_size,
+                max_iterations=max_iterations, timeout_s=timeout_s,
+                session_key=session_key, session_manager=session_manager,
+            )
+        if diff_chars > max_diff_chars:
+            outcome = DreamRunResult(
+                completed=False, reason="max_diff_chars", stop_reason=stop_reason,
+                changed_files=changed_files, diff_chars=diff_chars,
+                diff=diff_text, elapsed_s=elapsed,
+            )
+            return self._finish_incomplete_dream(
+                snapshot, resp, outcome,
+                model_label=model_label, max_batch_size=max_batch_size,
+                max_iterations=max_iterations, timeout_s=timeout_s,
+                session_key=session_key, session_manager=session_manager,
+            )
+
+        # Fully validated: advance the cursor and auto-commit.
+        self.set_last_dream_cursor(last_cursor)
+        commit_sha = None
+        if self.git.is_initialized():
+            commit_sha = self.git.auto_commit(
+                self.build_dream_commit_message(commit_prefix, resp),
+            )
+        outcome = DreamRunResult(
+            completed=True, reason="completed", stop_reason=stop_reason,
+            changed_files=changed_files, diff_chars=diff_chars,
+            diff=diff_text, commit_sha=commit_sha, elapsed_s=elapsed,
+        )
+        self._record_dream_outcome(
+            outcome, resp=resp,
+            model_label=model_label, max_batch_size=max_batch_size,
+            max_iterations=max_iterations, timeout_s=timeout_s,
+            session_key=session_key, session_manager=session_manager,
+        )
+        return outcome
+
+    def _finish_incomplete_dream(
+        self,
+        snapshot: DreamSnapshot,
+        resp: Any | None,
+        outcome: DreamRunResult,
+        *,
+        model_label: str,
+        max_batch_size: int,
+        max_iterations: int,
+        timeout_s: int,
+        session_key: str | None = None,
+        session_manager: Any | None = None,
+    ) -> DreamRunResult:
+        """M1c: roll back the working tree and record the incomplete outcome."""
+        touched = self.restore_dream_state(snapshot)
+        if touched:
+            logger.warning(
+                "Dream rollback: restored {} path(s): {}", len(touched), touched,
+            )
+        self._record_dream_outcome(
+            outcome, resp=resp,
+            model_label=model_label, max_batch_size=max_batch_size,
+            max_iterations=max_iterations, timeout_s=timeout_s,
+            session_key=session_key, session_manager=session_manager,
+        )
+        return outcome
 
     @staticmethod
     def dream_run_completed(resp: object | None) -> bool:

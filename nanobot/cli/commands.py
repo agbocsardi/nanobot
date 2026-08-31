@@ -806,23 +806,15 @@ def _run_gateway(
             from nanobot.agent.memory import MemoryStore
 
             dream_session_key = MemoryStore.dream_session_key
-            build_dream_commit_message = MemoryStore.build_dream_commit_message
             prune_dream_sessions = MemoryStore.prune_dream_sessions
 
             store = agent.context.memory
             dream_cfg = config.agents.defaults.dream
             dream_snapshot = _dream_snapshot()
-            completed = False
-            resp = None
+            key = dream_session_key()
             try:
-                result = store.build_dream_prompt(max_entries=dream_cfg.max_batch_size)
-                if result is None:
-                    logger.info("Dream: nothing to process")
-                    return None
-                prompt, last_cursor = result
-                key = dream_session_key()
-                resp = await asyncio.wait_for(
-                    agent.process_direct(
+                await store.run_dream(
+                    run=lambda prompt: agent.process_direct(
                         prompt,
                         session_key=key,
                         ephemeral=True,
@@ -837,38 +829,19 @@ def _run_gateway(
                         run_max_iterations=dream_cfg.max_iterations,
                         run_llm_timeout_s=dream_cfg.timeout_s,
                     ),
-                    timeout=dream_cfg.timeout_s,
-                )
-                completed = MemoryStore.dream_run_completed(resp)
-                if completed:
-                    store.set_last_dream_cursor(last_cursor)
-                    logger.info(
-                        "Dream cron job completed, cursor advanced to {} (model={}, max_iter={})",
-                        last_cursor,
-                        dream_snapshot.model if dream_snapshot else agent.model,
-                        dream_cfg.max_iterations,
-                    )
-                else:
-                    logger.warning(
-                        "Dream cron job did not complete; cursor remains at {}",
-                        store.get_last_dream_cursor(),
-                    )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "Dream timed out after {}s; cursor remains at {}",
-                    dream_cfg.timeout_s,
-                    store.get_last_dream_cursor(),
+                    max_batch_size=dream_cfg.max_batch_size,
+                    max_iterations=dream_cfg.max_iterations,
+                    timeout_s=dream_cfg.timeout_s,
+                    max_changed_files=dream_cfg.max_changed_files,
+                    max_diff_chars=dream_cfg.max_diff_chars,
+                    model_label=(dream_snapshot.model if dream_snapshot else agent.model),
+                    commit_prefix="dream: periodic memory consolidation",
+                    session_key=key,
+                    session_manager=agent.sessions,
                 )
             except Exception:
                 logger.exception("Dream cron job failed")
             finally:
-                if completed and store.git.is_initialized():
-                    msg = build_dream_commit_message(
-                        "dream: periodic memory consolidation", resp,
-                    )
-                    sha = store.git.auto_commit(msg)
-                    if sha:
-                        logger.info("Dream commit: {}", sha)
                 store.compact_history()
                 prune_dream_sessions(agent.sessions.sessions_dir)
             return None
