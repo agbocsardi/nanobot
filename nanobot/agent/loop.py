@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import os
+import re
 import time
 from contextlib import nullcontext, suppress
 from dataclasses import dataclass, field
@@ -42,6 +43,7 @@ from nanobot.agent.tools.policy import (
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.self import MyTool
 from nanobot.agent.tools.standing_intents import StandingIntentStore, source_digest
+from nanobot.agent.tools.waiting_runs import WaitingRunStore
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.progress import build_bus_progress_callback
 from nanobot.bus.queue import MessageBus
@@ -157,6 +159,35 @@ class TurnContext:
     turn_latency_ms: int | None = None
 
     trace: list[StateTraceEntry] = field(default_factory=list)
+
+
+def _extract_ask_user_question_id(messages: list[dict[str, Any]]) -> str | None:
+    """Pull the question id from the ask_user tool result in a turn's messages."""
+    pattern = re.compile(r"Question ([a-f0-9]{6,16}) sent")
+    for message in messages:
+        payload = str(message.get("content") or message.get("data") or "")
+        match = pattern.search(payload)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _extract_tool_names(messages: list[dict[str, Any]]) -> list[str]:
+    """Collect distinct tool call names referenced in one turn (bounded)."""
+    names: list[str] = []
+    seen: set[str] = set()
+    for message in messages:
+        candidates: list[str] = []
+        for call in message.get("tool_calls") or []:
+            if isinstance(call, dict) and call.get("name"):
+                candidates.append(str(call["name"]))
+        if isinstance(message.get("name"), str) and message.get("name"):
+            candidates.append(message["name"])
+        for name in candidates:
+            if name not in seen:
+                seen.add(name)
+                names.append(name)
+    return names[-50:]
 
 
 class AgentLoop:
@@ -331,6 +362,7 @@ class AgentLoop:
         # shared by this loop, so tools resolve the active state via contextvars.
         self._file_state_store = FileStateStore(max_sessions=MAX_FILE_STATE_SESSIONS)
         self._standing_intents = StandingIntentStore(workspace)
+        self._waiting_runs = WaitingRunStore(workspace)
         self.runner = AgentRunner(provider)
         self.subagents = SubagentManager(
             provider=provider,
@@ -738,6 +770,59 @@ class AgentLoop:
                     ),
                 },
             )
+
+    def _fire_waiting_resume(
+        self,
+        *,
+        session_key: str,
+        sender_id: str,
+        question_id: str,
+        answer_label: str,
+        source_key: str,
+        messages: list[dict[str, Any]],
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        """Claim one waiting run for resume and inject its envelope as a turn.
+
+        Returns ``(run_id, budgets)`` when claimed (exactly-once resume), else
+        ``(None, None)``. Never breaks the turn on store failures.
+        """
+        if not question_id:
+            return None, None
+        try:
+            claimed, run = self._waiting_runs.claim_resume(
+                question_id,
+                session_key=session_key,
+                sender_id=sender_id,
+                source_key=source_key,
+            )
+        except Exception:
+            logger.warning("Waiting-run claim failed", exc_info=True)
+            return None, None
+        if not claimed or run is None:
+            return None, None
+        lines = [
+            f"[Resuming run {run.run_id}]",
+            f"Answer received: {answer_label or 'selected'}",
+            "Do not repeat work already recorded in the conversation history.",
+            "Continue the original objective; the budget below is a fixed bound.",
+        ]
+        if run.note:
+            lines.append("Continuation note: " + run.note[:500])
+        if run.completed_tool_names:
+            lines.append(
+                "Completed tool calls (do not repeat): "
+                + ", ".join(run.completed_tool_names[:10])
+            )
+        if run.budgets:
+            budget_parts = [
+                f"{key}={value}"
+                for key, value in run.budgets.items()
+                if value is not None
+            ]
+            if budget_parts:
+                lines.append("Remaining budget bounds: " + " ".join(budget_parts))
+        messages.insert(0, {"role": "system", "content": "\n".join(lines)})
+        return run.run_id, dict(run.budgets or {})
 
     @staticmethod
     def _runtime_chat_id(msg: InboundMessage) -> str:
@@ -1502,6 +1587,25 @@ class AgentLoop:
                 text=msg.content,
                 messages=messages,
             )
+        # Durable wait-and-resume (#29): an authorized answer claims the
+        # waiting run exactly once; this turn then continues it.
+        resumed_run_id: str | None = None
+        resume_budgets: dict[str, Any] | None = None
+        if not is_subagent and channel != "system" and msg.metadata.get("question_answer"):
+            resumed_run_id, resume_budgets = self._fire_waiting_resume(
+                session_key=key,
+                sender_id=msg.sender_id,
+                question_id=str(msg.metadata.get("question_id") or ""),
+                answer_label=str(msg.metadata.get("question_answer_label") or ""),
+                source_key=source_digest(
+                    channel,
+                    chat_id,
+                    key,
+                    msg.metadata.get("update_id") or msg.metadata.get("message_id"),
+                    msg.content,
+                ),
+                messages=messages,
+            )
         context_report = dict(self.context.last_context_report)
         t_wall = time.time()
         final_content, _, all_msgs, stop_reason, _ = await self._run_agent_loop(
@@ -1510,7 +1614,41 @@ class AgentLoop:
             metadata=msg.metadata,
             session_key=key,
             pending_queue=pending_queue,
+            run_max_iterations=(
+                resume_budgets.get("max_iterations") if resume_budgets else None
+            ),
+            run_context_window_tokens=(
+                resume_budgets.get("context_window_tokens") if resume_budgets else None
+            ),
+            run_max_tool_result_chars=(
+                resume_budgets.get("max_tool_result_chars") if resume_budgets else None
+            ),
         )
+        # If this turn resumed a waiting run, close its lifecycle atomically.
+        if resumed_run_id:
+            self._waiting_runs.mark_complete(
+                resumed_run_id,
+                ok=stop_reason
+                in ("completed", "partial_completion", "max_iterations", "ask_user"),
+            )
+        # If this turn hit an ask_user boundary, fill the envelope the tool
+        # already persisted with the continuation note and bounded budgets.
+        if stop_reason == "ask_user":
+            question_id = _extract_ask_user_question_id(all_msgs)
+            if question_id:
+                self._waiting_runs.augment(
+                    question_id,
+                    note=final_content or "",
+                    budgets={
+                        "max_iterations": self.max_iterations,
+                        "context_window_tokens": self.context_window_tokens,
+                        "max_tool_result_chars": getattr(self, "max_tool_result_chars", None),
+                        "max_tokens": getattr(
+                            getattr(self.provider, "generation", None), "max_tokens", None
+                        ),
+                    },
+                    completed_tool_names=_extract_tool_names(all_msgs),
+                )
         wall_done = time.time()
         latency_ms = max(0, int((wall_done - t_wall) * 1000))
         self._save_turn(session, all_msgs, 1 + len(history), turn_latency_ms=latency_ms)
