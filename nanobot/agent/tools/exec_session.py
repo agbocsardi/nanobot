@@ -21,7 +21,8 @@ from nanobot.agent.tools.schema import (
 DEFAULT_YIELD_MS = 1000
 MAX_YIELD_MS = 30_000
 DEFAULT_WAIT_FOR_MS = 10_000
-MAX_WAIT_FOR_MS = 120_000
+MAX_WAIT_FOR_MS = 600_000
+DEFAULT_UNTIL_EXIT_MS = 600_000
 DEFAULT_MAX_OUTPUT_CHARS = 10_000
 MAX_OUTPUT_CHARS = 50_000
 OUTPUT_DRAIN_GRACE_S = 0.1
@@ -379,10 +380,27 @@ def format_session_poll(session_id: str, poll: _SessionPoll) -> str:
         ),
         wait_timeout_ms=IntegerSchema(
             DEFAULT_WAIT_FOR_MS,
-            description="Maximum milliseconds to wait for wait_for text (default 10000, max 120000).",
+            description="Alias of timeout_ms for wait_for (kept for compatibility).",
             minimum=0,
             maximum=MAX_WAIT_FOR_MS,
             nullable=True,
+        ),
+        timeout_ms=IntegerSchema(
+            description=(
+                "Maximum wait in ms for wait_for/until_exit "
+                f"(default {DEFAULT_WAIT_FOR_MS} for wait_for, {DEFAULT_UNTIL_EXIT_MS} "
+                f"for until_exit; max {MAX_WAIT_FOR_MS}). Ignored for plain polls."
+            ),
+            minimum=0,
+            maximum=MAX_WAIT_FOR_MS,
+            nullable=True,
+        ),
+        until_exit=BooleanSchema(
+            description=(
+                "Wait for the process to exit instead of returning after a fixed "
+                "poll. Use alone or with timeout_ms; mutually exclusive with wait_for."
+            ),
+            default=False,
         ),
         max_output_chars=IntegerSchema(
             DEFAULT_MAX_OUTPUT_CHARS,
@@ -441,9 +459,10 @@ class WriteStdinTool(Tool):
             "Interact with a running exec session created by exec with "
             "yield_time_ms. Use chars='' to poll without writing, chars to send "
             "stdin, close_stdin=true to send EOF, or terminate=true to stop the "
-            "process. Use wait_for with wait_timeout_ms for dev servers, test "
-            "watchers, and prompts where you need to wait for expected output. "
-            "Do not use this to start new commands; start them with exec."
+            "process. Use wait_for (with timeout_ms) for dev servers, test "
+            "watchers, and prompts where you need to wait for expected output, "
+            "or until_exit=true to block until the process exits (up to 10m by "
+            "default). Do not use this to start new commands; start them with exec."
         )
 
     async def execute(
@@ -455,11 +474,29 @@ class WriteStdinTool(Tool):
         yield_time_ms: int | None = None,
         wait_for: str | None = None,
         wait_timeout_ms: int | None = None,
+        timeout_ms: int | None = None,
+        until_exit: bool = False,
         max_output_chars: int | None = None,
         max_output_tokens: int | None = None,
         **kwargs: Any,
     ) -> str:
         try:
+            if wait_for is not None and wait_for == "":
+                return "Error: wait_for must not be empty."
+            if wait_for is not None and until_exit:
+                return "Error: wait_for and until_exit are mutually exclusive."
+            # yield_time_ms stays allowed with terminate for backward
+            # compatibility (existing callers terminate with a poll delay).
+            if terminate and any(
+                (
+                    chars is not None,
+                    close_stdin,
+                    wait_for is not None,
+                    until_exit,
+                    timeout_ms is not None,
+                )
+            ):
+                return "Error: terminate must be used alone."
             if max_output_chars is None:
                 max_output_chars = max_output_tokens
             output_limit = clamp_session_int(
@@ -468,19 +505,27 @@ class WriteStdinTool(Tool):
                 1000,
                 MAX_OUTPUT_CHARS,
             )
-            if wait_for:
+            if wait_for is not None or until_exit:
+                if timeout_ms is not None:
+                    wait_budget = clamp_session_int(
+                        timeout_ms, DEFAULT_WAIT_FOR_MS, 0, MAX_WAIT_FOR_MS
+                    )
+                elif until_exit:
+                    wait_budget = clamp_session_int(
+                        wait_timeout_ms, DEFAULT_UNTIL_EXIT_MS, 0, MAX_WAIT_FOR_MS
+                    )
+                else:
+                    wait_budget = clamp_session_int(
+                        wait_timeout_ms, DEFAULT_WAIT_FOR_MS, 0, MAX_WAIT_FOR_MS
+                    )
                 return await self._wait_for_output(
                     session_id=session_id,
                     chars=chars,
                     close_stdin=close_stdin,
                     terminate=terminate,
                     wait_for=wait_for,
-                    wait_timeout_ms=clamp_session_int(
-                        wait_timeout_ms,
-                        DEFAULT_WAIT_FOR_MS,
-                        0,
-                        MAX_WAIT_FOR_MS,
-                    ),
+                    until_exit=until_exit,
+                    timeout_ms=wait_budget,
                     max_output_chars=output_limit,
                 )
             poll = await self._manager.write(
@@ -505,11 +550,12 @@ class WriteStdinTool(Tool):
         chars: str | None,
         close_stdin: bool,
         terminate: bool,
-        wait_for: str,
-        wait_timeout_ms: int,
+        wait_for: str | None,
+        until_exit: bool,
+        timeout_ms: int,
         max_output_chars: int,
     ) -> str:
-        deadline = time.monotonic() + (wait_timeout_ms / 1000)
+        deadline = time.monotonic() + (timeout_ms / 1000)
         aggregate: list[str] = []
         first = True
         poll: _SessionPoll | None = None
@@ -517,27 +563,32 @@ class WriteStdinTool(Tool):
         while True:
             remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
             step_ms = min(500, remaining_ms)
+            # Internal drain polls use the full output budget so the wait target
+            # survives response truncation (upstream b1030ab1); the user-facing
+            # cap only shapes the final rendered poll.
             poll = await self._manager.write(
                 session_id=session_id,
                 chars=chars if first else None,
                 close_stdin=close_stdin if first else False,
                 terminate=terminate if first else False,
                 yield_time_ms=step_ms,
-                max_output_chars=max_output_chars,
+                max_output_chars=MAX_OUTPUT_CHARS,
                 owner_session_key=current_request_session_key(),
             )
             first = False
             if poll.output:
                 aggregate.append(poll.output)
                 joined = "".join(aggregate)
-                if wait_for in joined:
+                if wait_for is not None and wait_for in joined:
                     poll.output = joined
                     return format_session_poll(session_id, poll)
             if poll.done or remaining_ms <= 0:
                 poll.output = "".join(aggregate)
                 result = format_session_poll(session_id, poll)
-                if wait_for not in poll.output:
+                if wait_for is not None and wait_for not in poll.output:
                     result += f"\nWait target not observed: {wait_for!r}"
+                if until_exit and not poll.done:
+                    result += f"\nProcess still running after {timeout_ms / 1000:.1f}s."
                 return result
 
 

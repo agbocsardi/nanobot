@@ -369,3 +369,137 @@ def test_list_exec_sessions_reports_empty_state():
     result = asyncio.run(ListExecSessionsTool(manager=ExecSessionManager()).execute())
 
     assert result == "No active exec sessions."
+
+
+# ---------------------------------------------------------------------------
+# ported upstream QoL: wait without losing the target (b1030ab1) + until_exit
+# ---------------------------------------------------------------------------
+
+
+def test_write_stdin_wait_for_searches_before_response_truncation(tmp_path):
+    """Wait targets beyond a small user cap must still be found (b1030ab1)."""
+    async def run() -> str:
+        manager = ExecSessionManager()
+        exec_tool = ExecTool(working_dir=str(tmp_path), timeout=5, session_manager=manager)
+        stdin_tool = WriteStdinTool(manager=manager)
+        command = _python_command(
+            "import sys, time; "
+            "sys.stdout.write('A' * 3000 + 'TARGET-MARKER' + 'B' * 3000); "
+            "sys.stdout.flush(); time.sleep(0.2)"
+        )
+
+        # Start without draining output: yield_time_ms=0 returns the session id
+        # while the process is still starting, so the wait loop sees the burst.
+        initial = await exec_tool.execute(command=command, yield_time_ms=0)
+        sid = _session_id(initial)
+        waited = await stdin_tool.execute(
+            session_id=sid,
+            wait_for="TARGET-MARKER",
+            wait_timeout_ms=3000,
+            max_output_chars=1000,  # small user cap; target lays beyond it
+            yield_time_ms=0,
+        )
+        return waited
+
+    result = asyncio.run(run())
+
+    assert "TARGET-MARKER" in result
+    assert "Wait target not observed" not in result
+
+
+def test_write_stdin_until_exit_waits_and_reports_exit_code(tmp_path):
+    async def run() -> tuple[str, str]:
+        manager = ExecSessionManager()
+        exec_tool = ExecTool(working_dir=str(tmp_path), timeout=5, session_manager=manager)
+        stdin_tool = WriteStdinTool(manager=manager)
+        command = _python_command(
+            "import time; print('booting', flush=True); "
+            "time.sleep(0.3); print('done', flush=True)"
+        )
+
+        initial = await exec_tool.execute(command=command, yield_time_ms=50)
+        sid = _session_id(initial)
+        waited = await stdin_tool.execute(session_id=sid, until_exit=True)
+        return initial, waited
+
+    initial, waited = asyncio.run(run())
+
+    assert "Process running" in initial
+    assert "done" in waited
+    assert "Exit code: 0" in waited
+    assert "Process still running" not in waited
+
+
+def test_write_stdin_until_exit_timeout_reports_still_running(tmp_path):
+    async def run() -> str:
+        manager = ExecSessionManager()
+        exec_tool = ExecTool(working_dir=str(tmp_path), timeout=5, session_manager=manager)
+        stdin_tool = WriteStdinTool(manager=manager)
+        command = _python_command(
+            "import time; print('started', flush=True); time.sleep(5)"
+        )
+
+        initial = await exec_tool.execute(command=command, yield_time_ms=0)
+        sid = _session_id(initial)
+        waited = await stdin_tool.execute(session_id=sid, until_exit=True, timeout_ms=200)
+        await stdin_tool.execute(session_id=sid, terminate=True, yield_time_ms=0)
+        return waited
+
+    result = asyncio.run(run())
+
+    assert "Process still running after 0.2s." in result
+
+
+def test_write_stdin_validates_wait_conflicts(tmp_path):
+    async def run() -> tuple[str, str, str]:
+        manager = ExecSessionManager()
+        stdin_tool = WriteStdinTool(manager=manager)
+        exec_tool = ExecTool(working_dir=str(tmp_path), timeout=5, session_manager=manager)
+        initial = await exec_tool.execute(
+            command=_python_command("import time; time.sleep(5)"),
+            yield_time_ms=50,
+        )
+        sid = _session_id(initial)
+        both = await stdin_tool.execute(
+            session_id=sid, wait_for="x", until_exit=True
+        )
+        empty_target = await stdin_tool.execute(
+            session_id=sid, wait_for=""
+        )
+        terminate_with_input = await stdin_tool.execute(
+            session_id=sid, terminate=True, chars="x"
+        )
+        await stdin_tool.execute(session_id=sid, terminate=True, yield_time_ms=0)
+        return both, empty_target, terminate_with_input
+
+    both, empty_target, terminate_with_input = asyncio.run(run())
+
+    assert "mutually exclusive" in both
+    assert "must not be empty" in empty_target
+    assert "terminate must be used alone" in terminate_with_input
+
+
+def test_write_stdin_timeout_ms_unifies_wait_budget(tmp_path):
+    async def run() -> tuple[str, str]:
+        manager = ExecSessionManager()
+        exec_tool = ExecTool(working_dir=str(tmp_path), timeout=5, session_manager=manager)
+        stdin_tool = WriteStdinTool(manager=manager)
+        command = _python_command(
+            "import time; print('booting', flush=True); time.sleep(5)"
+        )
+
+        initial = await exec_tool.execute(command=command, yield_time_ms=100)
+        sid = _session_id(initial)
+        from_timeout = await stdin_tool.execute(
+            session_id=sid, wait_for="never-ready", timeout_ms=150
+        )
+        from_alias = await stdin_tool.execute(
+            session_id=sid, wait_for="never-ready", wait_timeout_ms=150
+        )
+        await stdin_tool.execute(session_id=sid, terminate=True, yield_time_ms=0)
+        return from_timeout, from_alias
+
+    from_timeout, from_alias = asyncio.run(run())
+
+    assert "Wait target not observed: 'never-ready'" in from_timeout
+    assert "Wait target not observed: 'never-ready'" in from_alias
