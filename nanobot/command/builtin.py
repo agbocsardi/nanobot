@@ -926,25 +926,12 @@ def _task_command_line(record: dict) -> str:
     )
 
 
-def _owned_task_record(loop, task_id: str, session_key: str, sender_id: str | None) -> dict | None:
-    """Return a record only when the session (and sender, when recorded) owns it."""
-    try:
-        record = loop.subagents.read_run_record(task_id)
-    except Exception:
-        return None
-    if record is None:
-        return None
-    origin = record.get("origin") or {}
-    if origin.get("session_key") != session_key:
-        return None
-    rec_sender = origin.get("sender_id")
-    if sender_id and rec_sender and str(rec_sender) != str(sender_id):
-        return None
-    return record
-
-
 async def cmd_tasks(ctx: CommandContext) -> OutboundMessage:
-    """List queued/running/waiting tasks first, then a small recent terminal list."""
+    """List the most recent owned background tasks (newest first).
+
+    Live tasks now have durable records from spawn time, so the list is one
+    flat, newest-first view: queued/running/waiting and terminal alike.
+    """
     loop = ctx.loop
     msg = ctx.msg
     if loop is None or not hasattr(loop, "subagents"):
@@ -969,16 +956,8 @@ async def cmd_tasks(ctx: CommandContext) -> OutboundMessage:
             content="No background tasks for this session.",
             metadata=dict(msg.metadata or {}),
         )
-    active = [
-        r for r in records
-        if SubagentManager.task_status_vocabulary(r) in ("queued", "waiting", "running")
-    ]
-    terminal = [r for r in records if r not in active][:10]
     lines = ["## Tasks"]
-    lines.extend(f"- {_task_command_line(r)}" for r in active)
-    if terminal:
-        lines.append("recent:")
-        lines.extend(f"- {_task_command_line(r)}" for r in terminal)
+    lines.extend(f"- {_task_command_line(r)}" for r in records)
     return OutboundMessage(
         channel=msg.channel, chat_id=msg.chat_id,
         content="\n".join(lines),
@@ -1073,7 +1052,9 @@ async def cmd_task(ctx: CommandContext) -> OutboundMessage:
             else:
                 content = f"Task {task_id} not found or not retryable."
         else:  # result
-            record = _owned_task_record(loop, task_id, ctx.key, sender_id)
+            record, _ = loop.subagents.owned_record(
+                task_id, session_key=ctx.key, sender_id=sender_id
+            )
             if record is None:
                 content = f"Task {task_id} not found."
             else:
@@ -1091,7 +1072,9 @@ async def cmd_task(ctx: CommandContext) -> OutboundMessage:
         )
 
     # Bare task id -> detail view (session + recorded-sender gated).
-    record = _owned_task_record(loop, action, ctx.key, sender_id)
+    record, _ = loop.subagents.owned_record(
+        action, session_key=ctx.key, sender_id=sender_id
+    )
     if record is None:
         return OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id,

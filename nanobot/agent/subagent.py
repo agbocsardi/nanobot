@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -34,6 +33,7 @@ from nanobot.security.workspace_access import (
     reset_workspace_scope,
     workspace_sandbox_status,
 )
+from nanobot.utils.helpers import truncate_text
 from nanobot.utils.prompt_templates import render_template
 from nanobot.utils.run_records import (
     build_usage_block,
@@ -241,7 +241,17 @@ class SubagentManager:
         self.model = model
         self.runner.provider = provider
 
-    async def spawn(
+    async def spawn(self, *args: Any, **kwargs: Any) -> str:
+        """Spawn a subagent; returns the human confirmation line.
+
+        The task id lives in the durable run record (``read_run_record`` /
+        ``owned_record``), never parsed from prose. See ``_spawn_impl`` for
+        the full signature and behaviour.
+        """
+        _, message = await self._spawn_impl(*args, **kwargs)
+        return message
+
+    async def _spawn_impl(
         self,
         task: str,
         label: str | None = None,
@@ -257,8 +267,8 @@ class SubagentManager:
         workspace_scope: WorkspaceScope | None = None,
         origin_sender_id: str | None = None,
         retry_of: str | None = None,
-    ) -> str:
-        """Spawn a subagent to execute a task in the background."""
+    ) -> tuple[str, str]:
+        """Execute one spawn; returns ``(task_id, human confirmation line)``."""
         queued_count = self.get_queued_count()
         if queued_count >= self.max_queued_subagents:
             raise QueueFullError(
@@ -303,6 +313,21 @@ class SubagentManager:
             retry_of=retry_of,
         )
         self._task_statuses[task_id] = status
+
+        # Durable from the start so /tasks and /task can see this run while
+        # it is queued/running; the terminal write overwrites this record.
+        self._write_run_record(
+            task_id,
+            task,
+            display_label,
+            origin,
+            temperature,
+            workspace_scope,
+            "",
+            status,
+            provider=effective_provider,
+            model=effective_model,
+        )
 
         bg_task = asyncio.create_task(
             self._run_scheduled_subagent(
@@ -373,8 +398,9 @@ class SubagentManager:
         logger.info("Spawned subagent [{}]: {}", task_id, display_label)
         state = "queued" if queued else "started"
         return (
+            task_id,
             f"Subagent [{display_label}] {state} (id: {task_id}). "
-            "I'll notify you when it completes."
+            "I'll notify you when it completes.",
         )
 
     async def _run_scheduled_subagent(
@@ -674,11 +700,9 @@ class SubagentManager:
 
     @staticmethod
     def _truncate_chat(text: str | None, limit: int = _TASK_CHAT_TEXT_LIMIT) -> str:
-        """Bounded, single-line-safe text for chat output."""
-        text = (text or "").strip().replace("\n", " ")
-        if len(text) <= limit:
-            return text
-        return text[: max(0, limit - 1)] + "\u2026"
+        """Single-line-safe chat text, reusing helpers.truncate_text."""
+        line = (text or "").strip().replace("\n", " ")
+        return truncate_text(line, limit).replace("\n", " ")
 
     @classmethod
     def task_status_vocabulary(cls, record: dict[str, Any]) -> str:
@@ -714,6 +738,30 @@ class SubagentManager:
         if not isinstance(data, dict) or str(data.get("task_id", "")) != str(task_id):
             return None
         return data
+
+    def owned_record(
+        self,
+        task_id: str,
+        *,
+        session_key: str,
+        sender_id: str | None = None,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Ownership-gated record lookup: ``(record, None)`` or ``(None, problem)``.
+
+        ``problem`` is ``not_found`` when there is no durable record and
+        ``not_owned`` when the session or recorded sender does not match.
+        One gate for cancel/retry inspection and the /task command.
+        """
+        record = self.read_run_record(task_id)
+        if record is None:
+            return None, "not_found"
+        origin = record.get("origin") or {}
+        if origin.get("session_key") != session_key:
+            return None, "not_owned"
+        rec_sender = origin.get("sender_id")
+        if sender_id is not None and rec_sender and str(rec_sender) != str(sender_id):
+            return None, "not_owned"
+        return record, None
 
     def list_session_task_records(
         self,
@@ -764,12 +812,9 @@ class SubagentManager:
             if self._finalizer_tasks:
                 await asyncio.gather(*list(self._finalizer_tasks), return_exceptions=True)
             return "cancelled"
-        record = self.read_run_record(task_id)
-        if record is None:
-            return "not_found"
-        origin = record.get("origin") or {}
-        if origin.get("session_key") != session_key:
-            return "not_owned"
+        record, problem = self.owned_record(task_id, session_key=session_key)
+        if problem is not None:
+            return problem
         phase = str(record.get("phase") or "")
         if phase in ("queued", "running"):
             return "not_owned"  # live elsewhere in this process; defensive
@@ -789,8 +834,8 @@ class SubagentManager:
         The old record gains ``retried_by``; the new record carries
         ``retry_of``. Never re-marks the failed record as running.
         """
-        # Live tasks have no durable record until terminal; consult the
-        # in-process registry first so active runs are never retried.
+        # The in-process registry is authoritative for live runs; consult it
+        # first so active tasks are never retried.
         task = self._running_tasks.get(task_id)
         if task is not None and not task.done():
             owned_ids = self._session_tasks.get(session_key, set())
@@ -798,23 +843,17 @@ class SubagentManager:
                 return "not_owned", task_id
             return "still_active", task_id
 
-        record = self.read_run_record(task_id)
-        if record is None:
-            return "not_found", task_id
-        origin = record.get("origin") or {}
-        if origin.get("session_key") != session_key:
-            return "not_owned", task_id
-        rec_sender = origin.get("sender_id")
-        if (
-            sender_id is not None
-            and rec_sender
-            and str(rec_sender) != str(sender_id)
-        ):
-            return "not_owned", task_id
+        record, problem = self.owned_record(
+            task_id, session_key=session_key, sender_id=sender_id
+        )
+        if problem is not None:
+            return problem, task_id
 
         params = record.get("params") or {}
+        origin = record.get("origin") or {}
+        rec_sender = origin.get("sender_id")
         try:
-            spawned = await self.spawn(
+            new_id, _ = await self._spawn_impl(
                 task=record.get("task") or "",
                 label=record.get("label"),
                 origin_channel=origin.get("channel", "cli"),
@@ -830,9 +869,6 @@ class SubagentManager:
             )
         except QueueFullError:
             return "queue_full", task_id
-        # ``spawn`` returns a human message; the new task id is embedded in it.
-        match = re.search(r"id: ([0-9a-f]+)", spawned)
-        new_id = match.group(1) if match else str(spawned)
 
         # Append-only lineage on the old record (never overwrite history).
         try:

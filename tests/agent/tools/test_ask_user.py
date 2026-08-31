@@ -145,32 +145,21 @@ def test_expired_question_rejects_and_marks_expired(tmp_path) -> None:
     assert q.status == "expired"
 
 
-def test_cancel_marks_cancelled(tmp_path) -> None:
-    store = PendingQuestionStore(tmp_path)
-    question = store.create(
-        prompt="decide", option_labels=["go", "stop"],
-        channel="telegram", chat_id="123", session_key="telegram:123", sender_id="u1",
-    )
-
-    assert store.cancel(question.question_id) is True
-    claimed, _ = store.claim(
-        question.question_id, "a", channel="telegram", chat_id="123", sender_id="u1"
-    )
-    assert claimed is False
-    assert store.cancel(question.question_id) is False  # already cancelled
-
-
-def test_corrupt_store_is_preserved_not_overwritten(tmp_path) -> None:
+def test_corrupt_store_degrades_to_empty(tmp_path) -> None:
     path = tmp_path / "pending_questions.json"
     path.write_text("{broken", encoding="utf-8")
 
     store = PendingQuestionStore(tmp_path)
     assert store.claim("missing", "a", channel="x", chat_id="y", sender_id="z") == (False, None)
 
-    # Original moved aside for recovery; the store treats it as empty.
-    assert not path.exists()
-    backups = list(tmp_path.glob("pending_questions.json.corrupt-*"))
-    assert backups
+    # The next write replaces the corrupt file atomically; no error loop.
+    question = store.create(
+        prompt="decide", option_labels=["go", "stop"],
+        channel="telegram", chat_id="123", session_key="telegram:123", sender_id="u1",
+    )
+    assert store.claim(
+        question.question_id, "a", channel="telegram", chat_id="123", sender_id="u1"
+    )[0] is True
 
 
 # ---------------------------------------------------------------------------
@@ -267,30 +256,4 @@ async def test_ask_user_ends_turn_with_ask_user_stop_reason(tmp_path) -> None:
     assert result.messages[-1]["content"] == "Awaiting your answer."
 
 
-@pytest.mark.asyncio
-async def test_execute_cancels_existing_question(tmp_path) -> None:
-    tool = _tool(tmp_path)
-    asked = await tool.execute(question="decide", options=["go", "stop"])
-    qid = asked.data["question_id"]
 
-    result = await tool.execute(
-        question="ignored", options=["x", "y"], cancel_question_id=qid
-    )
-
-    assert result.status == "success"
-    assert "Cancelled" in str(result)
-    assert result.data["cancelled_question_id"] == qid
-    # The cancelled question can no longer be answered.
-    store = PendingQuestionStore(tmp_path)
-    claimed, _ = store.claim(
-        qid, "a", channel="telegram", chat_id="123", sender_id="u1"
-    )
-    assert claimed is False
-
-
-@pytest.mark.asyncio
-async def test_execute_cancel_unknown_question_is_error(tmp_path) -> None:
-    tool = _tool(tmp_path)
-    result = await tool.execute(question="q", options=["a", "b"], cancel_question_id="nope")
-    assert result.status == "retryable_error"
-    assert "not pending" in str(result)

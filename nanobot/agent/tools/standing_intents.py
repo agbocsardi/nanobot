@@ -2,9 +2,8 @@
 
 A standing intent is a durable, owner-scoped rule: "when the user's trusted
 inbound text matches these trigger terms, surface this reminder." Matching is
-deterministic and bounded (no model call, no embeddings); firing is atomic so
-duplicate/replayed inbound updates cannot double-fire; cancellation, expiry,
-cooldown and a maximum fire budget are explicit durable state.
+deterministic and bounded (no model call, no embeddings); firing is atomic,
+each intent fires at most once, and cancellation is explicit durable state.
 
 The matching core (``normalize_text``/``match_trigger_groups``) is pure and
 testable in isolation. Storage (``StandingIntentStore``) and the ``intent``
@@ -14,36 +13,28 @@ tool live in the same module but are deliberately separate concerns.
 from __future__ import annotations
 
 import hashlib
-import json
-import os
 import re
-import threading
 import time
 import uuid
-from contextlib import suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from nanobot.agent.tools._durable_store import DurableJsonStore
 from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
 from nanobot.agent.tools.context import ContextAware, RequestContext
 from nanobot.agent.tools.schema import (
     ArraySchema,
-    IntegerSchema,
     StringSchema,
     tool_parameters_schema,
 )
 
-# Conservative defaults (bounded ranges enforced by the tool).
-DEFAULT_INTENT_TTL_S = 30 * 86400  # 30 days
-MAX_INTENT_TTL_S = 90 * 86400
-MIN_INTENT_TTL_S = 300  # 5 minutes
-DEFAULT_COOLDOWN_S = 3600  # 1 hour
-MAX_COOLDOWN_S = 7 * 86400
-MAX_FIRES = 100
-DEFAULT_MAX_FIRES = 3
+# Bounded trigger shapes (enforced by the tool).
 MAX_TERMS_PER_GROUP = 6
 MAX_GROUPS = 8
+# Terminal intents are pruned after a bounded retention window so the log
+# cannot grow without bound.
+_TERMINAL_RETENTION_MS = 30 * 86400 * 1000
 # Bounded dedup window: keep the last N fired source keys in memory so a
 # replayed inbound update cannot double-fire.
 _DEDUP_WINDOW = 512
@@ -109,63 +100,54 @@ class StandingIntent:
     trigger_groups: list[list[str]]
     reminder: str
     created_at_ms: int
-    expires_at_ms: int
-    cooldown_ms: int
-    max_fires: int
-    status: str = "active"  # active | cancelled | expired | exhausted
-    fire_count: int = 0
-    last_fired_at_ms: int | None = None
-
-    def expired(self, now_ms: int | None = None) -> bool:
-        return (now_ms if now_ms is not None else int(time.time() * 1000)) > self.expires_at_ms
+    status: str = "active"  # active | cancelled | fired
+    fired_at_ms: int | None = None
 
 
 class StandingIntentStore:
     """Durable intent log under ``workspace/standing_intents.json``.
 
-    Fires are atomic read-modify-write under a process lock; terminal intents
-    stay on disk (evidence retained) and are filtered out of match/fire.
+    Fires are atomic read-modify-write under the shared store lock; each
+    intent fires at most once (durable status -> fired). Terminal intents
+    are pruned after ``_TERMINAL_RETENTION_MS``.
     """
 
     def __init__(self, workspace: Path | None = None):
-        self._path = (workspace or Path(".")) / "standing_intents.json"
-        self._lock = threading.Lock()
+        self._store = DurableJsonStore(
+            (workspace or Path(".")) / "standing_intents.json", "intents"
+        )
         self._dedup: set[str] = set()
         self._dedup_order: list[str] = []
 
     @property
     def path(self) -> Path:
-        return self._path
+        return self._store.path
 
     def _load(self) -> list[StandingIntent]:
-        if not self._path.exists():
-            return []
-        data = json.loads(self._path.read_text(encoding="utf-8"))
-        items = data.get("intents", []) if isinstance(data, dict) else data
-        result: list[StandingIntent] = []
-        for item in items:
-            if isinstance(item, dict):
-                item["trigger_groups"] = [
-                    [str(t) for t in g] for g in (item.get("trigger_groups") or [])
-                ]
-                result.append(StandingIntent(**item))
-        return result
-
-    def _load_safe(self) -> list[StandingIntent]:
-        try:
-            return self._load()
-        except (OSError, json.JSONDecodeError, TypeError):
-            backup = self._path.with_suffix(self._path.suffix + f".corrupt-{int(time.time())}")
-            with suppress(OSError):
-                self._path.rename(backup)
-            return []
+        intents: list[StandingIntent] = []
+        for item in self._store.load():
+            trigger_groups = [
+                [str(t) for t in g]
+                for g in (item.get("trigger_groups") or [])
+                if isinstance(g, list)
+            ]
+            item["trigger_groups"] = trigger_groups
+            try:
+                intents.append(StandingIntent(**item))
+            except (TypeError, ValueError):
+                continue
+        return intents
 
     def _write(self, intents: list[StandingIntent]) -> None:
-        _atomic_write(
-            self._path,
-            json.dumps({"version": 1, "intents": [asdict(i) for i in intents]},
-                       indent=2, ensure_ascii=False),
-        )
+        # Terminal intents stay as evidence only within a bounded retention
+        # window; everything older is dropped on every write.
+        now = int(time.time() * 1000)
+        keep = [
+            i for i in intents
+            if i.status == "active"
+            or now - (i.fired_at_ms or i.created_at_ms) < _TERMINAL_RETENTION_MS
+        ]
+        self._store.write([asdict(i) for i in keep])
 
     def add(
         self,
@@ -176,9 +158,6 @@ class StandingIntentStore:
         session_key: str,
         trigger_groups: list[list[str]],
         reminder: str,
-        ttl_ms: int,
-        cooldown_ms: int,
-        max_fires: int,
     ) -> StandingIntent:
         now = int(time.time() * 1000)
         intent = StandingIntent(
@@ -190,19 +169,16 @@ class StandingIntentStore:
             trigger_groups=[[t.strip() for t in g if t.strip()] for g in trigger_groups],
             reminder=reminder,
             created_at_ms=now,
-            expires_at_ms=now + ttl_ms,
-            cooldown_ms=cooldown_ms,
-            max_fires=max_fires,
         )
-        with self._lock:
-            intents = self._load_safe()
+        with self._store.lock:
+            intents = self._load()
             intents.append(intent)
             self._write(intents)
         return intent
 
     def list_for_owner(self, session_key: str, *, sender_id: str | None = None) -> list[StandingIntent]:
-        with self._lock:
-            intents = self._load_safe()
+        with self._store.lock:
+            intents = self._load()
         return [
             i for i in intents
             if i.session_key == session_key
@@ -210,8 +186,8 @@ class StandingIntentStore:
         ]
 
     def cancel(self, intent_id: str, *, session_key: str, sender_id: str | None = None) -> bool:
-        with self._lock:
-            intents = self._load_safe()
+        with self._store.lock:
+            intents = self._load()
             intent = next((i for i in intents if i.intent_id == intent_id), None)
             if intent is None:
                 return False
@@ -234,17 +210,16 @@ class StandingIntentStore:
         text: str,
         now_ms: int | None = None,
     ) -> list[StandingIntent]:
-        """Fire every eligible owned intent once, atomically.
+        """Fire every eligible owned intent at most once, atomically.
 
-        Returns the list of fired intents (with ``fire_count`` already
-        incremented). Terminal states (expired/exhausted/cancelled) are
-        resolved lazily here; duplicate ``source_key`` within the bounded
-        dedup window is ignored, so replayed inbound updates cannot
-        double-fire.
+        Returns the fired intents with ``status`` already set to ``fired``
+        (durable truth: a fresh process cannot re-fire them). Duplicate
+        ``source_key`` within the bounded dedup window is ignored, so
+        replayed inbound updates cannot double-fire either.
         """
         now = now_ms if now_ms is not None else int(time.time() * 1000)
         normalized = normalize_text(text)
-        with self._lock:
+        with self._store.lock:
             if source_key in self._dedup:
                 return []
             self._dedup.add(source_key)
@@ -252,7 +227,7 @@ class StandingIntentStore:
             while len(self._dedup_order) > _DEDUP_WINDOW:
                 self._dedup.discard(self._dedup_order.pop(0))
 
-            intents = self._load_safe()
+            intents = self._load()
             fired: list[StandingIntent] = []
             changed = False
             for intent in intents:
@@ -260,51 +235,15 @@ class StandingIntentStore:
                     continue
                 if intent.status != "active":
                     continue
-                if intent.expired(now):
-                    intent.status = "expired"
-                    changed = True
-                    continue
-                if (
-                    intent.last_fired_at_ms is not None
-                    and now - intent.last_fired_at_ms < intent.cooldown_ms
-                ):
-                    continue
-                if intent.fire_count >= intent.max_fires:
-                    if intent.fire_count > 0:
-                        intent.status = "exhausted"
-                        changed = True
-                    continue
                 if not match_trigger_groups(intent.trigger_groups, normalized):
                     continue
-                intent.fire_count += 1
-                intent.last_fired_at_ms = now
-                if intent.fire_count >= intent.max_fires:
-                    intent.status = "exhausted"
+                intent.status = "fired"
+                intent.fired_at_ms = now
                 changed = True
                 fired.append(intent)
             if changed:
                 self._write(intents)
             return list(fired)
-
-
-def _atomic_write(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            f.write(content)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, path)
-        with suppress(PermissionError):
-            fd = os.open(str(path.parent), os.O_RDONLY)
-            try:
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-    except BaseException:
-        tmp_path.unlink(missing_ok=True)
-        raise
 
 
 @tool_parameters(
@@ -331,35 +270,13 @@ def _atomic_write(path: Path, content: str) -> None:
             "appear as a contiguous phrase; any group fires the intent.",
             max_items=MAX_GROUPS,
         ),
-        expires_in_s=IntegerSchema(
-            DEFAULT_INTENT_TTL_S,
-            description=f"Lifetime in seconds ({MIN_INTENT_TTL_S}-{MAX_INTENT_TTL_S}; "
-            f"default {DEFAULT_INTENT_TTL_S}).",
-            minimum=MIN_INTENT_TTL_S,
-            maximum=MAX_INTENT_TTL_S,
-            nullable=True,
-        ),
-        cooldown_s=IntegerSchema(
-            DEFAULT_COOLDOWN_S,
-            description="Minimum seconds between fires (default 3600).",
-            minimum=0,
-            maximum=MAX_COOLDOWN_S,
-            nullable=True,
-        ),
-        max_fires=IntegerSchema(
-            DEFAULT_MAX_FIRES,
-            description="Maximum number of fires before the intent exhausts (1-100).",
-            minimum=1,
-            maximum=MAX_FIRES,
-            nullable=True,
-        ),
         intent_id=StringSchema("intent id (from add/list) for cancel."),
         required=["action"],
         description=(
             "Create, list, or cancel event-conditioned reminders. The model "
             "translates natural language into explicit trigger terms; matching "
-            "itself is deterministic. Never ask for secrets. Triggers only fire "
-            "on trusted user text in the owner's session."
+            "itself is deterministic. Never ask for secrets. An intent fires at "
+            "most once, only on trusted user text in the owner's session."
         ),
     )
 )
@@ -378,7 +295,7 @@ class IntentTool(Tool, ContextAware):
             "Manage standing intents: 'when the user mentions X, remind them Y'. "
             "add/list/cancel. Matching is deterministic term matching on the "
             "user's own message; intents are scoped to the session/owner and "
-            "fire at most max_fires times with a cooldown. Never use for secrets."
+            "each fires at most once. Never use for secrets."
         )
 
     def __init__(self, *, workspace: Path | None = None):
@@ -404,10 +321,9 @@ class IntentTool(Tool, ContextAware):
     @staticmethod
     def _intent_line(intent: StandingIntent) -> str:
         groups = " OR ".join(" AND ".join(g) for g in intent.trigger_groups)
-        remaining = intent.max_fires - intent.fire_count
         return (
             f"- {intent.intent_id} | when: {groups} | remind: {intent.reminder} "
-            f"| fires left: {remaining} | status: {intent.status}"
+            f"| status: {intent.status}"
         )
 
     async def execute(
@@ -416,9 +332,6 @@ class IntentTool(Tool, ContextAware):
         reminder: str | None = None,
         trigger_terms: list[str] | None = None,
         trigger_groups: list[list[str]] | None = None,
-        expires_in_s: int | None = None,
-        cooldown_s: int | None = None,
-        max_fires: int | None = None,
         intent_id: str | None = None,
         **kwargs: Any,
     ) -> ToolResult:
@@ -441,16 +354,6 @@ class IntentTool(Tool, ContextAware):
                 return ToolResult.retryable_error("Error: trigger groups are empty.")
             if len(cleaned) > MAX_GROUPS or any(len(g) > MAX_TERMS_PER_GROUP for g in cleaned):
                 return ToolResult.retryable_error("Error: trigger group size out of bounds.")
-            ttl_s = expires_in_s if expires_in_s is not None else DEFAULT_INTENT_TTL_S
-            cooldown = cooldown_s if cooldown_s is not None else DEFAULT_COOLDOWN_S
-            fires = max_fires if max_fires is not None else DEFAULT_MAX_FIRES
-            if not (MIN_INTENT_TTL_S <= ttl_s <= MAX_INTENT_TTL_S):
-                return ToolResult.retryable_error("Error: expiry out of bounds.")
-            if not (0 <= cooldown <= MAX_COOLDOWN_S):
-                return ToolResult.retryable_error("Error: cooldown out of bounds.")
-            if not (1 <= fires <= MAX_FIRES):
-                return ToolResult.retryable_error("Error: max_fires out of bounds.")
-
             intent = store.add(
                 sender_id=self._sender_id,
                 channel=self._channel,
@@ -458,9 +361,6 @@ class IntentTool(Tool, ContextAware):
                 session_key=self._session_key,
                 trigger_groups=cleaned,
                 reminder=reminder.strip(),
-                ttl_ms=ttl_s * 1000,
-                cooldown_ms=cooldown * 1000,
-                max_fires=fires,
             )
             return ToolResult(
                 f"Standing intent added (id: {intent.intent_id}) — "

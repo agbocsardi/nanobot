@@ -42,9 +42,22 @@ def _subagents(records: list[dict], *, read_extra: dict | None = None):
     by_id = {r["task_id"]: dict(r) for r in records}
     if read_extra:
         by_id.update(read_extra)
+    def owned_record(task_id, *, session_key, sender_id=None):
+        record = by_id.get(task_id)
+        if record is None:
+            return None, "not_found"
+        origin = record.get("origin") or {}
+        if origin.get("session_key") != session_key:
+            return None, "not_owned"
+        rec_sender = origin.get("sender_id")
+        if sender_id is not None and rec_sender and str(rec_sender) != str(sender_id):
+            return None, "not_owned"
+        return record, None
+
     return SimpleNamespace(
         list_session_task_records=MagicMock(return_value=records),
         read_run_record=MagicMock(side_effect=lambda tid: by_id.get(tid)),
+        owned_record=MagicMock(side_effect=owned_record),
         cancel_task=AsyncMock(return_value="cancelled"),
         retry_task=AsyncMock(return_value=("created", "new9ab")),
         task_status_vocabulary=__import__(
@@ -59,7 +72,9 @@ def _ctx(loop, *, raw="/tasks", args="", sender="u1") -> CommandContext:
 
 
 @pytest.mark.asyncio
-async def test_tasks_lists_active_first_and_recent_terminal() -> None:
+async def test_tasks_lists_unified_newest_first() -> None:
+    # Live tasks now have durable records from spawn time, so /tasks is one
+    # flat newest-first list; the record order from the manager is preserved.
     subagents = _subagents([
         _record("t1", phase="queued", stop_reason=None, label="waiting job"),
         _record("t2", phase="completed", stop_reason="completed", label="done job"),
@@ -68,9 +83,9 @@ async def test_tasks_lists_active_first_and_recent_terminal() -> None:
     out = await cmd_tasks(_ctx(SimpleNamespace(subagents=subagents)))
 
     assert "## Tasks" in out.content
-    assert "t1" in out.content and "t3" in out.content
-    assert out.content.index("t1") < out.content.index("t2")  # active before terminal
-    assert out.content.index("t3") < out.content.index("t2")
+    assert "t1" in out.content and "t2" in out.content and "t3" in out.content
+    assert out.content.index("t1") < out.content.index("t2") < out.content.index("t3")
+    assert "recent:" not in out.content
 
 
 @pytest.mark.asyncio

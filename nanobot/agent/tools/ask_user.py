@@ -23,16 +23,13 @@ suspension/resumption of the model coroutine is out of scope.
 from __future__ import annotations
 
 import inspect
-import json
-import os
-import threading
 import time
 import uuid
-from contextlib import suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from nanobot.agent.tools._durable_store import DurableJsonStore
 from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
 from nanobot.agent.tools.context import ContextAware, RequestContext
 from nanobot.agent.tools.schema import (
@@ -47,6 +44,9 @@ from nanobot.bus.events import OutboundMessage
 QUESTION_CALLBACK_PREFIX = "pq:"
 # Maximum answer lifetime when the caller does not pass expires_in_s (seconds).
 DEFAULT_QUESTION_TTL_S = 900
+# Terminal rows (answered/expired) are kept briefly so duplicate callback taps
+# still get "Already answered."; anything older is pruned on every write.
+_RETAINED_TERMINAL_MS = 30 * 60 * 1000  # 30 minutes
 MIN_QUESTION_TTL_S = 30
 MAX_QUESTION_TTL_S = 86_400
 # Terminal tool status that stops the turn after a question is rendered.
@@ -60,27 +60,6 @@ _SECRET_HINTS = ("password", "secret", "token", "api key", "api_key", "apikey",
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
-
-
-def _atomic_write(path: Path, content: str) -> None:
-    """Write *content* atomically with fsync (tmp + os.replace + dir fsync)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            f.write(content)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, path)
-        with suppress(PermissionError):
-            fd = os.open(str(path.parent), os.O_RDONLY)
-            try:
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-    except BaseException:
-        tmp_path.unlink(missing_ok=True)
-        raise
 
 
 def question_callback_value(question_id: str, option_id: str) -> str:
@@ -112,7 +91,7 @@ class PendingQuestion:
     options: list[dict[str, str]]  # [{"id": "a", "label": "..."}]
     created_at_ms: int
     expires_at_ms: int
-    status: str = "pending"  # pending | answered | cancelled | expired
+    status: str = "pending"  # pending | answered | expired
     selected_option_id: str | None = None
     answered_at_ms: int | None = None
     answered_by: str | None = None
@@ -131,49 +110,43 @@ class PendingQuestion:
 class PendingQuestionStore:
     """Durable, atomic question log under ``workspace/pending_questions.json``.
 
-    Every transition is a fresh read-modify-write under a process lock so two
-    callbacks (or a callback racing a tool call) cannot double-answer. The
-    file is the source of truth; a corrupt store is preserved with a
-    ``.corrupt-<ts>`` suffix instead of being silently overwritten.
+    Every transition is a fresh read-modify-write under the shared store lock
+    so two callbacks (or a callback racing a tool call) cannot double-answer.
+    The file is the source of truth; corrupt input degrades to an empty store
+    and terminal rows are pruned on every write so the log stays bounded.
     """
 
     def __init__(self, workspace: Path | None = None):
-        self._path = (workspace or Path(".")) / "pending_questions.json"
-        self._lock = threading.Lock()
+        self._store = DurableJsonStore(
+            (workspace or Path(".")) / "pending_questions.json", "questions"
+        )
 
     @property
     def path(self) -> Path:
-        return self._path
+        return self._store.path
 
-    def _read(self) -> list[PendingQuestion]:
-        if not self._path.exists():
-            return []
-        data = json.loads(self._path.read_text(encoding="utf-8"))
-        questions = data.get("questions", []) if isinstance(data, dict) else data
-        result: list[PendingQuestion] = []
-        for item in questions:
-            if isinstance(item, dict):
-                options = item.get("options") or []
-                item["options"] = [dict(o) for o in options if isinstance(o, dict)]
-                result.append(PendingQuestion(**item))
-        return result
-
-    def _load_questions(self) -> list[PendingQuestion]:
-        try:
-            return self._read()
-        except (OSError, json.JSONDecodeError, TypeError):
-            # Preserve the corrupt file for recovery instead of overwriting it.
-            backup = self._path.with_suffix(self._path.suffix + f".corrupt-{int(time.time())}")
-            with suppress(OSError):
-                self._path.rename(backup)
-            return []
+    def _load(self) -> list[PendingQuestion]:
+        questions: list[PendingQuestion] = []
+        for item in self._store.load():
+            options = [dict(o) for o in (item.get("options") or []) if isinstance(o, dict)]
+            item["options"] = options
+            try:
+                questions.append(PendingQuestion(**item))
+            except (TypeError, ValueError):
+                continue
+        return questions
 
     def _write(self, questions: list[PendingQuestion]) -> None:
-        _atomic_write(
-            self._path,
-            json.dumps({"version": 1, "questions": [asdict(q) for q in questions]},
-                       indent=2, ensure_ascii=False),
-        )
+        # Keep terminal rows only inside a short retention window (duplicate
+        # taps keep answering "Already answered."), prune the rest on every
+        # write so the log stays bounded.
+        now = _now_ms()
+        keep = [
+            q for q in questions
+            if q.status == "pending"
+            or now - (q.answered_at_ms or q.expires_at_ms or q.created_at_ms) < _RETAINED_TERMINAL_MS
+        ]
+        self._store.write([asdict(q) for q in keep])
 
     def create(
         self,
@@ -201,8 +174,8 @@ class PendingQuestionStore:
             created_at_ms=now,
             expires_at_ms=expires_at_ms or (now + DEFAULT_QUESTION_TTL_S * 1000),
         )
-        with self._lock:
-            questions = self._load_questions()
+        with self._store.lock:
+            questions = self._load()
             questions.append(question)
             self._write(questions)
         return question
@@ -219,29 +192,25 @@ class PendingQuestionStore:
     ) -> tuple[bool, PendingQuestion | None]:
         """Atomically claim one answer. Returns ``(claimed, question)``.
 
-        ``claimed`` is False (and the question's status updated) when the
-        question is missing, expired, cancelled, already answered, or the
-        answer comes from a different channel/chat/sender.
+        One status-then-scope gate: pending -> expiry -> reach -> option.
+        ``claimed`` is False when the question is missing, expired, answered,
+        unreachable from this channel/chat/sender, or the option is unknown.
         """
         now = now_ms if now_ms is not None else _now_ms()
-        with self._lock:
-            questions = self._load_questions()
+        with self._store.lock:
+            questions = self._load()
             question = next((q for q in questions if q.question_id == question_id), None)
             if question is None:
                 return False, None
-            if question.channel != channel or str(question.chat_id) != str(chat_id):
-                return False, question
-            if str(question.sender_id or "") != str(sender_id or ""):
-                return False, question
-            if question.status == "expired":
-                return False, question
-            if question.status == "cancelled":
-                return False, question
-            if question.status == "answered":
+            if question.status != "pending":
                 return False, question
             if question.expired(now):
                 question.status = "expired"
                 self._write(questions)
+                return False, question
+            if question.channel != channel or str(question.chat_id) != str(chat_id):
+                return False, question
+            if str(question.sender_id or "") != str(sender_id or ""):
                 return False, question
             if option_id not in {o["id"] for o in question.options}:
                 return False, question
@@ -251,30 +220,6 @@ class PendingQuestionStore:
             question.answered_by = str(sender_id)
             self._write(questions)
             return True, question
-
-    def cancel(self, question_id: str) -> bool:
-        with self._lock:
-            questions = self._load_questions()
-            question = next((q for q in questions if q.question_id == question_id), None)
-            if question is None or question.status != "pending":
-                return False
-            question.status = "cancelled"
-            self._write(questions)
-            return True
-
-    def expire_overdue(self, now_ms: int | None = None) -> int:
-        """Mark overdue pending questions as expired; returns how many changed."""
-        now = now_ms if now_ms is not None else _now_ms()
-        with self._lock:
-            questions = self._load_questions()
-            changed = 0
-            for question in questions:
-                if question.status == "pending" and question.expired(now):
-                    question.status = "expired"
-                    changed += 1
-            if changed:
-                self._write(questions)
-            return changed
 
 
 def _build_question_text(question: PendingQuestion) -> str:
@@ -304,11 +249,6 @@ def _build_question_text(question: PendingQuestion) -> str:
             "default 900). No default answer is chosen on expiry.",
             minimum=MIN_QUESTION_TTL_S,
             maximum=MAX_QUESTION_TTL_S,
-            nullable=True,
-        ),
-        cancel_question_id=StringSchema(
-            "Explicitly cancel a previously asked question id (instead of "
-            "asking a new one). When set, 'question' and 'options' are ignored.",
             nullable=True,
         ),
         required=["question", "options"],
@@ -374,21 +314,8 @@ class AskUserTool(Tool, ContextAware):
         question: str,
         options: list[str],
         expires_in_s: int | None = None,
-        cancel_question_id: str | None = None,
         **kwargs: Any,
     ) -> ToolResult:
-        if cancel_question_id:
-            cancelled = self._store().cancel(cancel_question_id)
-            if not cancelled:
-                return ToolResult.retryable_error(
-                    f"Error: question {cancel_question_id!r} is not pending."
-                )
-            return ToolResult(
-                f"Cancelled question {cancel_question_id}.",
-                data={"cancelled_question_id": cancel_question_id},
-                side_effects=[{"kind": "question_cancelled", "question_id": cancel_question_id}],
-                postcondition="checked",
-            )
         if not self._channel or not self._chat_id:
             return ToolResult.retryable_error(
                 "Error: ask_user requires an interactive chat turn."

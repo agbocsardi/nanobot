@@ -805,7 +805,15 @@ class TestCancelBySession:
 
         sm.runner.run = _slow_run
         sm._announce_result = AsyncMock()
-        with patch.object(sm, "_write_run_record") as write_record:
+        # Snapshot phases at call time: the status object is mutated in place
+        # afterwards, so inspecting the captured args later would show the
+        # terminal phase for every call.
+        phases: list[str] = []
+
+        def _capture(_tid, _task, _label, _origin, _temp, _scope, _result, status, **_kw):
+            phases.append(status.phase)
+
+        with patch.object(sm, "_write_run_record", side_effect=_capture):
             await sm.spawn("running", session_key="s1")
             await sm.spawn("queued", session_key="s1")
             await asyncio.sleep(0)
@@ -814,10 +822,10 @@ class TestCancelBySession:
             assert sm.get_queued_count() == 1
             assert await sm.cancel_by_session("s1") == 2
 
-        recorded_statuses = [call.args[7] for call in write_record.call_args_list]
-        assert len(recorded_statuses) == 2
-        assert all(status.phase == "cancelled" for status in recorded_statuses)
-        assert all(status.stop_reason == "cancelled" for status in recorded_statuses)
+        # Durable records exist from spawn time (queued/running) and are
+        # overwritten with terminal state; cancellation lands as cancelled.
+        assert len(phases) == 4  # 2 spawn-time + 2 terminal
+        assert sorted(phases) == ["cancelled", "cancelled", "queued", "running"]
 
 
 # ---------------------------------------------------------------------------
