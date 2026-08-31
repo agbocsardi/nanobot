@@ -372,22 +372,20 @@ Minimal restoration plan:
 - [ ] M0. Document current memory architecture and Letta/MemFS target model.
 - [ ] M1. Restore Dream safeguards without restoring the old class: config-wired batch size, Dream-specific model, Dream-specific max iterations, timeout, changed-file/diff limits, and rollback-on-incomplete.
   - [x] M1a. Rewire `max_batch_size`, `model_override`, `max_iterations`, and 300s timeout into current single-phase Dream path.
-  - [ ] M1b. Add changed-file/diff limits.
-    - Add `dream.max_changed_files` (suggested default: 8).
-    - Add `dream.max_diff_chars` (suggested default: 32,000).
-    - After Dream returns `completed`, inspect git diff for tracked memory surfaces before auto-commit.
-    - If the diff is too broad, treat the run as incomplete: do not commit and do not advance cursor.
-    - Count only memory-owned surfaces: `SOUL.md`, `USER.md`, `memory/**/*.md`, `skills/**/SKILL.md`.
-    - Add tests for successful small diff, too many files, and too-large diff.
-  - [ ] M1c. Add rollback-on-incomplete.
-    - Before Dream starts, snapshot memory working tree state.
-    - If Dream times out, raises, hits max iterations, or violates diff limits, restore the pre-Dream state.
-    - First implementation can require a clean memory git state before Dream and use `git restore`/dulwich checkout for tracked memory files plus removal of new untracked memory files.
-    - Better later implementation: run Dream in a temporary git worktree/branch and merge only validated commits.
-    - Add tests that incomplete Dream leaves memory files unchanged and cursor unchanged.
-  - [ ] M1d. Add observability.
-    - Log Dream model, batch size, max iterations, timeout, stop reason, changed files, and diff size.
-    - Include incomplete reason in Dream session metadata or commit/log output.
+  - [x] M1b. Add changed-file/diff limits.
+    - `dream.max_changed_files` (default 8) and `dream.max_diff_chars` (default 32,000) added to `DreamConfig` (camelCase aliases automatic).
+    - After Dream returns `completed`, `MemoryStore.run_dream` measures the delta over memory-owned surfaces (`SOUL.md`, `USER.md`, `memory/**/*.md`, `skills/**/SKILL.md`) before auto-commit.
+    - Too broad a diff (file count or char size) is treated as incomplete: no commit, no cursor advance, rollback.
+    - Tests: successful small diff, exactly-at-limit, too many files, too-large diff.
+  - [x] M1c. Add rollback-on-incomplete.
+    - `run_dream` snapshots the memory surfaces + git-tracked files byte-for-byte before the run.
+    - Timeout, exception, unexpected stop reason (incl. `max_iterations`), or M1b violations restore the pre-run bytes and remove newly created surface files; the cursor is restored too.
+    - Byte snapshot doubles as the no-git fallback (no git repo needed).
+    - Better later implementation still open: run Dream in a temporary git worktree/branch and merge only validated commits.
+    - Tests: timeout, exception, max-iterations, untracked-new-file removal, pre-existing dirty file survival, previous-cursor restoration, and no-git workspace rollback.
+  - [x] M1d. Add observability.
+    - `DreamRunResult` + `_log_dream_outcome` record model, batch size, max iterations, timeout, stop reason, changed files, diff chars, cursor, commit on success and every incomplete path.
+    - Incomplete reason lands in `resp.metadata["_dream_run"]` and (when a session manager is provided) the Dream session file metadata `_last_dream_run`.
 - [ ] M2. Change Dream trigger policy from pure cron to hybrid turn-count + idle timer + manual, with compaction as optional extra.
 - [ ] M3. Add `/remember` for targeted memory writes and `/memory status|diff|backup|tokens` command surface.
 - [ ] M4. Split Dream and Defrag responsibilities in prompts/tools: Dream = recent deltas; Defrag/Doctor = reorganization.
@@ -429,3 +427,12 @@ Minimal restoration plan:
 - Verification before merge: import sanity passed, `uv run nanobot --help` no longer showed API/WebUI commands, and 306 targeted tests passed. Known pre-existing stale failure remains: `tests/agent/test_auto_compact.py::TestAutoCompactEdgeCases::test_auto_compact_with_nothing_summary`.
 - Completed branch-model switch locally: `main` now tracks `origin/main` as the independent fork line. `upstream/main` remains fetch-only reference for future manual scar-raiding; no upstream tracking/merging on fork `main`.
 - Deferred the workspace exact-file allowlist arc as not load-bearing for current needs; Dream M1a limits and planned rollback/diff guards cover the realistic runaway-Dream failure mode.
+
+### 2026-08-31
+
+- Implemented Dream guardrails M1b (diff limits), M1c (rollback-on-incomplete), and M1d (observability) on `feat/dream-guardrails` (worktree `fork-nanobot-dg`, uncommitted).
+- Added `dream.maxChangedFiles` (default 8) and `dream.maxDiffChars` (default 32,000) to `DreamConfig`; camelCase aliases come from the shared `Base` alias generator.
+- New `MemoryStore.run_dream(...)` orchestrates the single-phase Dream path: build prompt → byte-snapshot the memory surfaces + git-tracked files (incl. `.dream_cursor`) → run (with `asyncio.wait_for` timeout) → validate stop reason → measure surface delta (changed files + diff char count over `SOUL.md`, `USER.md`, `memory/**/*.md`, `skills/**/SKILL.md`) → commit + advance cursor only when fully validated; otherwise roll back byte-for-byte and remove newly created surface files.
+- Wired both call sites: the cron `dream` job (`nanobot/cli/commands.py`) and manual `/dream` (`nanobot/command/builtin.py`, now also honoring the configured limits via `loop.dream_config`). Manual runs now apply max iterations/timeout and no longer commit incomplete runs.
+- Observability: `DreamRunResult` carries reason/stop reason/changed files/diff chars/commit/elapsed; logged on every outcome; incomplete reason recorded in `resp.metadata["_dream_run"]` and the Dream session file's `_last_dream_run` metadata.
+- Tests added: `tests/agent/test_dream_guardrails.py` (16) and `tests/config/test_dream_config.py` (3 new). Verification: `tests/config/`, `tests/agent/test_dream*.py`, `tests/agent/test_memory_store.py`, `tests/agent/test_git_store.py`, `tests/command/test_builtin_dream.py`, `tests/agent/test_context_prompt_cache.py`, `tests/agent/test_auto_compact*.py`, `tests/agent/test_run_presets_wiring.py`, `tests/cron/test_cron_tool_list.py`, `tests/agent/tools/test_memory_search.py`, `tests/agent/tools/test_self_tool.py` all pass; ruff clean. Not committed.

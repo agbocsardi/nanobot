@@ -89,11 +89,16 @@ decouples chat channels from the agent core:
 
 These are fork additions/forks-from-upstream, not part of stock HKUDS nanobot.
 
-- **Dream safeguards (M1a).** Dream honors `dream.max_batch_size`,
+- **Dream safeguards (M1a–M1d).** Dream honors `dream.max_batch_size`,
   `dream.max_iterations` (Dream-specific, not the chat iteration budget),
-  `dream.model_override`, and `dream.timeout_s` (default 300s). Incomplete or
-  timed-out Dream runs no longer auto-commit. Remaining hardening (diff-size
-  cap, rollback-on-incomplete, observability) is tracked in the TODO.
+  `dream.model_override`, `dream.timeout_s` (default 300s), plus the M1b
+  limits `dream.max_changed_files` (default 8) and `dream.max_diff_chars`
+  (default 32,000). Incomplete or timed-out Dream runs no longer auto-commit;
+  `MemoryStore.run_dream` snapshots the memory surfaces before the run and
+  rolls back byte-for-byte (timeout, exception, max iterations, or diff-limit
+  violations), and logs model/limits/stop reason/changed files/diff size on
+  every outcome. Remaining hardening (worktree-based Dream execution) is
+  tracked in the TODO.
 - **Session token usage tracking.** Each completed turn accumulates usage into
   `session.metadata["usage"]` with a per-provider/model breakdown
   (`usage["by_model"]["provider/model"]`). When a session is archived into

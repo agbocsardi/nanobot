@@ -67,6 +67,15 @@ class GitStore:
                     files.append(rel)
         return files
 
+    def tracked_files(self) -> list[str]:
+        """All currently tracked memory files (static list + live glob expansion).
+
+        Public wrapper used by the Dream guardrail snapshot so it can restore
+        tracked files (e.g. ``memory/.dream_cursor``) without reaching into
+        git internals.
+        """
+        return self._current_tracked_files()
+
     def is_initialized(self) -> bool:
         """Check if the git repo has been initialized."""
         return (self._workspace / ".git").is_dir()

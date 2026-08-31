@@ -49,3 +49,28 @@ def test_dream_config_uses_model_override_name_and_accepts_legacy_model() -> Non
     assert cfg.model_override == "openrouter/sonnet"
     assert dumped["modelOverride"] == "openrouter/sonnet"
     assert "model" not in dumped
+
+
+def test_dream_config_guardrail_limits_defaults() -> None:
+    cfg = DreamConfig()
+
+    assert cfg.max_changed_files == 8
+    assert cfg.max_diff_chars == 32_000
+
+
+def test_dream_config_accepts_camel_case_guardrail_aliases() -> None:
+    cfg = DreamConfig.model_validate({"maxChangedFiles": 4, "maxDiffChars": 500})
+
+    assert cfg.max_changed_files == 4
+    assert cfg.max_diff_chars == 500
+    dumped = cfg.model_dump(by_alias=True)
+    assert dumped["maxChangedFiles"] == 4
+    assert dumped["maxDiffChars"] == 500
+
+
+def test_dream_config_back_compatible_defaults_for_old_configs() -> None:
+    # A config written before the guardrail fields existed still parses.
+    cfg = DreamConfig.model_validate({"intervalH": 3, "maxBatchSize": 10})
+
+    assert cfg.max_changed_files == 8
+    assert cfg.max_diff_chars == 32_000
