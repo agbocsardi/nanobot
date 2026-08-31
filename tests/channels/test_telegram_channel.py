@@ -1,4 +1,5 @@
 import asyncio
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,11 +16,13 @@ except ImportError:
 from nanobot.bus.events import OUTBOUND_META_REACTION, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.telegram import (
+    TELEGRAM_RECOVERY_BACKOFF_INITIAL,
     TELEGRAM_REPLY_CONTEXT_MAX_LEN,
     TelegramChannel,
     TelegramConfig,
     _markdown_to_telegram_html,
     _split_telegram_markdown,
+    _StallWatchBot,
     _StreamBuf,
 )
 
@@ -59,6 +62,10 @@ class _FakeBot:
         self.sent_messages: list[dict] = []
         self.sent_media: list[dict] = []
         self.get_me_calls = 0
+        self.shutdown_calls = 0
+
+    async def shutdown(self) -> None:
+        self.shutdown_calls += 1
 
     async def get_me(self):
         self.get_me_calls += 1
@@ -128,9 +135,18 @@ class _FakeBuilder:
         self.token_value = None
         self.request_value = None
         self.get_updates_request_value = None
+        self.bot_value = None
 
     def token(self, token: str):
         self.token_value = token
+        return self
+
+    def bot(self, bot):
+        # Mirrors the real builder: supplying a bot instance means token() and
+        # per-request endpoints are no longer allowed.
+        if self.token_value is not None:
+            raise RuntimeError("You must either pass a bot instance or a token")
+        self.bot_value = bot
         return self
 
     def request(self, request):
@@ -273,8 +289,9 @@ async def test_start_creates_separate_pools_with_proxy(monkeypatch) -> None:
     assert poll_req.kwargs["proxy"] == config.proxy
     assert api_req.kwargs["connection_pool_size"] == 32
     assert poll_req.kwargs["connection_pool_size"] == 4
-    assert builder.request_value is api_req
-    assert builder.get_updates_request_value is poll_req
+    # The watchdog bot carries both pools; the builder gets the bot instance.
+    assert isinstance(builder.bot_value, _StallWatchBot)
+    assert builder.bot_value._request == (poll_req, api_req)
     assert callable(app.updater.start_polling_kwargs["error_callback"])
     assert any(cmd.command == "status" for cmd in app.bot.commands)
     assert any(cmd.command == "history" for cmd in app.bot.commands)
@@ -312,6 +329,8 @@ async def test_start_respects_custom_pool_config(monkeypatch) -> None:
     assert api_req.kwargs["connection_pool_size"] == 32
     assert api_req.kwargs["pool_timeout"] == 10.0
     assert poll_req.kwargs["pool_timeout"] == 10.0
+    assert isinstance(builder.bot_value, _StallWatchBot)
+    assert builder.bot_value._request == (poll_req, api_req)
 
 
 def test_webhook_config_requires_https_url_and_secret() -> None:
@@ -364,6 +383,7 @@ async def test_start_webhook_mode(monkeypatch) -> None:
 
     await channel.start()
 
+    assert isinstance(builder.bot_value, _StallWatchBot)
     assert app.updater.start_polling_kwargs is None
     assert app.updater.start_webhook_kwargs == {
         "listen": "127.0.0.1",
@@ -2908,3 +2928,397 @@ async def test_callback_query_ignores_unauthorized_user_before_side_effects() ->
     query.answer.assert_not_awaited()
     query.message.edit_reply_markup.assert_not_awaited()
     channel._handle_message.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Polling stall recovery: watchdog bot, supervisor, backoff, invalid token
+# ---------------------------------------------------------------------------
+
+
+class _FakeLogger:
+    """Records loguru-style calls made through ``channel.logger``."""
+
+    def __init__(self) -> None:
+        self.errors: list[tuple] = []
+        self.warnings: list[tuple] = []
+        self.debugs: list[tuple] = []
+
+    def error(self, msg: str, *args) -> None:
+        self.errors.append((msg, args))
+
+    def warning(self, msg: str, *args) -> None:
+        self.warnings.append((msg, args))
+
+    def debug(self, msg: str, *args) -> None:
+        self.debugs.append((msg, args))
+
+
+class _FakePollPool:
+    """Minimal request-pool stand-in for exercising Bot.get_updates offline."""
+
+    read_timeout = 5.0
+
+    def __init__(self, result=None, exc=None) -> None:
+        self._result = result if result is not None else []
+        self._exc = exc
+
+    async def post(self, **kwargs):
+        if self._exc is not None:
+            raise self._exc
+        return self._result
+
+
+@pytest.mark.asyncio
+async def test_watchdog_bot_stamps_completion_on_success_and_exception() -> None:
+    """Every getUpdates round trip stamps the channel timestamp, success or failure."""
+    from telegram.error import NetworkError
+
+    stamps: list[float] = []
+
+    ok_bot = _StallWatchBot(
+        token="123:abc",
+        request=object(),
+        get_updates_request=_FakePollPool(result=[]),
+        on_get_updates_done=lambda: stamps.append(time.monotonic()),
+    )
+    await ok_bot.get_updates()
+    assert len(stamps) == 1
+
+    failing_bot = _StallWatchBot(
+        token="123:abc",
+        request=object(),
+        get_updates_request=_FakePollPool(exc=NetworkError("connection reset")),
+        on_get_updates_done=lambda: stamps.append(time.monotonic()),
+    )
+    with pytest.raises(NetworkError):
+        await failing_bot.get_updates()
+    assert len(stamps) == 2  # an exception also finishes the round trip
+
+
+@pytest.mark.asyncio
+async def test_builder_receives_watchdog_bot_with_both_pools(monkeypatch) -> None:
+    """_build_app injects the watchdog via builder.bot(), not builder.token()."""
+    _FakeHTTPXRequest.clear()
+    config = TelegramConfig(enabled=True, token="123:abc", allow_from=["*"])
+    channel = TelegramChannel(config, MessageBus())
+    app = _FakeApp(lambda: None)
+    builder = _FakeBuilder(app)
+
+    monkeypatch.setattr("nanobot.channels.telegram.HTTPXRequest", _FakeHTTPXRequest)
+    monkeypatch.setattr(
+        "nanobot.channels.telegram.Application",
+        SimpleNamespace(builder=lambda: builder),
+    )
+
+    built = channel._build_app()
+
+    assert built is app
+    assert builder.token_value is None  # bot instance wins over token
+    assert isinstance(builder.bot_value, _StallWatchBot)
+    api_req, poll_req = _FakeHTTPXRequest.instances
+    assert builder.bot_value._request == (poll_req, api_req)
+    assert channel._app is app
+
+
+@pytest.mark.asyncio
+async def test_supervisor_recovers_after_stall_once(monkeypatch) -> None:
+    """A stale getUpdates timestamp triggers exactly one teardown+rebuild."""
+    monkeypatch.setattr("nanobot.channels.telegram.TELEGRAM_POLL_WATCH_INTERVAL", 0.0)
+    config = TelegramConfig(enabled=True, token="123:abc", allow_from=["*"])
+    channel = TelegramChannel(config, MessageBus())
+
+    rebuilt = 0
+    teardowns = 0
+    real_teardown = channel._teardown_app
+
+    async def tracked_teardown() -> None:
+        nonlocal teardowns
+        teardowns += 1
+        await real_teardown()
+
+    async def fake_start_app() -> None:
+        # One recovery of a stalled app: rebuild, then stop the supervisor.
+        nonlocal rebuilt
+        rebuilt += 1
+        channel._app = _FakeApp(lambda: None)
+        channel._last_get_updates_finished_at = time.monotonic()
+        channel._running = False
+
+    channel._start_app = fake_start_app
+    channel._teardown_app = tracked_teardown
+    channel._running = True
+    channel._last_get_updates_finished_at = time.monotonic() - 10_000  # stalled
+    channel._recovery_backoff = 0.0
+
+    await channel._supervise_polling()
+
+    assert rebuilt == 1
+    assert teardowns == 1
+    assert channel._recovering is False
+    assert channel._recovery_backoff == TELEGRAM_RECOVERY_BACKOFF_INITIAL
+
+
+@pytest.mark.asyncio
+async def test_healthy_polls_do_not_trigger_recovery(monkeypatch) -> None:
+    """Fresh round-trip stamps keep the supervisor idle."""
+    monkeypatch.setattr("nanobot.channels.telegram.TELEGRAM_POLL_WATCH_INTERVAL", 0.0)
+    config = TelegramConfig(enabled=True, token="123:abc", allow_from=["*"])
+    channel = TelegramChannel(config, MessageBus())
+    channel._running = True
+    channel._app = _FakeApp(lambda: None)
+    channel._last_get_updates_finished_at = time.monotonic()  # healthy
+
+    rebuilt = 0
+    async def fake_start_app() -> None:
+        nonlocal rebuilt
+        rebuilt += 1
+    channel._start_app = fake_start_app
+
+    ticks = 0
+    real_needs = channel._needs_recovery
+
+    def counting_needs() -> bool:
+        nonlocal ticks
+        ticks += 1
+        if ticks >= 3:
+            channel._running = False
+        return real_needs()
+    channel._needs_recovery = counting_needs
+
+    await channel._supervise_polling()
+
+    assert ticks >= 3
+    assert rebuilt == 0  # never recovered
+
+
+@pytest.mark.asyncio
+async def test_polling_error_request_schedules_single_recovery(monkeypatch) -> None:
+    """Network-class polling errors request recovery; the supervisor performs one."""
+    from telegram.error import NetworkError
+
+    monkeypatch.setattr("nanobot.channels.telegram.TELEGRAM_POLL_WATCH_INTERVAL", 0.0)
+    config = TelegramConfig(enabled=True, token="123:abc", allow_from=["*"])
+    channel = TelegramChannel(config, MessageBus())
+    logger = _FakeLogger()
+    channel.logger = logger
+
+    rebuilt = 0
+    async def fake_start_app() -> None:
+        nonlocal rebuilt
+        rebuilt += 1
+        channel._app = _FakeApp(lambda: None)
+        channel._last_get_updates_finished_at = time.monotonic()
+        channel._running = False
+    channel._start_app = fake_start_app
+    channel._running = True
+    channel._recovery_backoff = 0.0
+
+    channel._on_polling_error(NetworkError("connection reset"))
+
+    assert channel._recovery_requested is True
+    # Logged via loguru at error level with the exception class attached.
+    assert len(logger.errors) == 1
+    msg, args = logger.errors[0]
+    assert "polling error" in msg
+    assert args[1] == "NetworkError"
+
+    await channel._supervise_polling()
+
+    assert rebuilt == 1
+    assert channel._recovery_requested is False
+
+
+@pytest.mark.asyncio
+async def test_invalid_token_on_polling_error_marks_failed_without_recovery() -> None:
+    """InvalidToken in the polling error callback fails the channel; no retry."""
+    from telegram.error import InvalidToken
+
+    config = TelegramConfig(enabled=True, token="123:abc", allow_from=["*"])
+    channel = TelegramChannel(config, MessageBus())
+    logger = _FakeLogger()
+    channel.logger = logger
+    channel._running = True
+
+    channel._on_polling_error(
+        InvalidToken("The token `123:abc` was rejected by the server.")
+    )
+
+    assert channel._failed is True
+    assert channel._running is False
+    assert channel._recovery_requested is False
+    assert len(logger.errors) == 1
+    msg, args = logger.errors[0]
+    assert "polling error" in msg
+    # The token must never reach the log.
+    assert "123:abc" not in msg and all("123:abc" not in str(a) for a in args)
+
+
+@pytest.mark.asyncio
+async def test_invalid_token_at_startup_fails_channel_without_retry(monkeypatch) -> None:
+    """A rejected token during startup fails the channel; no retry loop."""
+    from telegram.error import InvalidToken
+
+    config = TelegramConfig(enabled=True, token="123:abc", allow_from=["*"])
+    channel = TelegramChannel(config, MessageBus())
+    logger = _FakeLogger()
+    channel.logger = logger
+
+    startup_calls = 0
+
+    async def fake_start_app() -> None:
+        nonlocal startup_calls
+        startup_calls += 1
+        raise InvalidToken("The token `123:abc` was rejected by the server.")
+
+    channel._start_app = fake_start_app
+
+    with pytest.raises(RuntimeError, match="token") as excinfo:
+        await channel.start()
+
+    assert startup_calls == 1  # no retry
+    assert channel._failed is True
+    assert channel._running is False
+    assert channel._app is None
+    assert "123:abc" not in str(excinfo.value)
+    assert len(logger.errors) == 1
+    msg, args = logger.errors[0]
+    assert "123:abc" not in msg and all("123:abc" not in str(a) for a in args)
+
+
+@pytest.mark.asyncio
+async def test_transient_startup_failure_retries_with_backoff(monkeypatch) -> None:
+    """Transient startup errors keep the channel running and back off between retries."""
+    from telegram.error import NetworkError
+
+    monkeypatch.setattr("nanobot.channels.telegram.TELEGRAM_POLL_WATCH_INTERVAL", 0.0)
+    config = TelegramConfig(enabled=True, token="123:abc", allow_from=["*"])
+    channel = TelegramChannel(config, MessageBus())
+
+    attempts = 0
+
+    async def fake_start_app() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise NetworkError("connect failed")
+        channel._app = _FakeApp(lambda: None)
+        channel._last_get_updates_finished_at = time.monotonic()
+        channel._running = False
+
+    channel._start_app = fake_start_app
+    channel._running = True
+    channel._last_get_updates_finished_at = None  # never completed a round trip
+    channel._recovery_backoff = 0.0
+
+    await channel._supervise_polling()
+
+    assert attempts == 3
+    # Backoff resets after a successful rebuild.
+    assert channel._recovery_backoff == TELEGRAM_RECOVERY_BACKOFF_INITIAL
+
+
+@pytest.mark.asyncio
+async def test_recovery_backoff_doubles_and_caps() -> None:
+    """Failed recoveries double the delay, capped at the maximum."""
+    from telegram.error import NetworkError
+
+    config = TelegramConfig(enabled=True, token="123:abc", allow_from=["*"])
+    channel = TelegramChannel(config, MessageBus())
+
+    async def no_sleep(seconds: float) -> None:
+        pass
+
+    async def failing_start() -> None:
+        raise NetworkError("connect failed")
+
+    channel._start_app = failing_start
+    channel._idle = no_sleep
+    channel._running = True
+
+    channel._recovery_backoff = 1.0
+    await channel._recover()
+    assert channel._recovery_backoff == 2.0
+    await channel._recover()
+    assert channel._recovery_backoff == 4.0
+
+    channel._recovery_backoff = 32.0
+    await channel._recover()
+    assert channel._recovery_backoff == 60.0  # capped (min(64, 60))
+
+    # Still running: transient failures must not mark the channel as failed.
+    assert channel._running is True
+    assert channel._failed is False
+
+
+@pytest.mark.asyncio
+async def test_terminal_recovery_failure_marks_channel_failed() -> None:
+    """Non-transient recovery errors (bad proxy, bound port) fail the channel."""
+    config = TelegramConfig(enabled=True, token="123:abc", allow_from=["*"])
+    channel = TelegramChannel(config, MessageBus())
+
+    async def no_sleep(seconds: float) -> None:
+        pass
+
+    async def bad_start() -> None:
+        raise ValueError("Unknown scheme for proxy URL")
+
+    channel._start_app = bad_start
+    channel._idle = no_sleep
+    channel._running = True
+    channel._recovery_backoff = 0.0
+
+    await channel._recover()
+
+    assert channel._failed is True
+    assert channel._running is False
+    assert channel._app is None
+
+
+@pytest.mark.asyncio
+async def test_recovery_is_single_flight() -> None:
+    """A second recovery attempt is skipped while one is in flight."""
+    config = TelegramConfig(enabled=True, token="123:abc", allow_from=["*"])
+    channel = TelegramChannel(config, MessageBus())
+    channel._running = True
+
+    rebuilds = 0
+    async def fake_start_app() -> None:
+        nonlocal rebuilds
+        rebuilds += 1
+    channel._start_app = fake_start_app
+
+    # Simulate a recovery already in flight (e.g. triggered by the watchdog).
+    channel._recovering = True
+    channel._recovery_backoff = 0.0
+    await channel._recover()
+
+    assert rebuilds == 0
+    assert channel._recovering is True  # the in-flight recovery owns the flag
+
+
+@pytest.mark.asyncio
+async def test_stop_cancels_supervisor_and_tears_down_app() -> None:
+    """stop() landing mid-recovery cancels the supervisor and leaks nothing."""
+    config = TelegramConfig(enabled=True, token="123:abc", allow_from=["*"])
+    channel = TelegramChannel(config, MessageBus())
+    channel._running = True
+    channel._last_get_updates_finished_at = time.monotonic() - 10_000  # stalled
+    channel._recovery_backoff = 0.0
+
+    started = asyncio.Event()
+
+    async def slow_start() -> None:
+        # Mid-startup hang: the app exists but never finishes starting.
+        channel._app = _FakeApp(lambda: None)
+        started.set()
+        await asyncio.sleep(30)
+
+    channel._start_app = slow_start
+    channel._supervisor = asyncio.create_task(channel._supervise_polling())
+    await started.wait()
+    assert channel._recovering is True
+
+    await channel.stop()
+
+    assert channel._app is None  # torn down, not leaked
+    assert channel._supervisor is None
