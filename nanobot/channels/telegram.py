@@ -6,6 +6,7 @@ import asyncio
 import re
 import time
 import unicodedata
+from collections import deque
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
@@ -50,6 +51,9 @@ TELEGRAM_MAX_MESSAGE_LEN = 4000  # Telegram message character limit
 # boundary so the final rendered message never overflows.
 TELEGRAM_HTML_MAX_LEN = 4096
 TELEGRAM_REPLY_CONTEXT_MAX_LEN = TELEGRAM_MAX_MESSAGE_LEN  # Max length for reply context in user message
+# Bounded rolling buffer of reply-context observations for runtime diagnostics.
+# Records only flags/lengths/ids — never raw message content.
+TELEGRAM_REPLY_OBSERVATION_LIMIT = 100
 
 
 def _split_telegram_markdown(content: str, max_len: int) -> list[str]:
@@ -460,6 +464,10 @@ class TelegramChannel(BaseChannel):
         self._inbound_buffers: dict[str, list[_QueuedTelegramUpdate]] = {}
         self._inbound_workers: dict[str, asyncio.Task] = {}
         self._rich_send_disabled: bool = False  # Latch off if Bot API < 10.1
+        self._reply_observations: deque[dict[str, Any]] = deque(
+            maxlen=TELEGRAM_REPLY_OBSERVATION_LIMIT
+        )
+        self._reply_observations_total = 0
 
     def is_allowed(self, sender_id: str) -> bool:
         """Preserve Telegram's legacy id|username allowlist matching."""
@@ -1579,6 +1587,55 @@ class TelegramChannel(BaseChannel):
             return None
         return self._format_reply_context(details)
 
+    def _record_reply_observation(
+        self,
+        *,
+        chat_id: str,
+        message_id: int | None,
+        reply,
+        details: dict,
+        context_attached: bool,
+    ) -> None:
+        """Append a bounded reply-context observation record.
+
+        The record contains only flags, lengths, and ids — never raw message
+        bodies. Used by the runtime inspector for the telegram reply-context
+        diagnostics section (#18).
+        """
+        media = details.get("media") or []
+        self._reply_observations.append({
+            "ts": time.time(),
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "has_reply_source": reply is not None,
+            "reply_to_message_id": details.get("message_id"),
+            "reply_id_present": details.get("message_id") is not None,
+            "replied_to_bot": details.get("sent_by_bot"),
+            "context_attached": context_attached,
+            "text_len": len(details.get("text") or ""),
+            "caption_len": len(details.get("caption") or ""),
+            "quote_len": len(details.get("quote") or ""),
+            "media_count": len(media),
+            "media_file_id_present": any(
+                item.get("file_unique_id") for item in media
+            ),
+            "content_unavailable": bool(details.get("content_unavailable")),
+        })
+        self._reply_observations_total += 1
+
+    def reply_context_observations(self) -> dict[str, Any]:
+        """Read-only reply-context diagnostics snapshot (flags/lengths/ids only).
+
+        Returns the rolling bounded buffer plus a cumulative total; never
+        exposes raw message content. The runtime inspector uses this for the
+        telegram reply-context diagnostics section.
+        """
+        return {
+            "total_seen": self._reply_observations_total,
+            "limit": TELEGRAM_REPLY_OBSERVATION_LIMIT,
+            "entries": list(self._reply_observations),
+        }
+
     async def _download_message_media(
         self, msg, *, add_failure_content: bool = False
     ) -> tuple[list[str], list[str]]:
@@ -1901,6 +1958,14 @@ class TelegramChannel(BaseChannel):
                     f"Media: {reply_media_parts[0]}\n[/Telegram Reply Context]",
                 )
             content_parts.insert(0, reply_ctx)
+            # Diagnostics: record a bounded observation (flags/lengths/ids only).
+            self._record_reply_observation(
+                chat_id=str(chat_id),
+                message_id=getattr(message, "message_id", None),
+                reply=reply,
+                details=reply_details,
+                context_attached=True,
+            )
         forward_details = self._extract_forward_details(message)
         if forward_details is not None:
             content_parts.insert(0, self._format_forward_context(forward_details))
