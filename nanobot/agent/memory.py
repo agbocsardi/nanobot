@@ -1316,6 +1316,13 @@ class Consolidator:
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
             weakref.WeakValueDictionary()
         )
+        # Pre-compaction memory flush (issue #33): idempotent by range, guarded
+        # against recursion/cross-session overlap.
+        self._flush_in_flight: set[str] = set()
+        self._flush_max_input_messages = 40
+        self._flush_input_chars = 6000
+        self._flush_max_tokens = 300
+        self._flush_wall_timeout_s = 30.0
 
     def set_provider(
         self,
@@ -1778,6 +1785,150 @@ class Consolidator:
             # the summary injection strategy with AutoCompact._archive().
             self._persist_last_summary(session, last_summary)
 
+    # ------------------------------------------------------------------
+    # Pre-compaction memory flush (issue #33)
+    # ------------------------------------------------------------------
+
+    def _flush_provenance_path(self) -> Path:
+        return Path(self.store.workspace) / "memory" / "flush_provenance.jsonl"
+
+    @staticmethod
+    def _message_trust_classes(messages: list[dict[str, Any]]) -> list[str]:
+        """Bounded trust classes derived from message roles + explicit markers."""
+        classes: set[str] = set()
+        for entry in messages:
+            role = str(entry.get("role") or "")
+            meta = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
+            if role == "user":
+                classes.add("user")
+            elif role == "assistant":
+                classes.add("assistant")
+            else:
+                classes.add("tool_untrusted")
+            if meta.get("_untrusted") or meta.get("untrusted"):
+                classes.add("tool_untrusted")
+        return sorted(classes) or ["tool_untrusted"]
+
+    async def flush_before_compaction(self, session) -> dict[str, Any]:
+        """Silent, bounded, idempotent memory flush of the unflushed range.
+
+        Returns a bounded provenance record; never raises and never blocks
+        emergency compaction beyond the wall timeout. The same range is not
+        flushed twice (session metadata checkpoint survives restart).
+        """
+        key = session.key
+        meta = session.metadata.setdefault("_precompact_flush", {"last": 0})
+        start = int(meta.get("last", 0))
+        total = len(session.messages)
+        if total <= start:
+            return {"session": key, "range": [start, total], "result": "nothing"}
+        if key in self._flush_in_flight:
+            return {"session": key, "range": [start, total], "result": "skipped_in_flight"}
+        self._flush_in_flight.add(key)
+        try:
+            result = await asyncio.wait_for(
+                self._run_flush(session, start, total),
+                timeout=self._flush_wall_timeout_s,
+            )
+            if result["result"] in ("changed", "nothing"):
+                meta["last"] = total
+                self.sessions.save(session)
+            return result
+        except asyncio.TimeoutError:
+            return self._record_flush(session, start, total, "failed", "timeout")
+        except Exception as exc:
+            return self._record_flush(session, start, total, "failed", str(exc)[:200])
+        finally:
+            self._flush_in_flight.discard(key)
+
+    async def _run_flush(self, session, start: int, total: int) -> dict[str, Any]:
+        range_messages = session.messages[start:total][-self._flush_max_input_messages:]
+        trust = self._message_trust_classes(range_messages)
+        # Hard trust boundary: web/tool-only ranges never become durable
+        # personal memory; the model is not even consulted.
+        if not ({"user", "assistant"} & set(trust)):
+            return self._record_flush(session, start, total, "nothing", trust=trust)
+
+        prompt_lines = []
+        for entry in range_messages:
+            role = str(entry.get("role") or "?")
+            content = entry.get("content") or entry.get("text") or ""
+            sub = entry.get("messages")
+            if isinstance(sub, list):
+                content = " ".join(str(m.get("content") or "") for m in sub if isinstance(m, dict))
+            if isinstance(content, str) and content.strip():
+                prompt_lines.append(f"{role}: {content.strip()[:200]}")
+        sample = "\n".join(prompt_lines)[: self._flush_input_chars] if prompt_lines else "(empty range)"
+        contract = (
+            "You are the memory-flush pass before conversation compaction. "
+            "List at most 3 durable personal USER/ASSISTANT-supported facts, "
+            "one per line starting with FACT:. If nothing is durable, reply exactly "
+            "none. Never invent facts; never write credentials."
+        )
+        response = await self.provider.chat_with_retry(**{
+            "messages": [{"role": "user", "content": contract + "\n\n" + sample}],
+            "model": self.model,
+            "max_tokens": self._flush_max_tokens,
+            "temperature": 0.0,
+        })
+        text = (response.content or "").strip()
+        facts = [
+            line[len("FACT:"):].strip()
+            for line in text.splitlines()
+            if line.strip().upper().startswith("FACT:")
+        ][:3]
+        if (not facts) or text.lower() in ("none", "nothing"):
+            return self._record_flush(session, start, total, "nothing", trust=trust)
+        destination = self._append_facts(session, start, total, facts)
+        return self._record_flush(session, start, total, "changed", trust=trust,
+                                  destinations=[destination])
+
+    def _append_facts(self, session, start: int, total: int, facts: list[str]) -> str:
+        """Append bounded facts to a topic memory file (guarded paths)."""
+        from nanobot.agent.tools._memory_common import resolve_topic_path
+
+        rel = "flush-notes.md"
+        Path(self.store.workspace).joinpath("memory").mkdir(parents=True, exist_ok=True)
+        resolved = resolve_topic_path(Path(self.store.workspace), rel)
+        heading = f"## Pre-compaction flush {start}-{total}\n"
+        body = "\n".join("- " + f[:300] for f in facts) + "\n"
+        content = f"# {rel}\n\n" + heading + body
+        tmp = resolved.with_suffix(resolved.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        tmp.replace(resolved)
+        return f"memory/{rel}"
+
+    def _record_flush(
+        self, session, start: int, total: int, result: str,
+        error: str | None = None, trust: list[str] | None = None,
+        destinations: list[str] | None = None,
+    ) -> dict[str, Any]:
+        record = {
+            "ts": int(time.time() * 1000),
+            "session": session.key,
+            "range": [int(start), int(total)],
+            "origin": "precompact_flush",
+            "result": result,
+            "trust": trust or self._message_trust_classes(session.messages[start:total]),
+            "destinations": destinations or [],
+        }
+        if error:
+            record["error"] = error
+        try:
+            path = self._flush_provenance_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+        except OSError:
+            logger.warning("Precompact flush provenance write failed", exc_info=True)
+        return {k: record.get(k) for k in ("result", "range", "trust", "destinations")}
+
+
     async def compact_idle_session(
         self,
         session_key: str,
@@ -1794,6 +1945,12 @@ class Consolidator:
         async with lock:
             self.sessions.invalidate(session_key)
             session = self.sessions.get_or_create(session_key)
+
+            # Pre-compaction memory flush (issue #33): best-effort, never blocks.
+            try:
+                await self.flush_before_compaction(session)
+            except Exception:
+                logger.warning("Precompact flush failed for {}", session_key, exc_info=True)
 
             messages_to_summarize = list(session.messages[session.last_consolidated:])
             if not messages_to_summarize:
