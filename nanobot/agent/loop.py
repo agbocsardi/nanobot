@@ -559,6 +559,15 @@ class AgentLoop:
         self._apply_provider_snapshot(snapshot)
 
     @property
+    def loaded_config_fingerprint(self) -> str | None:
+        """Fingerprint of the config the loop last loaded (for drift checks)."""
+        return self._loaded_config_fingerprint
+
+    @loaded_config_fingerprint.setter
+    def loaded_config_fingerprint(self, value: str | None) -> None:
+        self._loaded_config_fingerprint = value
+
+    @property
     def model_preset(self) -> str | None:
         return self._active_preset
 

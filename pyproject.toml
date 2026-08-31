@@ -52,6 +52,7 @@ dependencies = [
     "openpyxl>=3.1.0,<4.0.0",
     "python-pptx>=1.0.0,<2.0.0",
     "filelock>=3.25.2",
+    "watchfiles>=1.1.1,<2.0.0",
 ]
 
 [project.optional-dependencies]
