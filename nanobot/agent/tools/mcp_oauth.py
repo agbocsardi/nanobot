@@ -21,6 +21,8 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
+import tempfile
 import time
 from urllib.parse import parse_qs, urlparse
 
@@ -51,7 +53,22 @@ class FileTokenStorage:
             return {}
 
     def _save(self, data: dict) -> None:
-        self.path.write_text(json.dumps(data, indent=2, default=str))
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(dir=self.path.parent, prefix=f".{self.path.name}.")
+        try:
+            with os.fdopen(fd, "w") as tmp:
+                json.dump(data, tmp, indent=2, default=str)
+                tmp.write("\n")
+                tmp.flush()
+                os.fsync(tmp.fileno())
+            os.chmod(tmp_name, 0o600)
+            os.replace(tmp_name, self.path)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except FileNotFoundError:
+                pass
+            raise
 
     async def get_tokens(self):
         from mcp.shared.auth import OAuthToken
@@ -98,6 +115,17 @@ class FileTokenStorage:
     async def set_client_info(self, client_info) -> None:
         data = self._load()
         data["client_info"] = client_info.model_dump(mode="json")
+        self._save(data)
+
+    async def get_oauth_metadata(self):
+        from mcp.shared.auth import OAuthMetadata
+
+        data = self._load().get("oauth_metadata")
+        return OAuthMetadata.model_validate(data) if data else None
+
+    async def set_oauth_metadata(self, oauth_metadata) -> None:
+        data = self._load()
+        data["oauth_metadata"] = oauth_metadata.model_dump(mode="json")
         self._save(data)
 
 
@@ -160,6 +188,14 @@ def build_oauth_provider(
             await super()._initialize()
             if self.context.current_tokens is not None:
                 self.context.update_token_expiry(self.context.current_tokens)
+            oauth_metadata = await storage.get_oauth_metadata()
+            if oauth_metadata is not None:
+                self.context.oauth_metadata = oauth_metadata
+
+        async def _handle_token_response(self, response) -> None:
+            await super()._handle_token_response(response)
+            if self.context.oauth_metadata is not None:
+                await storage.set_oauth_metadata(self.context.oauth_metadata)
 
     return PersistedExpiryOAuthClientProvider(
         server_url=server_url,

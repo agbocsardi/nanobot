@@ -5,8 +5,9 @@ import json
 import os
 import time
 
+import httpx
 import pytest
-from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
+from mcp.shared.auth import OAuthClientInformationFull, OAuthMetadata, OAuthToken
 
 import nanobot.agent.tools.mcp_oauth as mcp_oauth
 from nanobot.agent.tools.mcp_oauth import (
@@ -38,6 +39,13 @@ async def test_file_token_storage_roundtrip(monkeypatch, tmp_path):
         token_endpoint_auth_method="client_secret_post",
     )
     await storage.set_client_info(client_info)
+    metadata = OAuthMetadata(
+        issuer="https://mcp.coros.com",
+        authorization_endpoint="https://mcp.coros.com/oauth2/authorize",
+        token_endpoint="https://mcp.coros.com/oauth2/token",
+        response_types_supported=["code"],
+    )
+    await storage.set_oauth_metadata(metadata)
 
     # A fresh instance reads the same file (simulates a restart).
     reloaded = FileTokenStorage("coros")
@@ -45,6 +53,8 @@ async def test_file_token_storage_roundtrip(monkeypatch, tmp_path):
     assert got is not None and got.access_token == "abc" and got.refresh_token == "def"
     info = await reloaded.get_client_info()
     assert info is not None and info.client_id == "cid-123"
+    assert await reloaded.get_oauth_metadata() == metadata
+    assert storage.path.stat().st_mode & 0o777 == 0o600
 
 
 @pytest.mark.asyncio
@@ -145,3 +155,68 @@ async def test_interactive_callback_handler_rejects_missing_code(monkeypatch, tm
     monkeypatch.setattr("builtins.input", lambda _prompt: "http://localhost:8765/callback?error=denied")
     with pytest.raises(ValueError, match="no `code`"):
         await provider.context.callback_handler()
+
+
+@pytest.mark.asyncio
+async def test_provider_restores_oauth_metadata_for_refresh_after_restart(monkeypatch, tmp_path):
+    """Persisted tokens must refresh at the server-advertised endpoint."""
+    _isolate_storage(monkeypatch, tmp_path)
+    storage = FileTokenStorage("coros")
+    metadata = OAuthMetadata(
+        issuer="https://mcp.coros.com",
+        authorization_endpoint="https://mcp.coros.com/oauth2/authorize",
+        token_endpoint="https://mcp.coros.com/oauth2/token",
+        response_types_supported=["code"],
+        grant_types_supported=["authorization_code", "refresh_token"],
+        code_challenge_methods_supported=["S256"],
+    )
+    await storage.set_tokens(
+        OAuthToken(access_token="expired", refresh_token="refresh", expires_in=3600)
+    )
+    await storage.set_client_info(
+        OAuthClientInformationFull(
+            client_id="cid-123",
+            redirect_uris=["http://localhost:8765/callback"],
+            token_endpoint_auth_method="none",
+        )
+    )
+    await storage.set_oauth_metadata(metadata)
+
+    provider = build_oauth_provider(
+        "https://mcp.coros.com/mcp", "coros", interactive=False
+    )
+    await provider._initialize()
+
+    assert provider.context.oauth_metadata == metadata
+    refresh_request = await provider._refresh_token()
+    assert str(refresh_request.url) == "https://mcp.coros.com/oauth2/token"
+
+
+@pytest.mark.asyncio
+async def test_successful_token_exchange_persists_discovered_oauth_metadata(
+    monkeypatch, tmp_path
+):
+    _isolate_storage(monkeypatch, tmp_path)
+    provider = build_oauth_provider(
+        "https://mcp.coros.com/mcp", "coros", interactive=False
+    )
+    metadata = OAuthMetadata(
+        issuer="https://mcp.coros.com",
+        authorization_endpoint="https://mcp.coros.com/oauth2/authorize",
+        token_endpoint="https://mcp.coros.com/oauth2/token",
+        response_types_supported=["code"],
+    )
+    provider.context.oauth_metadata = metadata
+    response = httpx.Response(
+        200,
+        json={
+            "access_token": "fresh",
+            "refresh_token": "rotated",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+        },
+    )
+
+    await provider._handle_token_response(response)
+
+    assert await FileTokenStorage("coros").get_oauth_metadata() == metadata
