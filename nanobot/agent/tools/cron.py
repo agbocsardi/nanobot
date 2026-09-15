@@ -283,21 +283,34 @@ class CronTool(Tool, ContextAware):
             except (ValueError, KeyError) as e:
                 return f"Error: {e}"
 
-        job = self._cron.add_job(
-            name=name or message[:30],
-            schedule=schedule,
-            message=message,
-            delete_after_run=delete_after,
-            session_key=session_key,
-            origin_channel=origin_channel,
-            origin_chat_id=origin_chat_id,
-            origin_metadata=dict(self._origin_metadata.get() or {}),
-            silent=silent,
-            model_preset=preset_name,
-            isolated=isolated,
-            misfire_policy=misfire_policy,
-            misfire_grace_ms=misfire_grace_seconds * 1000,
-        )
+        try:
+            job = self._cron.add_job(
+                name=name or message[:30],
+                schedule=schedule,
+                message=message,
+                delete_after_run=delete_after,
+                session_key=session_key,
+                origin_channel=origin_channel,
+                origin_chat_id=origin_chat_id,
+                origin_metadata=dict(self._origin_metadata.get() or {}),
+                silent=silent,
+                model_preset=preset_name,
+                isolated=isolated,
+                misfire_policy=misfire_policy,
+                misfire_grace_ms=misfire_grace_seconds * 1000,
+            )
+        except ValueError as e:
+            # Invalid schedule (bad cron expression, non-positive interval,
+            # one-shot in the past, ...): nothing was persisted.  Surface the
+            # reason as tool error text instead of raising past the tool
+            # boundary — the caller must never see a "Created job" claim for a
+            # job that will not run.
+            return f"Error: {e}"
+        except RuntimeError as e:
+            # Corrupt cron store refused the mutation; retryable.
+            return ToolResult.retryable_error(
+                f"Could not create scheduled job: {e}"
+            )
         return ToolResult(
             f"Created job '{job.name}' (id: {job.id})",
             data={"job_id": job.id, "job_name": job.name},

@@ -234,3 +234,55 @@ async def test_claimed_job_timeout_records_error_and_releases_claim(tmp_path, mo
     assert stored.state.last_status == "error"
     assert stored.state.last_error == "job timed out after 0.01s"
     assert service.claim_status(job.id, 1_000)["status"] == "none"
+
+
+@pytest.mark.asyncio
+async def test_stop_cancellation_keeps_claim_and_delays_replay(tmp_path, monkeypatch):
+    """``stop()`` cancels running executions, and a cancelled run keeps its
+    claim lease: a restarted service must not instantly re-run the partially
+    executed occurrence. Replay becomes possible only after the lease expires,
+    and then at most once."""
+    clock = {"now": 1_000_000}
+    monkeypatch.setattr("nanobot.cron.service._now_ms", lambda: clock["now"])
+    started = asyncio.Event()
+    release = asyncio.Event()
+    ran: list[str] = []
+
+    async def slow(_job):
+        ran.append("started")
+        started.set()
+        await release.wait()
+        ran.append("finished")
+
+    service = CronService(tmp_path / "cron" / "jobs.json", on_job=slow)
+    service._running = True
+    service._load_store()
+    service._arm_timer = lambda: None
+    job = service.add_job("slow", CronSchedule(kind="every", every_ms=60_000), "x")
+    job.state.next_run_at_ms = clock["now"]
+    service._save_store()
+
+    await service._on_timer()
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    service.stop()
+    release.set()
+    await service.wait_stopped()
+
+    # The claim lease survived the cancellation.
+    assert service.claim_status(job.id, clock["now"])["status"] == "active"
+
+    restarted = CronService(tmp_path / "cron" / "jobs.json", on_job=slow)
+    restarted._running = True
+    restarted._load_store()
+    restarted._arm_timer = lambda: None
+    await restarted._on_timer()
+    await asyncio.gather(*list(restarted._execution_tasks.values()))
+    assert ran == ["started"]  # no instant replay: first run died cancelled
+
+    # Once the lease expires, the occurrence becomes claimable and re-runs once.
+    clock["now"] += 300_001
+    await restarted._on_timer()
+    await asyncio.gather(*list(restarted._execution_tasks.values()))
+    assert ran.count("started") == 2
+    assert restarted.claim_status(job.id, clock["now"])["status"] == "none"
