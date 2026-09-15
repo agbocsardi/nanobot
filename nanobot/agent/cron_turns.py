@@ -6,6 +6,8 @@ import asyncio
 import dataclasses
 from collections.abc import Awaitable, Callable, Iterable
 
+from loguru import logger
+
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.cron.session_turns import (
     cron_run_id,
@@ -30,6 +32,9 @@ class CronTurnCoordinator:
         self.deferred_queues: dict[str, list[InboundMessage]] = {}
         self._waiters: dict[str, asyncio.Future[OutboundMessage | None]] = {}
         self._pending_messages_by_run_id: dict[str, InboundMessage] = {}
+        # Run ids whose submit waiter ended without a completion (cancelled
+        # or timed out): any still-queued deferred copy must never execute.
+        self._cancelled_run_ids: set[str] = set()
 
     async def submit(self, msg: InboundMessage) -> OutboundMessage | None:
         """Submit a scheduled cron turn and wait for its session response."""
@@ -43,15 +48,32 @@ class CronTurnCoordinator:
         future: asyncio.Future[OutboundMessage | None] = loop.create_future()
         self._waiters[run_id] = future
         self._pending_messages_by_run_id[run_id] = msg
+        self._cancelled_run_ids.discard(run_id)
         try:
             if self._is_running():
                 await self._publish_inbound(msg)
             else:
                 await self._dispatch(msg)
             return await future
+        except asyncio.CancelledError:
+            # The awaiting cron job was cancelled or timed out (or the turn
+            # itself failed with cancellation): any still-queued deferred copy
+            # must never execute an orphaned run. Task.cancel() cancels the
+            # future being awaited, so future.done() cannot distinguish this.
+            self._cancelled_run_ids.add(run_id)
+            logger.warning(
+                "Cron run {} ended without completion; deferred turn invalidated",
+                run_id,
+            )
+            raise
         finally:
             self._waiters.pop(run_id, None)
             self._pending_messages_by_run_id.pop(run_id, None)
+
+    def is_cancelled(self, msg: InboundMessage) -> bool:
+        """True when *msg*'s cron run lost its waiter without completing."""
+        run_id = cron_run_id(msg.metadata)
+        return bool(run_id) and run_id in self._cancelled_run_ids
 
     def should_defer(
         self,
@@ -110,7 +132,12 @@ class CronTurnCoordinator:
         self.deferred_queues.setdefault(session_key, []).append(msg)
 
     def pending_job_ids_for_session(self, session_key: str) -> set[str]:
-        """Return cron jobs that are waiting for or running in *session_key*."""
+        """Return cron jobs that are waiting for or running in *session_key*.
+
+        Deferred-but-invalidated copies still count until the next idle drain
+        actually drops them, so a job never looks idle while its turn sits in
+        the queue.
+        """
         job_ids: set[str] = set()
         for msg in self.deferred_queues.get(session_key, []):
             job_id = _cron_job_id(msg)
@@ -124,14 +151,37 @@ class CronTurnCoordinator:
                 job_ids.add(job_id)
         return job_ids
 
+    def _deferred_is_live(self, msg: InboundMessage) -> bool:
+        """A deferred turn is publishable unless its run was invalidated.
+
+        ``submit()`` adds the run id to the cancelled set when its waiter ends
+        without a completion; that is the only authoritative dead signal. A
+        run id the coordinator never saw stays publishable.
+        """
+        run_id = cron_run_id(msg.metadata)
+        return not run_id or run_id not in self._cancelled_run_ids
+
     async def publish_next_deferred(self, session_key: str) -> None:
         queue = self.deferred_queues.get(session_key)
         if not queue:
             return
-        msg = queue.pop(0)
-        if not queue:
-            self.deferred_queues.pop(session_key, None)
-        await self._publish_inbound(msg)
+        publishable: InboundMessage | None = None
+        while queue:
+            candidate = queue.pop(0)
+            if not queue:
+                self.deferred_queues.pop(session_key, None)
+            if self._deferred_is_live(candidate):
+                publishable = candidate
+                break
+            logger.info(
+                "Dropping deferred cron turn for ended run {} in session {}",
+                cron_run_id(candidate.metadata), session_key,
+            )
+            run_id = cron_run_id(candidate.metadata)
+            if run_id:
+                self._cancelled_run_ids.discard(run_id)
+        if publishable is not None:
+            await self._publish_inbound(publishable)
 
 
 def _cron_job_id(msg: InboundMessage) -> str | None:

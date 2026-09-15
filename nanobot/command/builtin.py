@@ -1173,7 +1173,9 @@ async def cmd_task(ctx: CommandContext) -> OutboundMessage:
             )
         task_id = parts[1]
         if action == "stop":
-            result = await loop.subagents.cancel_task(task_id, session_key=ctx.key)
+            result = await loop.subagents.cancel_task(
+                task_id, session_key=ctx.key, sender_id=sender_id
+            )
             if result == "cancelled":
                 content = f"Cancelled task {task_id}."
             elif result == "done":

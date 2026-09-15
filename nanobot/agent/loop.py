@@ -44,7 +44,7 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.self import MyTool
 from nanobot.agent.tools.standing_intents import StandingIntentStore, source_digest
 from nanobot.agent.tools.waiting_runs import WaitingRunStore
-from nanobot.bus.events import InboundMessage, OutboundMessage
+from nanobot.bus.events import DeliveryResult, InboundMessage, OutboundMessage
 from nanobot.bus.progress import build_bus_progress_callback
 from nanobot.bus.queue import MessageBus
 from nanobot.bus.runtime_events import (
@@ -1058,7 +1058,8 @@ class AgentLoop:
             return await self._control_ack(msg, "No active run to interrupt in this session.")
         try:
             total = await asyncio.wait_for(
-                self._cancel_active_tasks(session_key), timeout=30.0
+                self._cancel_active_tasks(session_key, sender_id=msg.sender_id),
+                timeout=30.0,
             )
         except asyncio.TimeoutError:
             return await self._control_ack(
@@ -1212,17 +1213,25 @@ class AgentLoop:
         else:
             logger.warning("Command '{}' matched but dispatch returned None", raw)
 
-    async def _cancel_active_tasks(self, key: str) -> int:
+    async def _cancel_active_tasks(
+        self, key: str, *,
+        sender_id: str | None = None, trusted: bool = False,
+    ) -> int:
         """Cancel and await all active tasks and subagents for *key*.
 
-        Returns the total number of cancelled tasks + subagents.
+        Returns the total number of cancelled tasks + subagents. ``sender_id``
+        scopes subagent cancellation to the requesting participant; callers
+        with no sender context (internal entry points such as /stop and
+        /restart) cancel session-wide.
         """
         tasks = self._active_tasks.pop(key, [])
         cancelled = sum(1 for t in tasks if not t.done() and t.cancel())
         for t in tasks:
             with suppress(asyncio.CancelledError, Exception):
                 await t
-        sub_cancelled = await self.subagents.cancel_by_session(key)
+        sub_cancelled = await self.subagents.cancel_by_session(
+            key, sender_id=sender_id, trusted=trusted or sender_id is None,
+        )
         return cancelled + sub_cancelled
 
     def discard_session_file_state(self, key: str) -> None:
@@ -1556,6 +1565,14 @@ class AgentLoop:
                     self.commands.dispatch_priority,
                 )
                 continue
+            if self._cron_turns.is_cancelled(msg):
+                # A stale copy of a cron turn whose submit waiter already ended
+                # (cancelled/timed out run): executing it would run an orphaned
+                # turn after the cron service recorded a failure.
+                logger.info(
+                    "Dropping cancelled cron turn for session {}", effective_key,
+                )
+                continue
             if self._cron_turns.defer_if_active(
                 msg,
                 session_key=effective_key,
@@ -1607,6 +1624,21 @@ class AgentLoop:
                 if t in self._active_tasks.get(k, [])
                 else None
             )
+
+    @staticmethod
+    def _suppress_delivery(response: OutboundMessage) -> None:
+        """Resolve an intentionally undelivered reply as ``suppressed``.
+
+        Silent cron turns never reach a channel; the delivery future returned
+        to the caller must report that instead of looking like a missing or
+        pending acknowledgement.
+        """
+        if response.delivery is None or not response.delivery.done():
+            future: asyncio.Future[DeliveryResult] = (
+                asyncio.get_running_loop().create_future()
+            )
+            future.set_result(DeliveryResult("suppressed"))
+            response.delivery = future
 
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message: per-session serial, cross-session concurrent."""
@@ -1672,8 +1704,9 @@ class AgentLoop:
                                 "Suppressing silent cron turn output for session {}",
                                 session_key,
                             )
+                            self._suppress_delivery(response)
                         else:
-                            await self.bus.publish_outbound(response)
+                            await self.bus.publish_outbound_tracked(response)
                             completed_channel = response.channel
                             completed_chat_id = response.chat_id
                     elif msg.channel == "cli":
@@ -2451,6 +2484,11 @@ class AgentLoop:
     def _persist_subagent_followup(self, session: Session, msg: InboundMessage) -> bool:
         """Persist subagent follow-ups before prompt assembly so history stays durable.
 
+        The announcement is stored as a ``user``-role entry (matching how the
+        same content enters the model live via mid-turn injections) with
+        ``injected_event``/``sender_id`` provenance, so replay never mistakes
+        delegated subagent output for the assistant's own statement.
+
         Returns True if a new entry was appended; False if the follow-up was
         deduped (same ``subagent_task_id`` already in session) or carries no
         content worth persisting.
@@ -2464,7 +2502,7 @@ class AgentLoop:
         ):
             return False
         session.add_message(
-            "assistant",
+            "user",
             msg.content,
             sender_id=msg.sender_id,
             injected_event="subagent_result",

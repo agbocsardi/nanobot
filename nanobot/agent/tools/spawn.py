@@ -64,6 +64,8 @@ if TYPE_CHECKING:
 class SpawnTool(Tool, ContextAware):
     """Tool to spawn a subagent for background task execution."""
 
+    effect = "local_write"
+
     def __init__(self, manager: "SubagentManager"):
         self._manager = manager
         self._origin_channel: ContextVar[str] = ContextVar("spawn_origin_channel", default="cli")
@@ -72,6 +74,9 @@ class SpawnTool(Tool, ContextAware):
         self._origin_message_id: ContextVar[str | None] = ContextVar(
             "spawn_origin_message_id",
             default=None,
+        )
+        self._origin_sender_id: ContextVar[str | None] = ContextVar(
+            "spawn_origin_sender_id", default=None,
         )
 
     @classmethod
@@ -84,6 +89,7 @@ class SpawnTool(Tool, ContextAware):
         self._origin_chat_id.set(ctx.chat_id)
         self._session_key.set(ctx.session_key or f"{ctx.channel}:{ctx.chat_id}")
         self._origin_message_id.set(ctx.message_id)
+        self._origin_sender_id.set(ctx.sender_id)
 
     @property
     def name(self) -> str:
@@ -119,6 +125,7 @@ class SpawnTool(Tool, ContextAware):
                 origin_chat_id=self._origin_chat_id.get(),
                 session_key=self._session_key.get(),
                 origin_message_id=self._origin_message_id.get(),
+                origin_sender_id=self._origin_sender_id.get(),
                 temperature=temperature,
                 model_preset=model_preset,
                 max_iterations=max_iterations,
