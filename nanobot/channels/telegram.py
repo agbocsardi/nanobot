@@ -24,7 +24,7 @@ from telegram import (
     ReplyParameters,
     Update,
 )
-from telegram.error import BadRequest, InvalidToken, NetworkError, TimedOut
+from telegram.error import BadRequest, Forbidden, InvalidToken, NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -36,7 +36,7 @@ from telegram.ext import (
 )
 from telegram.request import HTTPXRequest
 
-from nanobot.bus.events import OUTBOUND_META_REACTION, OutboundMessage
+from nanobot.bus.events import OUTBOUND_META_REACTION, DeliveryResult, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.command.builtin import build_help_text
@@ -55,6 +55,7 @@ TELEGRAM_REPLY_CONTEXT_MAX_LEN = TELEGRAM_MAX_MESSAGE_LEN  # Max length for repl
 # Bounded rolling buffer of reply-context observations for runtime diagnostics.
 # Records only flags/lengths/ids — never raw message content.
 TELEGRAM_REPLY_OBSERVATION_LIMIT = 100
+TELEGRAM_INGRESS_IDENTITY_LIMIT = 4096
 # Long-poll liveness: a healthy getUpdates long poll completes one round trip
 # every ~10s even when idle (Updater.start_polling uses a 10s timeout by
 # default). The watchdog bot stamps each completed round trip; when none lands
@@ -512,6 +513,9 @@ class TelegramChannel(BaseChannel):
         self._inbound_buffers: dict[str, list[_QueuedTelegramUpdate]] = {}
         self._inbound_workers: dict[str, asyncio.Task] = {}
         self._rich_send_disabled: bool = False  # Latch off if Bot API < 10.1
+        # Identities of updates already claimed for processing; bounded so a
+        # long-lived bot cannot grow this without limit (see _claim_update).
+        self._seen_update_identities: dict[tuple, None] = {}
         self._reply_observations: deque[dict[str, Any]] = deque(
             maxlen=TELEGRAM_REPLY_OBSERVATION_LIMIT
         )
@@ -904,6 +908,33 @@ class TelegramChannel(BaseChannel):
             or "bad request: invalid parameter" in err
         )
 
+    @staticmethod
+    def _is_format_error(exc: BadRequest) -> bool:
+        error = str(exc).lower()
+        return any(marker in error for marker in (
+            "can't parse", "cannot parse", "unsupported start tag",
+            "unsupported end tag", "message is too long", "rich_message",
+        ))
+
+    @staticmethod
+    def _delivery_error(exc: Exception, *, partial: bool = False) -> DeliveryResult:
+        """Classify a transport exception truthfully.
+
+        Definite rejections (bad request, blocked, bad token, flood-wait,
+        invalid input, refused/refused-level OS errors) report ``failed``;
+        anything ambiguous — a timeout or network error where the remote may
+        have accepted the message — reports ``unknown`` so the caller never
+        re-sends a duplicate. ``partial`` forces ``unknown``: some parts of a
+        multipart message were acknowledged, so the whole-message state is
+        no longer a definite failure either.
+        """
+        definite = isinstance(exc, (BadRequest, Forbidden, InvalidToken, RetryAfter, ValueError, OSError))
+        status = "failed" if definite and not partial else "unknown"
+        error = f"{type(exc).__name__}: {exc}"
+        if partial:
+            error = f"Partial delivery: {error}"
+        return DeliveryResult(status=status, error=error)
+
     async def _try_send_rich(
         self,
         chat_id: int,
@@ -911,10 +942,10 @@ class TelegramChannel(BaseChannel):
         reply_params=None,
         thread_kwargs: dict | None = None,
         reply_markup=None,
-    ) -> bool:
-        """Attempt sendRichMessage (Bot API 10.1). Returns True on success."""
+    ) -> DeliveryResult | None:
+        """Return acknowledgement, or None only when a format fallback is safe."""
         if not self._app:
-            return False
+            return DeliveryResult(status="failed", error="Telegram bot is not running")
 
         payload: dict[str, Any] = {
             "chat_id": chat_id,
@@ -944,22 +975,18 @@ class TelegramChannel(BaseChannel):
             )
             if isinstance(result, dict) and result.get("message_id") is not None:
                 self._remember_sent_message(chat_id, int(result["message_id"]), content)
-            return True
+            return DeliveryResult(status="delivered")
         except BadRequest as exc:
             if self._is_rich_capability_error(exc):
                 self.logger.debug("sendRichMessage not available, disabling")
                 self._rich_send_disabled = True
-            else:
-                self.logger.debug("sendRichMessage rejected: {}", exc)
-            return False
+                return None
+            if self._is_format_error(exc):
+                self.logger.debug("sendRichMessage format rejected: {}", exc)
+                return None
+            return self._delivery_error(exc)
         except Exception as exc:
-            err_str = str(exc).lower()
-            is_timeout = "timed out" in err_str or isinstance(exc, TimedOut)
-            if is_timeout:
-                self.logger.debug("sendRichMessage timeout, falling back to legacy path")
-                return False
-            self.logger.debug("sendRichMessage failed: {}", exc)
-            return False
+            return self._delivery_error(exc)
 
     async def _try_edit_rich(
         self,
@@ -1000,19 +1027,22 @@ class TelegramChannel(BaseChannel):
             self.logger.debug("editMessageText rich_message failed: {}", exc)
             return False
 
-    async def send(self, msg: OutboundMessage) -> None:
-        """Send a message through Telegram."""
+    async def send(self, msg: OutboundMessage) -> DeliveryResult:
+        """Send each part once and report acknowledgement of the entire message."""
         if not self._app:
             self.logger.warning("bot not running")
-            return
+            return DeliveryResult(status="failed", error="Telegram bot is not running")
 
         if reaction := msg.metadata.get(OUTBOUND_META_REACTION):
-            await self._set_agent_reaction(
-                msg.chat_id,
-                int(reaction["message_id"]),
-                str(reaction.get("emoji") or ""),
-            )
-            return
+            try:
+                await self._set_agent_reaction(
+                    msg.chat_id,
+                    int(reaction["message_id"]),
+                    str(reaction.get("emoji") or ""),
+                )
+            except Exception as exc:
+                return self._delivery_error(exc)
+            return DeliveryResult(status="delivered")
 
         # Only stop typing indicator and remove reaction for final responses
         if not msg.metadata.get("_progress", False):
@@ -1023,9 +1053,8 @@ class TelegramChannel(BaseChannel):
 
         try:
             chat_id = int(msg.chat_id)
-        except ValueError:
-            self.logger.exception("Invalid chat_id: {}", msg.chat_id)
-            return
+        except (TypeError, ValueError) as exc:
+            return DeliveryResult(status="failed", error=f"Invalid chat_id: {exc}")
         reply_to_message_id = msg.metadata.get("message_id")
         message_thread_id = msg.metadata.get("message_thread_id")
         if message_thread_id is None and reply_to_message_id is not None:
@@ -1043,6 +1072,7 @@ class TelegramChannel(BaseChannel):
                 )
 
         # Send media files
+        delivered = False
         for media_path in (msg.media or []):
             try:
                 media_type = self._get_media_type(media_path)
@@ -1075,6 +1105,7 @@ class TelegramChannel(BaseChannel):
                         **thread_kwargs,
                         **extra,
                     )
+                    delivered = True
                     if (sent_message_id := getattr(sent, "message_id", None)) is not None:
                         self._remember_sent_message(
                             str(chat_id), sent_message_id, f"[{media_type}: {media_path}]"
@@ -1092,19 +1123,14 @@ class TelegramChannel(BaseChannel):
                     **extra,
                     **send_kwargs,
                 )
+                delivered = True
                 if (sent_message_id := getattr(sent, "message_id", None)) is not None:
                     self._remember_sent_message(
                         str(chat_id), sent_message_id, f"[{media_type}: {filename}]"
                     )
-            except Exception:
-                filename = media_path.rsplit("/", 1)[-1]
+            except Exception as exc:
                 self.logger.exception("Failed to send media {}", media_path)
-                await self._app.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"[Failed to send: {filename}]",
-                    reply_parameters=reply_params,
-                    **thread_kwargs,
-                )
+                return self._delivery_error(exc, partial=delivered)
 
         # Send text content
         if msg.content and msg.content != "[empty message]":
@@ -1124,37 +1150,36 @@ class TelegramChannel(BaseChannel):
                 and self.config.rich_messages
                 and not getattr(self, "_rich_send_disabled", False)
             ):
-                rich_ok = await self._try_send_rich(
+                result = await self._try_send_rich(
                     chat_id, text, reply_params, thread_kwargs, reply_markup,
                 )
-                if rich_ok:
-                    return
+                if result is not None:
+                    if delivered and result.status != "delivered":
+                        return DeliveryResult(
+                            status="unknown", error=f"Partial delivery: {result.error}",
+                        )
+                    return result
 
             chunks = _split_telegram_markdown(text, TELEGRAM_MAX_MESSAGE_LEN)
             for i, chunk in enumerate(chunks):
                 is_last = (i == len(chunks) - 1)
-                await self._send_text(
-                    chat_id, chunk, reply_params, thread_kwargs,
-                    render_as_blockquote=render_as_blockquote,
-                    reply_markup=reply_markup if is_last else None,
-                )
+                try:
+                    await self._send_text(
+                        chat_id, chunk, reply_params, thread_kwargs,
+                        render_as_blockquote=render_as_blockquote,
+                        reply_markup=reply_markup if is_last else None,
+                    )
+                except Exception as exc:
+                    return self._delivery_error(exc, partial=delivered)
+                delivered = True
+        return DeliveryResult(status="delivered" if delivered else "suppressed")
 
     async def _call_with_retry(self, fn, *args, **kwargs):
-        """Call an async Telegram API function with retry on pool/network timeout and RetryAfter."""
-        from telegram.error import RetryAfter
+        """Retry only explicit rate-limit rejection, never ambiguous network failure."""
 
         for attempt in range(1, _SEND_MAX_RETRIES + 1):
             try:
                 return await fn(*args, **kwargs)
-            except TimedOut:
-                if attempt == _SEND_MAX_RETRIES:
-                    raise
-                delay = _SEND_RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                self.logger.warning(
-                    "timeout (attempt {}/{}), retrying in {:.1f}s",
-                    attempt, _SEND_MAX_RETRIES, delay,
-                )
-                await asyncio.sleep(delay)
             except RetryAfter as e:
                 if attempt == _SEND_MAX_RETRIES:
                     raise
@@ -1186,6 +1211,8 @@ class TelegramChannel(BaseChannel):
             )
             self._remember_sent_message(str(chat_id), sent.message_id, text)
         except BadRequest as e:
+            if not self._is_format_error(e):
+                raise
             self.logger.warning("HTML parse failed, falling back to plain text: {}", e)
             try:
                 sent = await self._call_with_retry(
@@ -2046,6 +2073,49 @@ class TelegramChannel(BaseChannel):
                 self._drain_ordered_updates(key)
             )
 
+    @staticmethod
+    def _identities_for_update(update: Update) -> tuple[tuple, ...]:
+        """Stable identities for duplicate suppression.
+
+        Telegram may redeliver an update (same ``update_id``) after a poll
+        restart, and redelivery replays the same ``(chat_id, message_id)``
+        body. Edits of a message carry that same body pair but are a distinct
+        update, so they get their own tag; reactions may legitimately repeat
+        for one message and are identified by ``update_id`` only.
+        """
+        identities: list[tuple] = []
+        update_id = getattr(update, "update_id", None)
+        if update_id is not None:
+            identities.append(("update", int(update_id)))
+        message = getattr(update, "message", None)
+        edited = getattr(update, "edited_message", None)
+        body = message if message is not None else edited
+        if body is not None:
+            chat_id = getattr(body, "chat_id", None)
+            message_id = getattr(body, "message_id", None)
+            if chat_id is not None and message_id is not None:
+                tag = "message" if message is not None else "edited"
+                identities.append((tag, str(chat_id), int(message_id)))
+        return tuple(identities)
+
+    def _claim_update(self, update: Update) -> bool:
+        """Claim an update once; False when a duplicate was already claimed.
+
+        Claiming happens at ingress, before any session queuing, so a repeated
+        update can never reach the bus (and thus never execute tools) twice.
+        """
+        identities = self._identities_for_update(update)
+        if not identities:
+            return True
+        if any(identity in self._seen_update_identities for identity in identities):
+            self.logger.info("Dropping duplicate Telegram update {}", identities)
+            return False
+        for identity in identities:
+            self._seen_update_identities[identity] = None
+        while len(self._seen_update_identities) > TELEGRAM_INGRESS_IDENTITY_LIMIT:
+            self._seen_update_identities.pop(next(iter(self._seen_update_identities)))
+        return True
+
     async def _drain_ordered_updates(self, key: str) -> None:
         """Drain one Telegram session buffer in stable message order."""
         try:
@@ -2083,6 +2153,8 @@ class TelegramChannel(BaseChannel):
     async def _forward_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Forward slash commands to the bus for unified handling in AgentLoop."""
         if not update.message or not update.effective_user:
+            return
+        if not self._claim_update(update):
             return
         if not self._running:
             await self._process_forward_command(update, context)
@@ -2123,6 +2195,8 @@ class TelegramChannel(BaseChannel):
     async def _on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming messages (text, photos, voice, documents)."""
         if not self._message_for_update(update) or not update.effective_user:
+            return
+        if not self._claim_update(update):
             return
         if not self._running:
             await self._process_message_update(update, context)
@@ -2313,6 +2387,8 @@ class TelegramChannel(BaseChannel):
     ) -> None:
         """Stage a reaction change in the ordered ingress queue."""
         if not update.message_reaction:
+            return
+        if not self._claim_update(update):
             return
         if not self._running:
             await self._process_message_reaction(update, context)
@@ -2566,6 +2642,8 @@ class TelegramChannel(BaseChannel):
     async def _on_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle inline keyboard button clicks (callback queries)."""
         if not update.callback_query or not update.effective_user:
+            return
+        if not self._claim_update(update):
             return
         query = update.callback_query
         user = update.effective_user

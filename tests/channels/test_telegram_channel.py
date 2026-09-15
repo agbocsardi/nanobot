@@ -17,6 +17,7 @@ from nanobot.agent.tools.ask_user import PendingQuestionStore, question_callback
 from nanobot.bus.events import OUTBOUND_META_REACTION, InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.telegram import (
+    TELEGRAM_INGRESS_IDENTITY_LIMIT,
     TELEGRAM_RECOVERY_BACKOFF_INITIAL,
     TELEGRAM_REPLY_CONTEXT_MAX_LEN,
     TelegramChannel,
@@ -465,6 +466,104 @@ async def test_running_handler_orders_reaction_after_earlier_message() -> None:
 
 
 @pytest.mark.asyncio
+async def test_duplicate_update_is_processed_once() -> None:
+    """A redelivered Telegram update must produce a single inbound turn."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
+        MessageBus(),
+    )
+    channel._running = True
+    processed = []
+
+    async def fake_process(update, context):
+        processed.append(update.message.text)
+
+    channel._process_message_update = fake_process
+
+    update = _make_telegram_update(text="run the tool")
+    update.update_id = 100
+    await channel._on_message(update, None)
+    await channel._on_message(update, None)  # exact redelivery
+
+    replay = _make_telegram_update(text="run the tool")
+    replay.update_id = 101  # fresh update id but the same message body
+    await channel._on_message(replay, None)
+
+    await asyncio.sleep(0.3)
+    channel._running = False
+
+    assert processed == ["run the tool"]
+
+@pytest.mark.asyncio
+async def test_edit_of_seen_message_is_processed_as_new_update() -> None:
+    """Edits share (chat_id, message_id) with the original but must not be deduped away."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
+        MessageBus(),
+    )
+    channel._running = True
+    processed = []
+
+    async def fake_process(update, context):
+        processed.append(getattr(update, "edited_message", None) is not None)
+
+    channel._process_message_update = fake_process
+
+    update = _make_telegram_update(text="original")
+    update.update_id = 100
+    edit = _make_telegram_update(text="edited")
+    edit.update_id = 101
+    edit.edited_message = edit.message
+    edit.message = None
+
+    await channel._on_message(update, None)
+    await channel._on_message(edit, None)
+
+    await asyncio.sleep(0.3)
+    channel._running = False
+
+    assert processed == [False, True]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_slash_command_is_processed_once() -> None:
+    """A repeated command update must not execute the command twice."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._running = True
+    processed = []
+
+    async def fake_command(update, context):
+        processed.append(update.message.text)
+
+    channel._process_forward_command = fake_command
+
+    update = _make_telegram_update(text="/dream-log now")
+    update.update_id = 200
+    await channel._forward_command(update, None)
+    await channel._forward_command(update, None)
+
+    await asyncio.sleep(0.3)
+    channel._running = False
+
+    assert processed == ["/dream-log now"]
+
+
+def test_seen_update_identities_stay_bounded() -> None:
+    """The dedup map evicts old identities instead of growing without bound."""
+    channel = TelegramChannel(TelegramConfig(enabled=True, token="123:abc"), MessageBus())
+
+    for i in range(TELEGRAM_INGRESS_IDENTITY_LIMIT + 50):
+        assert channel._claim_update(SimpleNamespace(update_id=i)) is True
+
+    assert len(channel._seen_update_identities) <= TELEGRAM_INGRESS_IDENTITY_LIMIT
+    # The oldest identity was evicted, so it can be claimed again.
+    assert channel._claim_update(SimpleNamespace(update_id=0)) is True
+
+
+@pytest.mark.asyncio
 async def test_edited_message_becomes_marked_replacement_turn() -> None:
     channel = TelegramChannel(
         TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
@@ -511,8 +610,8 @@ async def test_edited_slash_command_is_not_reexecuted() -> None:
 
 
 @pytest.mark.asyncio
-async def test_send_text_retries_on_timeout() -> None:
-    """_send_text retries on TimedOut before succeeding."""
+async def test_send_text_timeout_propagates_after_single_attempt() -> None:
+    """TimedOut is ambiguous (the remote may have accepted the send): raise after one attempt."""
     from telegram.error import TimedOut
 
     channel = TelegramChannel(
@@ -522,32 +621,24 @@ async def test_send_text_retries_on_timeout() -> None:
     channel._app = _FakeApp(lambda: None)
 
     call_count = 0
-    original_send = channel._app.bot.send_message
 
-    async def flaky_send(**kwargs):
+    async def timing_out_send(**kwargs):
         nonlocal call_count
         call_count += 1
-        if call_count <= 2:
-            raise TimedOut()
-        return await original_send(**kwargs)
+        raise TimedOut()
 
-    channel._app.bot.send_message = flaky_send
+    channel._app.bot.send_message = timing_out_send
 
-    import nanobot.channels.telegram as tg_mod
-    orig_delay = tg_mod._SEND_RETRY_BASE_DELAY
-    tg_mod._SEND_RETRY_BASE_DELAY = 0.01
-    try:
+    with pytest.raises(TimedOut):
         await channel._send_text(123, "hello", None, {})
-    finally:
-        tg_mod._SEND_RETRY_BASE_DELAY = orig_delay
 
-    assert call_count == 3
-    assert len(channel._app.bot.sent_messages) == 1
+    assert call_count == 1
+    assert channel._app.bot.sent_messages == []
 
 
 @pytest.mark.asyncio
-async def test_send_text_gives_up_after_max_retries() -> None:
-    """_send_text raises TimedOut after exhausting all retries."""
+async def test_send_reports_unknown_on_ambiguous_rich_timeout() -> None:
+    """Ambiguous rich-send timeout: exactly one attempt, unknown, no legacy fallback."""
     from telegram.error import TimedOut
 
     channel = TelegramChannel(
@@ -555,21 +646,14 @@ async def test_send_text_gives_up_after_max_retries() -> None:
         MessageBus(),
     )
     channel._app = _FakeApp(lambda: None)
+    channel._app.bot.do_api_request = AsyncMock(side_effect=TimedOut())
 
-    async def always_timeout(**kwargs):
-        raise TimedOut()
+    result = await channel.send(
+        OutboundMessage(channel="telegram", chat_id="123", content="**hello**")
+    )
 
-    channel._app.bot.send_message = always_timeout
-
-    import nanobot.channels.telegram as tg_mod
-    orig_delay = tg_mod._SEND_RETRY_BASE_DELAY
-    tg_mod._SEND_RETRY_BASE_DELAY = 0.01
-    try:
-        with pytest.raises(TimedOut):
-            await channel._send_text(123, "hello", None, {})
-    finally:
-        tg_mod._SEND_RETRY_BASE_DELAY = orig_delay
-
+    assert result.status == "unknown"
+    assert channel._app.bot.do_api_request.await_count == 1
     assert channel._app.bot.sent_messages == []
 
 
@@ -584,12 +668,13 @@ async def test_send_rich_capability_error_latches_and_falls_back() -> None:
     channel._app = _FakeApp(lambda: None)
     channel._app.bot.do_api_request = AsyncMock(side_effect=BadRequest("Method not found"))
 
-    await channel.send(OutboundMessage(channel="telegram", chat_id="123", content="**hello**"))
+    result = await channel.send(OutboundMessage(channel="telegram", chat_id="123", content="**hello**"))
 
     assert channel._rich_send_disabled is True
     channel._app.bot.do_api_request.assert_awaited_once()
     assert len(channel._app.bot.sent_messages) == 1
     assert channel._app.bot.sent_messages[0]["text"]
+    assert result.status == "delivered"
 
 
 @pytest.mark.asyncio
@@ -605,11 +690,13 @@ async def test_send_rich_bad_request_does_not_latch_capability() -> None:
         side_effect=BadRequest("Bad Request: message to reply not found")
     )
 
-    await channel.send(OutboundMessage(channel="telegram", chat_id="123", content="**hello**"))
+    result = await channel.send(OutboundMessage(channel="telegram", chat_id="123", content="**hello**"))
 
     assert channel._rich_send_disabled is False
     channel._app.bot.do_api_request.assert_awaited_once()
-    assert len(channel._app.bot.sent_messages) == 1
+    # A definite rejection is reported, never papered over with a legacy re-send.
+    assert result.status == "failed"
+    assert channel._app.bot.sent_messages == []
 
 
 @pytest.mark.asyncio
@@ -622,10 +709,57 @@ async def test_rich_messages_default_uses_send_rich_message() -> None:
     channel._app = _FakeApp(lambda: None)
     channel._app.bot.do_api_request = AsyncMock()
 
-    await channel.send(OutboundMessage(channel="telegram", chat_id="123", content="**hello**"))
+    result = await channel.send(OutboundMessage(channel="telegram", chat_id="123", content="**hello**"))
 
     channel._app.bot.do_api_request.assert_awaited_once()
     assert len(channel._app.bot.sent_messages) == 0
+    assert result.status == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_send_without_running_bot_reports_failed() -> None:
+    """An unavailable bot is a definite failure, not an ambiguity."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+
+    result = await channel.send(
+        OutboundMessage(channel="telegram", chat_id="123", content="hello")
+    )
+
+    assert result.status == "failed"
+    assert "not running" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_send_media_then_rich_rejection_reports_partial_unknown(monkeypatch) -> None:
+    """Media acked + text definitely rejected ⇒ unknown, never a definite failure."""
+    from telegram.error import BadRequest
+
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    monkeypatch.setattr("nanobot.channels.telegram.validate_url_target", lambda url: (True, ""))
+    channel._app.bot.do_api_request = AsyncMock(
+        side_effect=BadRequest("Bad Request: chat not found")
+    )
+
+    result = await channel.send(
+        OutboundMessage(
+            channel="telegram",
+            chat_id="123",
+            content="**hello**",
+            media=["https://example.com/cat.jpg"],
+        )
+    )
+
+    assert result.status == "unknown"
+    assert "Partial delivery" in (result.error or "")
+    assert len(channel._app.bot.sent_media) == 1
+    assert channel._app.bot.sent_messages == []
 
 
 @pytest.mark.asyncio
@@ -759,8 +893,8 @@ async def test_send_delta_stream_end_does_not_fallback_on_network_timeout() -> N
         MessageBus(),
     )
     channel._app = _FakeApp(lambda: None)
-    # _call_with_retry retries TimedOut up to 3 times, so the mock will be called
-    # multiple times – but all calls must be with parse_mode="HTML" (no plain fallback).
+    # Ambiguous timeouts are never retried (single attempt) and never fall back
+    # to plain text; every call must stay parse_mode="HTML".
     channel._app.bot.edit_message_text = AsyncMock(side_effect=TimedOut("network timeout"))
     channel._stream_bufs["123"] = _StreamBuf(text="hello", message_id=7, last_edit=0.0)
 
@@ -1188,7 +1322,10 @@ def test_is_allowed_rejects_invalid_legacy_telegram_sender_shapes() -> None:
 
 @pytest.mark.asyncio
 async def test_send_progress_keeps_message_in_topic() -> None:
-    config = TelegramConfig(enabled=True, token="123:abc", allow_from=["*"])
+    # Legacy path under test; rich sending would bypass send_message entirely.
+    config = TelegramConfig(
+        enabled=True, token="123:abc", allow_from=["*"], rich_messages=False
+    )
     channel = TelegramChannel(config, MessageBus())
     channel._app = _FakeApp(lambda: None)
 
@@ -1206,7 +1343,11 @@ async def test_send_progress_keeps_message_in_topic() -> None:
 
 @pytest.mark.asyncio
 async def test_send_reply_infers_topic_from_message_id_cache() -> None:
-    config = TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], reply_to_message=True)
+    # Legacy path under test; rich sending would bypass send_message entirely.
+    config = TelegramConfig(
+        enabled=True, token="123:abc", allow_from=["*"], reply_to_message=True,
+        rich_messages=False,
+    )
     channel = TelegramChannel(config, MessageBus())
     channel._app = _FakeApp(lambda: None)
     channel._message_threads[("123", 10)] = 42
@@ -1294,7 +1435,7 @@ async def test_send_blocks_unsafe_remote_media_url(monkeypatch) -> None:
         lambda url: (False, "Blocked: example.com resolves to private/internal address 127.0.0.1"),
     )
 
-    await channel.send(
+    result = await channel.send(
         OutboundMessage(
             channel="telegram",
             chat_id="123",
@@ -1304,13 +1445,10 @@ async def test_send_blocks_unsafe_remote_media_url(monkeypatch) -> None:
     )
 
     assert channel._app.bot.sent_media == []
-    assert channel._app.bot.sent_messages == [
-        {
-            "chat_id": 123,
-            "text": "[Failed to send: internal.jpg]",
-            "reply_parameters": None,
-        }
-    ]
+    # Definite rejection (unsafe URL): reported as failed, not papered over
+    # with a synthetic failure notice.
+    assert result.status == "failed"
+    assert channel._app.bot.sent_messages == []
 
 
 @pytest.mark.asyncio
@@ -1352,8 +1490,11 @@ async def test_group_policy_mention_accepts_text_mention_and_caches_bot_identity
     channel._start_typing = lambda _chat_id: None
 
     mention = SimpleNamespace(type="mention", offset=0, length=13)
-    await channel._on_message(_make_telegram_update(text="@nanobot_test hi", entities=[mention]), None)
-    await channel._on_message(_make_telegram_update(text="@nanobot_test again", entities=[mention]), None)
+    first = _make_telegram_update(text="@nanobot_test hi", entities=[mention])
+    second = _make_telegram_update(text="@nanobot_test again", entities=[mention])
+    second.message.message_id = 2  # distinct message: dedup must not drop it
+    await channel._on_message(first, None)
+    await channel._on_message(second, None)
 
     assert len(handled) == 2
     assert channel._app.bot.get_me_calls == 1
@@ -2563,20 +2704,13 @@ async def test_send_text_does_not_fallback_on_network_timeout() -> None:
 
     channel._app.bot.send_message = always_timeout
 
-    import nanobot.channels.telegram as tg_mod
-    orig_delay = tg_mod._SEND_RETRY_BASE_DELAY
-    tg_mod._SEND_RETRY_BASE_DELAY = 0.01
-    try:
-        with pytest.raises(TimedOut):
-            await channel._send_text(123, "hello", None, {})
-    finally:
-        tg_mod._SEND_RETRY_BASE_DELAY = orig_delay
+    with pytest.raises(TimedOut):
+        await channel._send_text(123, "hello", None, {})
 
-    # With the fix: only _call_with_retry's 3 HTML attempts (no plain fallback).
-    # Before the fix: 3 HTML + 3 plain = 6 attempts.
-    assert call_count == 3, (
-        f"Expected 3 calls (HTML retries only), got {call_count} "
-        "(plain-text fallback should not trigger on TimedOut)"
+    # Ambiguous timeouts are never retried: one HTML attempt, no plain fallback.
+    assert call_count == 1, (
+        f"Expected 1 call (single HTML attempt), got {call_count} "
+        "(timeouts must not be retried or fall back to plain text)"
     )
 
 
@@ -2609,9 +2743,8 @@ async def test_send_text_does_not_fallback_on_network_error() -> None:
     finally:
         tg_mod._SEND_RETRY_BASE_DELAY = orig_delay
 
-    # _call_with_retry does NOT retry NetworkError (only TimedOut/RetryAfter),
-    # so it raises after 1 attempt. The fix prevents plain-text fallback.
-    # Before the fix: 1 HTML + 1 plain = 2. After the fix: 1 HTML only.
+    # _call_with_retry retries only RetryAfter, so this raises after 1 attempt;
+    # the fix prevents plain-text fallback on network errors.
     assert call_count == 1, (
         f"Expected 1 call (HTML only, no plain fallback), got {call_count}"
     )
@@ -2684,9 +2817,8 @@ async def test_send_text_bad_request_plain_fallback_exhausted() -> None:
     finally:
         tg_mod._SEND_RETRY_BASE_DELAY = orig_delay
 
-    # _call_with_retry does NOT retry BadRequest (only TimedOut/RetryAfter),
-    # so HTML fails after 1 attempt → fallback to plain also fails after 1 attempt.
-    # Before the fix: 2 total. After the fix: still 2 (BadRequest SHOULD fallback).
+    # _call_with_retry retries only RetryAfter, so each attempt fails once:
+    # HTML fails, the plain fallback also fails (BadRequest SHOULD fall back).
     assert call_count == 2, f"Expected 2 calls (1 HTML + 1 plain), got {call_count}"
 
 
@@ -2885,7 +3017,10 @@ async def test_send_falls_back_buttons_to_inline_text_when_flag_off() -> None:
     was the pre-fallback bug — the agent got a success reply while the user
     saw a question with no options."""
     channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], inline_keyboards=False),
+        TelegramConfig(
+            enabled=True, token="123:abc", allow_from=["*"],
+            inline_keyboards=False, rich_messages=False,
+        ),
         MessageBus(),
     )
     channel._app = _FakeApp(lambda: None)
@@ -2913,7 +3048,10 @@ async def test_send_uses_native_keyboard_when_flag_on() -> None:
     from telegram import InlineKeyboardMarkup
 
     channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], inline_keyboards=True),
+        TelegramConfig(
+            enabled=True, token="123:abc", allow_from=["*"],
+            inline_keyboards=True, rich_messages=False,
+        ),
         MessageBus(),
     )
     channel._app = _FakeApp(lambda: None)

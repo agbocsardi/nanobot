@@ -20,7 +20,7 @@ from websockets.asyncio.server import ServerConnection, serve, unix_serve
 from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request as WsRequest
 
-from nanobot.bus.events import OUTBOUND_META_AGENT_UI, OutboundMessage
+from nanobot.bus.events import OUTBOUND_META_AGENT_UI, DeliveryResult, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.paths import get_media_dir
@@ -481,6 +481,18 @@ class WebSocketChannel(BaseChannel):
             paths.append(saved)
         return paths, None
 
+    def _owns_chat(self, connection: Any, chat_id: Any) -> bool:
+        """True only when this connection registered the chat itself.
+
+        Chat-ID syntax checks are not ownership: a connection may only
+        attach to and message chats it created (its ready chat or chats
+        returned by ``new_chat``). A reconnect gets a fresh identity and
+        cannot reclaim IDs a previous connection used.
+        """
+        if not _is_valid_chat_id(chat_id):
+            return False
+        return chat_id in self._conn_chats.get(connection, set())
+
     async def _dispatch_envelope(self, connection: Any, client_id: str, envelope: dict[str, Any]) -> None:
         t = envelope.get("type")
         if t == "new_chat":
@@ -490,18 +502,23 @@ class WebSocketChannel(BaseChannel):
             return
         if t == "attach":
             chat_id = envelope.get("chat_id")
-            if not _is_valid_chat_id(chat_id):
-                await self._send_event(connection, "error", detail="invalid chat_id")
+            if not self._owns_chat(connection, chat_id):
+                # Same answer for malformed, unknown, and foreign chat IDs so
+                # the error never confirms another connection's chats exist.
+                await self._send_event(connection, "error", detail="unknown chat_id")
                 return
             self._attach(connection, chat_id)
             await self._send_event(connection, "attached", chat_id=chat_id)
             return
         if t == "message":
             chat_id = envelope.get("chat_id")
-            content = envelope.get("content")
             if not _is_valid_chat_id(chat_id):
                 await self._send_event(connection, "error", detail="invalid chat_id")
                 return
+            if not self._owns_chat(connection, chat_id):
+                await self._send_event(connection, "error", detail="unknown chat_id")
+                return
+            content = envelope.get("content")
             if not isinstance(content, str):
                 await self._send_event(connection, "error", detail="missing content")
                 return
@@ -548,14 +565,36 @@ class WebSocketChannel(BaseChannel):
             self.logger.exception("send failed{}", label)
             raise
 
-    async def send(self, msg: OutboundMessage) -> None:
+
+    async def send_delta(self, chat_id: str, delta: str, metadata: dict[str, Any] | None = None) -> None:
+        meta = metadata or {}
+        stream_key = (chat_id, str(meta.get("_stream_id") or ""))
+        if meta.get("_stream_end"):
+            body: dict[str, Any] = {"event": "stream_end", "chat_id": chat_id}
+            buffered = self._stream_text_buffers.pop(stream_key, [])
+            if delta:
+                buffered.append(delta)
+            if buffered:
+                body["text"] = "".join(buffered)
+        else:
+            body = {"event": "delta", "chat_id": chat_id, "text": delta}
+            self._stream_text_buffers.setdefault(stream_key, []).append(delta)
+        if meta.get("_stream_id") is not None:
+            body["stream_id"] = meta["_stream_id"]
+        raw = json.dumps(body, ensure_ascii=False)
+        for conn in list(self._subs.get(chat_id, ())):
+            await self._safe_send_to(conn, raw, label=" stream")
+
+    async def send(self, msg: OutboundMessage) -> DeliveryResult:
         if msg.metadata.get("_runtime_model_updated"):
             await self.send_runtime_model_updated(
                 model_name=msg.metadata.get("model"),
                 model_preset=msg.metadata.get("model_preset"),
             )
-            return
+            return DeliveryResult("delivered")
         conns = list(self._subs.get(msg.chat_id, ()))
+        if not conns:
+            return DeliveryResult("failed", "no websocket subscriber for chat")
         payload: dict[str, Any] = {
             "event": "message",
             "chat_id": msg.chat_id,
@@ -576,27 +615,23 @@ class WebSocketChannel(BaseChannel):
         elif msg.metadata.get("_progress"):
             payload["kind"] = "progress"
         raw = json.dumps(payload, ensure_ascii=False)
+        sent = 0
         for conn in conns:
-            await self._safe_send_to(conn, raw)
-
-    async def send_delta(self, chat_id: str, delta: str, metadata: dict[str, Any] | None = None) -> None:
-        meta = metadata or {}
-        stream_key = (chat_id, str(meta.get("_stream_id") or ""))
-        if meta.get("_stream_end"):
-            body: dict[str, Any] = {"event": "stream_end", "chat_id": chat_id}
-            buffered = self._stream_text_buffers.pop(stream_key, [])
-            if delta:
-                buffered.append(delta)
-            if buffered:
-                body["text"] = "".join(buffered)
-        else:
-            body = {"event": "delta", "chat_id": chat_id, "text": delta}
-            self._stream_text_buffers.setdefault(stream_key, []).append(delta)
-        if meta.get("_stream_id") is not None:
-            body["stream_id"] = meta["_stream_id"]
-        raw = json.dumps(body, ensure_ascii=False)
-        for conn in list(self._subs.get(chat_id, ())):
-            await self._safe_send_to(conn, raw, label=" stream")
+            try:
+                await conn.send(raw)
+                sent += 1
+            except ConnectionClosed:
+                self._cleanup_connection(conn)
+                self.logger.warning("connection gone")
+            except Exception:
+                self.logger.exception("send failed")
+        if sent == 0:
+            return DeliveryResult("failed", "no live websocket subscriber")
+        if sent < len(conns):
+            # At least one subscriber got the frame while another outcome is
+            # unknown — retrying could duplicate the delivered copies.
+            return DeliveryResult("unknown", "some websocket sends failed")
+        return DeliveryResult("delivered")
 
     async def send_reasoning_delta(
         self,
