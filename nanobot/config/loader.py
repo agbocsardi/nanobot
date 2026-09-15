@@ -3,6 +3,9 @@
 import json
 import os
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
@@ -12,19 +15,36 @@ from pydantic import BaseModel
 from nanobot.config.schema import Config, _resolve_tool_config_refs
 from nanobot.utils.helpers import _write_text_atomic
 
-# Global variable to store current config path (for multi-instance support)
+# CLI defaults remain process-wide; SDK instances override them in their task context.
 _current_config_path: Path | None = None
+_scoped_config_path: ContextVar[Path | None] = ContextVar("config_path", default=None)
 _schema_refs_ready = False
 
 
 def set_config_path(path: Path) -> None:
     """Set the current config path (used to derive data directory)."""
-    global _current_config_path
-    _current_config_path = path
+    if _scoped_config_path.get() is not None:
+        _scoped_config_path.set(path)
+    else:
+        global _current_config_path
+        _current_config_path = path
+
+
+@contextmanager
+def config_path_context(path: Path) -> Iterator[None]:
+    """Scope runtime paths to an instance, including tasks it creates."""
+    token = _scoped_config_path.set(path)
+    try:
+        yield
+    finally:
+        _scoped_config_path.reset(token)
 
 
 def get_config_path() -> Path:
     """Get the configuration file path."""
+    scoped = _scoped_config_path.get()
+    if scoped is not None:
+        return scoped
     if _current_config_path:
         return _current_config_path
     return Path.home() / ".nanobot" / "config.json"

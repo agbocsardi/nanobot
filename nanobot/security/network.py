@@ -5,7 +5,9 @@ from __future__ import annotations
 import ipaddress
 import re
 import socket
-from contextlib import suppress
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from urllib.parse import urlparse
 
 _BLOCKED_NETWORKS = [
@@ -23,7 +25,10 @@ _BLOCKED_NETWORKS = [
 
 _URL_RE = re.compile(r"https?://[^\s\"'`;|<>]+", re.IGNORECASE)
 
-_allowed_networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+_allowed_networks: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = ()
+_scoped_allowed_networks: ContextVar[
+    tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] | None
+] = ContextVar("ssrf_whitelist", default=None)
 
 
 def configure_ssrf_whitelist(cidrs: list[str]) -> None:
@@ -33,7 +38,23 @@ def configure_ssrf_whitelist(cidrs: list[str]) -> None:
     for cidr in cidrs:
         with suppress(ValueError):
             nets.append(ipaddress.ip_network(cidr, strict=False))
-    _allowed_networks = nets
+    if _scoped_allowed_networks.get() is not None:
+        _scoped_allowed_networks.set(tuple(nets))
+    else:
+        _allowed_networks = tuple(nets)
+
+
+@contextmanager
+def ssrf_whitelist_context() -> Iterator[None]:
+    """Snapshot the active policy for an instance without changing CLI defaults."""
+    current = _scoped_allowed_networks.get()
+    token = _scoped_allowed_networks.set(
+        _allowed_networks if current is None else current
+    )
+    try:
+        yield
+    finally:
+        _scoped_allowed_networks.reset(token)
 
 
 def _normalize_addr(
@@ -53,7 +74,10 @@ def _normalize_addr(
 
 def _is_private(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     normalized = _normalize_addr(addr)
-    if _allowed_networks and any(normalized in net for net in _allowed_networks):
+    networks = _scoped_allowed_networks.get()
+    if networks is None:
+        networks = _allowed_networks
+    if any(normalized in net for net in networks):
         return False
     return any(normalized in net for net in _BLOCKED_NETWORKS)
 

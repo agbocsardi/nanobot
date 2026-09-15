@@ -9,7 +9,7 @@ import pytest
 
 from nanobot.security.network import (
     configure_ssrf_whitelist,
-    contains_internal_url,
+    ssrf_whitelist_context,
     validate_url_target,
 )
 
@@ -225,5 +225,62 @@ def test_whitelist_allows_ipv6_mapped_cgnat():
         with patch("nanobot.security.network.socket.getaddrinfo", _fake_resolve_v6("ts.local", ["::ffff:100.100.1.1"])):
             ok, err = validate_url_target("http://ts.local/api")
             assert ok, f"Whitelisted IPv6-mapped CGNAT should be allowed, got: {err}"
+    finally:
+        configure_ssrf_whitelist([])
+
+
+# ---------------------------------------------------------------------------
+# Scoped whitelist context — per-instance policy without touching CLI defaults
+# ---------------------------------------------------------------------------
+
+def test_context_snapshots_global_and_restores_it():
+    """Entering a scope snapshots the global policy; exiting restores it."""
+    configure_ssrf_whitelist(["100.64.0.0/10"])
+    try:
+        with ssrf_whitelist_context():
+            # Inside the scope the snapshot still admits CGNAT...
+            with patch("nanobot.security.network.socket.getaddrinfo", _fake_resolve("ts.local", ["100.100.1.1"])):
+                ok, _ = validate_url_target("http://ts.local/api")
+                assert ok
+            # ...and mutating inside the scope stays scoped.
+            configure_ssrf_whitelist([])
+            with patch("nanobot.security.network.socket.getaddrinfo", _fake_resolve("ts.local", ["100.100.1.1"])):
+                ok, _ = validate_url_target("http://ts.local/api")
+                assert not ok
+        # The global policy was never touched by the scoped mutation.
+        with patch("nanobot.security.network.socket.getaddrinfo", _fake_resolve("ts.local", ["100.100.1.1"])):
+            ok, _ = validate_url_target("http://ts.local/api")
+            assert ok
+    finally:
+        configure_ssrf_whitelist([])
+
+
+def test_context_starts_from_empty_global_without_inheriting_defaults():
+    """A scope over an empty global stays strict inside and after."""
+    configure_ssrf_whitelist([])
+    with ssrf_whitelist_context():
+        with patch("nanobot.security.network.socket.getaddrinfo", _fake_resolve("ts.local", ["100.100.1.1"])):
+            ok, _ = validate_url_target("http://ts.local/api")
+            assert not ok
+    with patch("nanobot.security.network.socket.getaddrinfo", _fake_resolve("ts.local", ["100.100.1.1"])):
+        ok, _ = validate_url_target("http://ts.local/api")
+        assert not ok
+
+
+def test_nested_context_restores_outer_scope():
+    """A nested scope cannot leak its policy into the enclosing scope."""
+    configure_ssrf_whitelist([])
+    try:
+        with ssrf_whitelist_context():
+            configure_ssrf_whitelist(["100.64.0.0/10"])
+            with ssrf_whitelist_context():
+                configure_ssrf_whitelist([])
+                with patch("nanobot.security.network.socket.getaddrinfo", _fake_resolve("ts.local", ["100.100.1.1"])):
+                    ok, _ = validate_url_target("http://ts.local/api")
+                    assert not ok
+            # Outer scope policy survives the nested scope.
+            with patch("nanobot.security.network.socket.getaddrinfo", _fake_resolve("ts.local", ["100.100.1.1"])):
+                ok, _ = validate_url_target("http://ts.local/api")
+                assert ok
     finally:
         configure_ssrf_whitelist([])
