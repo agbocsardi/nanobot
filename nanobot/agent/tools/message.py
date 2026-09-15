@@ -10,7 +10,7 @@ from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
 from nanobot.agent.tools.context import ContextAware, RequestContext
 from nanobot.agent.tools.path_utils import resolve_workspace_path
 from nanobot.agent.tools.schema import ArraySchema, StringSchema, tool_parameters_schema
-from nanobot.bus.events import OutboundMessage
+from nanobot.bus.events import DeliveryResult, OutboundMessage
 from nanobot.config.paths import get_workspace_path
 from nanobot.security.workspace_access import current_tool_workspace
 
@@ -54,7 +54,7 @@ class MessageTool(Tool, ContextAware):
 
     def __init__(
         self,
-        send_callback: Callable[[OutboundMessage], Awaitable[None]] | None = None,
+        send_callback: Callable[[OutboundMessage], Awaitable["DeliveryResult | None"]] | None = None,
         default_channel: str = "",
         default_chat_id: str = "",
         default_message_id: str | None = None,
@@ -110,7 +110,9 @@ class MessageTool(Tool, ContextAware):
         self._default_message_id.set(ctx.message_id)
         self._default_metadata.set(dict(ctx.metadata or {}))
 
-    def set_send_callback(self, callback: Callable[[OutboundMessage], Awaitable[None]]) -> None:
+    def set_send_callback(
+        self, callback: Callable[[OutboundMessage], Awaitable["DeliveryResult | None"]],
+    ) -> None:
         """Set the callback for sending messages."""
         self._send_callback = callback
 
@@ -267,14 +269,58 @@ class MessageTool(Tool, ContextAware):
             )
 
         try:
-            await self._send_callback(msg)
+            ack = await self._send_callback(msg)
+            ack_status = getattr(ack, "status", None)
+            if ack_status == "failed":
+                return ToolResult.retryable_error(
+                    f"Error delivering message to {channel}:{chat_id}: "
+                    f"{getattr(ack, 'error', None) or 'channel reported failure'}"
+                )
+            media_info = f" with {len(media)} attachments" if media else ""
+            button_info = f" with {sum(len(row) for row in buttons)} button(s)" if buttons else ""
+            if ack_status in ("unknown", "queued"):
+                # Ambiguous outcome: never claim delivery, never auto-resend
+                # (the remote may have accepted the message).
+                return ToolResult.partial(
+                    f"Message handed to {channel}:{chat_id}{media_info}{button_info} "
+                    "but delivery is unconfirmed: "
+                    f"{getattr(ack, 'error', None) or 'no channel acknowledgement'}",
+                    side_effects=[{
+                        "kind": "message_delivery",
+                        "channel": channel,
+                        "chat_id": chat_id,
+                    }],
+                    postcondition="failed",
+                )
+            if ack_status == "delivered":
+                if channel == default_channel and chat_id == default_chat_id:
+                    self._sent_in_turn = True
+                    if media:
+                        prev = self._turn_delivered_media_var.get()
+                        self._turn_delivered_media_var.set(prev + tuple(str(p) for p in media))
+                return ToolResult(
+                    f"Message sent to {channel}:{chat_id}{media_info}{button_info}",
+                    data={
+                        "channel": channel,
+                        "chat_id": chat_id,
+                        "media": list(media or []),
+                        "button_count": sum(len(row) for row in buttons or []),
+                        "delivered": True,
+                    },
+                    evidence=[{"kind": "channel_acknowledgement", "status": "delivered"}],
+                    side_effects=[{
+                        "kind": "message_delivery",
+                        "channel": channel,
+                        "chat_id": chat_id,
+                    }],
+                    postcondition="checked",
+                )
+            # Legacy callback without acknowledgement contract (or suppressed).
             if channel == default_channel and chat_id == default_chat_id:
                 self._sent_in_turn = True
                 if media:
                     prev = self._turn_delivered_media_var.get()
                     self._turn_delivered_media_var.set(prev + tuple(str(p) for p in media))
-            media_info = f" with {len(media)} attachments" if media else ""
-            button_info = f" with {sum(len(row) for row in buttons)} button(s)" if buttons else ""
             return ToolResult(
                 f"Message sent to {channel}:{chat_id}{media_info}{button_info}",
                 data={

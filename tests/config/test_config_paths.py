@@ -45,3 +45,44 @@ def test_is_default_workspace_distinguishes_default_and_custom_paths() -> None:
     assert is_default_workspace(None) is True
     assert is_default_workspace(Path.home() / ".nanobot" / "workspace") is True
     assert is_default_workspace("~/custom-workspace") is False
+
+
+def test_config_path_context_scopes_get_config_path(tmp_path: Path) -> None:
+    from nanobot.config.loader import config_path_context, get_config_path
+
+    instance = tmp_path / "instance-a" / "config.json"
+    before = get_config_path()
+    with config_path_context(instance):
+        assert get_config_path() == instance
+    assert get_config_path() == before
+
+
+def test_concurrent_config_path_contexts_are_isolated(tmp_path: Path) -> None:
+    """Overlapping scopes must not observe each other's instance path."""
+    import asyncio
+
+    from nanobot.config.loader import config_path_context, get_config_path
+
+    path_a = tmp_path / "a" / "config.json"
+    path_b = tmp_path / "b" / "config.json"
+
+    async def scoped(
+        label: str,
+        path: Path,
+        entered: asyncio.Event,
+        resume: asyncio.Event,
+    ) -> tuple[str, Path]:
+        with config_path_context(path):
+            entered.set()
+            await resume.wait()
+            return label, get_config_path()
+
+    async def main():
+        a_entered, b_entered = asyncio.Event(), asyncio.Event()
+        task_a = asyncio.create_task(scoped("a", path_a, a_entered, b_entered))
+        task_b = asyncio.create_task(scoped("b", path_b, b_entered, a_entered))
+        return await asyncio.gather(task_a, task_b)
+
+    (label_a, seen_a), (label_b, seen_b) = asyncio.run(main())
+    assert (label_a, seen_a) == ("a", path_a)
+    assert (label_b, seen_b) == ("b", path_b)

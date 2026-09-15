@@ -24,7 +24,7 @@ from nanobot.agent.tools.exec_session import (
     MAX_OUTPUT_CHARS,
     MAX_YIELD_MS,
     clamp_session_int,
-    format_session_poll,
+    render_session_poll_outcome,
 )
 from nanobot.agent.tools.sandbox import wrap_command
 from nanobot.agent.tools.schema import (
@@ -130,6 +130,8 @@ class _PreparedCommand:
 )
 class ExecTool(Tool):
     """Tool to execute shell commands."""
+
+    effect = "external_write"
     _scopes = {"core", "subagent"}
 
     config_key = "exec"
@@ -348,7 +350,7 @@ class ExecTool(Tool):
                     MAX_OUTPUT_CHARS,
                 ),
             )
-            return format_session_poll(session_id, poll)
+            return render_session_poll_outcome(session_id, poll)
         except Exception as exc:
             return f"Error executing command: {exc}"
 

@@ -744,6 +744,8 @@ def _find_match(content: str, old_text: str) -> tuple[str | None, int]:
 )
 class EditFileTool(_FsTool):
     """Edit a file by replacing text with fallback matching."""
+
+    effect = "local_write"
     _scopes = {"core", "subagent", "memory"}
 
     _MAX_EDIT_FILE_SIZE = 1024 * 1024 * 1024  # 1 GiB

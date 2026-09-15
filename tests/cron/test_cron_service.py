@@ -631,7 +631,10 @@ async def test_timer_execution_is_not_rolled_back_by_list_jobs_reload(tmp_path):
     service._save_store()
 
     await service._on_timer()
+    # Second tick while the spawned execution is in flight: the
+    # _execution_tasks registry must prevent a duplicate run.
     await service._on_timer()
+    await asyncio.gather(*list(service._execution_tasks.values()))
 
     assert calls == [job.id]
     loaded = service.get_job(job.id)
@@ -880,6 +883,7 @@ async def test_skip_misfire_records_without_callback(tmp_path):
     service._save_store()
     service._arm_timer = lambda: None
     await service._on_timer()
+    await asyncio.gather(*list(service._execution_tasks.values()))
     assert called == []
     assert service.get_job(job.id).state.run_history[-1].status == "skipped"
 
@@ -914,3 +918,126 @@ async def test_due_jobs_are_started_independently_with_bounded_concurrency(tmp_p
     assert set(started) == {"blocked", "other"}
     release.set()
     await asyncio.gather(*tasks)
+
+
+@pytest.mark.asyncio
+async def test_add_job_while_job_executes_does_not_cancel_it(tmp_path):
+    """Mutating the schedule while a job executes must not cancel the in-flight
+    run: mutations re-arm only the timer tick, never execution tasks."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    completed: list[str] = []
+
+    async def on_job(job):
+        started.set()
+        await release.wait()
+        completed.append(job.name)
+
+    service = CronService(tmp_path / "cron" / "jobs.json", on_job=on_job)
+    service._running = True
+    service._load_store()
+    service._arm_timer = lambda: None
+    job = service.add_job("slow", CronSchedule(kind="every", every_ms=3_600_000), "x")
+    job.state.next_run_at_ms = int(time.time() * 1000) - 1
+    service._save_store()
+
+    await service._on_timer()
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    # The mutation re-arms the timer while the run is in flight.
+    later_job = service.add_job("later", CronSchedule(kind="every", every_ms=3_600_000), "y")
+    release.set()
+    await asyncio.gather(*list(service._execution_tasks.values()))
+
+    assert completed == ["slow"]
+    loaded = service.get_job(job.id)
+    assert loaded is not None
+    assert service.get_job(later_job.id) is not None
+
+
+@pytest.mark.asyncio
+async def test_newly_due_job_starts_while_slow_job_runs_with_free_slots(tmp_path):
+    """A job that becomes due while a slow job is executing starts immediately
+    on a free slot instead of waiting for the slow run to finish."""
+    slow_started = asyncio.Event()
+    quick_started = asyncio.Event()
+    slow_release = asyncio.Event()
+
+    async def on_job(job):
+        if job.name == "slow":
+            slow_started.set()
+            await slow_release.wait()
+        else:
+            quick_started.set()
+
+    service = CronService(tmp_path / "cron" / "jobs.json", on_job=on_job)
+    service._running = True
+    service._load_store()
+    service._arm_timer = lambda: None
+    slow_job = service.add_job("slow", CronSchedule(kind="every", every_ms=3_600_000), "x")
+    quick_job = service.add_job("quick", CronSchedule(kind="every", every_ms=3_600_000), "y")
+    # Refresh from the store before mutating: every add_job/_on_timer reloads
+    # jobs.json, so earlier add_job references go stale.
+    slow = service.get_job(slow_job.id)
+    assert slow is not None
+    slow.state.next_run_at_ms = int(time.time() * 1000) - 1
+    service._save_store()
+    await service._on_timer()
+    await asyncio.wait_for(slow_started.wait(), timeout=1)
+
+    # The quick job becomes due only after the slow run has started. Refresh
+    # from the store first: _on_timer reloads jobs.json, so the original
+    # add_job reference is stale.
+    quick = service.get_job(quick_job.id)
+    assert quick is not None
+    quick.state.next_run_at_ms = int(time.time() * 1000) - 1
+    service._save_store()
+    await service._on_timer()
+    await asyncio.wait_for(quick_started.wait(), timeout=1)
+
+    # The slow run is still blocked while quick already completed its start.
+    assert not slow_release.is_set()
+    slow_release.set()  # unblock the slow run so the gather can finish
+    await asyncio.gather(*list(service._execution_tasks.values()))
+    loaded = service.get_job(slow_job.id)
+    assert loaded is not None and loaded.state.last_status == "ok"
+
+
+@pytest.mark.asyncio
+async def test_failed_one_shot_retained_inspectable_and_force_runnable(tmp_path):
+    """A failed one-shot stays in the store (disabled, unscheduled), keeps its
+    error state inspectable, and can be force-run again; a successful one-shot
+    is not force-runnable."""
+    attempts = {"n": 0}
+
+    async def flaky(_job):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("transient boom")
+
+    service = CronService(tmp_path / "cron" / "jobs.json", on_job=flaky)
+    job = service.add_job("once", CronSchedule(kind="at", at_ms=int(time.time() * 1000) + 60_000), "x")
+
+    assert await service.run_job(job.id) is True
+    loaded = service.get_job(job.id)
+    assert loaded is not None  # retained, not deleted
+    assert loaded.enabled is False  # disabled: never re-armed by the timer
+    assert loaded.state.next_run_at_ms is None
+    assert loaded.state.last_status == "error"
+    assert loaded.state.last_error == "transient boom"
+    assert [r.status for r in loaded.state.run_history] == ["error"]
+    # Inspectable through the disabled-inclusive listing.
+    assert [j.id for j in service.list_jobs(include_disabled=True)] == [job.id]
+    assert service.list_jobs() == []
+    # Non-force rerun is refused while the job is disabled.
+    assert await service.run_job(job.id) is False
+
+    # Force-retry executes the failed occurrence exactly once more.
+    assert await service.run_job(job.id, force=True) is True
+    loaded = service.get_job(job.id)
+    assert attempts["n"] == 2
+    assert loaded is not None and loaded.state.last_status == "ok"
+    assert len(loaded.state.run_history) == 2
+    # A completed (non-failed) one-shot cannot be force-run again.
+    assert await service.run_job(job.id, force=True) is False
+    assert attempts["n"] == 2

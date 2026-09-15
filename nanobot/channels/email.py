@@ -22,7 +22,7 @@ from typing import Any, Literal
 from loguru import logger
 from pydantic import Field
 
-from nanobot.bus.events import OutboundMessage
+from nanobot.bus.events import DeliveryResult, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.paths import get_media_dir
@@ -205,25 +205,25 @@ class EmailChannel(BaseChannel):
         """Stop polling loop."""
         self._running = False
 
-    async def send(self, msg: OutboundMessage) -> None:
+    async def send(self, msg: OutboundMessage) -> DeliveryResult:
         """Send email via SMTP."""
         if not self.config.consent_granted:
             self.logger.warning("Skip email send: consent_granted is false")
-            return
+            return DeliveryResult("suppressed", "Email consent not granted")
 
         if not self.config.smtp_host:
             self.logger.warning("SMTP host not configured")
-            return
+            return DeliveryResult("failed", "SMTP host not configured")
 
         # Skip progress messages to prevent sending an empty email after each tool call
         if (msg.metadata or {}).get("_progress"):
             self.logger.debug("Skip progress message to {}", msg.chat_id)
-            return
+            return DeliveryResult("suppressed", "Email progress message")
 
         to_addr = msg.chat_id.strip()
         if not to_addr:
             self.logger.warning("Missing recipient address")
-            return
+            return DeliveryResult("failed", "Missing recipient address")
 
         # Determine if this is a reply (recipient has sent us an email before)
         is_reply = to_addr in self._last_subject_by_chat
@@ -232,7 +232,7 @@ class EmailChannel(BaseChannel):
         # autoReplyEnabled only controls automatic replies, not proactive sends
         if is_reply and not self.config.auto_reply_enabled and not force_send:
             self.logger.info("Skip automatic reply to {}: auto_reply_enabled is false", to_addr)
-            return
+            return DeliveryResult("suppressed", "Automatic replies disabled")
 
         base_subject = self._last_subject_by_chat.get(to_addr, "nanobot reply")
         subject = self._reply_subject(base_subject)
@@ -302,11 +302,10 @@ class EmailChannel(BaseChannel):
             email_msg["In-Reply-To"] = in_reply_to
             email_msg["References"] = in_reply_to
 
-        try:
-            await asyncio.to_thread(self._smtp_send, email_msg)
-        except Exception:
-            self.logger.exception("Error sending to {}", to_addr)
-            raise
+        result = await asyncio.to_thread(self._smtp_send, email_msg)
+        if result.status == "delivered" and failed_attachments:
+            return DeliveryResult("unknown", "Email accepted without all requested attachments")
+        return result
 
     def _validate_config(self) -> bool:
         missing = []
@@ -331,23 +330,31 @@ class EmailChannel(BaseChannel):
             return False
         return True
 
-    def _smtp_send(self, msg: EmailMessage) -> None:
-        timeout = 30
-        if self.config.smtp_use_ssl:
-            with smtplib.SMTP_SSL(
-                self.config.smtp_host,
-                self.config.smtp_port,
-                timeout=timeout,
-            ) as smtp:
+    def _smtp_send(self, msg: EmailMessage) -> DeliveryResult:
+        submitting = False
+        result = None
+        try:
+            transport = smtplib.SMTP_SSL if self.config.smtp_use_ssl else smtplib.SMTP
+            with transport(self.config.smtp_host, self.config.smtp_port, timeout=30) as smtp:
+                if self.config.smtp_use_tls and not self.config.smtp_use_ssl:
+                    smtp.starttls(context=ssl.create_default_context())
                 smtp.login(self.config.smtp_username, self.config.smtp_password)
-                smtp.send_message(msg)
-            return
-
-        with smtplib.SMTP(self.config.smtp_host, self.config.smtp_port, timeout=timeout) as smtp:
-            if self.config.smtp_use_tls:
-                smtp.starttls(context=ssl.create_default_context())
-            smtp.login(self.config.smtp_username, self.config.smtp_password)
-            smtp.send_message(msg)
+                submitting = True
+                refused = smtp.send_message(msg)
+                # send_message returns only after the server's DATA response.
+                result = DeliveryResult(
+                    "unknown" if refused else "delivered",
+                    "Some recipients refused" if refused else None,
+                )
+        except Exception as exc:
+            # QUIT failure cannot undo a successful DATA acknowledgement.
+            if result is not None:
+                return result
+            rejected = isinstance(exc, (smtplib.SMTPResponseException, smtplib.SMTPRecipientsRefused))
+            status = "failed" if not submitting or rejected else "unknown"
+            self.logger.warning("SMTP delivery {}: {}", status, exc)
+            return DeliveryResult(status, str(exc))
+        return result
 
     def _fetch_new_messages(self) -> tuple[list[dict[str, Any]], set[str]]:
         """Poll IMAP and return parsed unread messages plus skipped message UIDs."""

@@ -77,6 +77,8 @@ from nanobot.agent.tools.schema import ArraySchema, ObjectSchema, StringSchema
 class MemoryWriteTool(Tool):
     """Curate topic memory files under memory/ (atomic writes only)."""
 
+    effect = "local_write"
+
     _scopes = {"core", "subagent", "memory"}
 
     @property

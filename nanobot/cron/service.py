@@ -63,18 +63,36 @@ def _compute_next_run(schedule: CronSchedule, now_ms: int) -> int | None:
     return None
 
 
-def _validate_schedule_for_add(schedule: CronSchedule) -> None:
-    """Validate schedule fields that would otherwise create non-runnable jobs."""
-    if schedule.tz and schedule.kind != "cron":
+def _validate_schedule_for_add(schedule: CronSchedule, now_ms: int | None = None) -> int:
+    """Reject malformed or non-runnable schedules before any persistence."""
+    now_ms = _now_ms() if now_ms is None else now_ms
+    if schedule.kind not in ("at", "every", "cron"):
+        raise ValueError("schedule kind must be 'at', 'every', or 'cron'")
+    fields = {"at": schedule.at_ms, "every": schedule.every_ms, "cron": schedule.expr}
+    if any(value is not None for kind, value in fields.items() if kind != schedule.kind):
+        raise ValueError("schedule must specify only the field matching its kind")
+    if schedule.tz is not None and schedule.kind != "cron":
         raise ValueError("tz can only be used with cron schedules")
+    if schedule.kind in ("at", "every"):
+        value = fields[schedule.kind]
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"{schedule.kind} schedule requires a positive integer")
+        if schedule.kind == "at" and value <= now_ms:
+            raise ValueError("one-shot schedule must be in the future")
+    else:
+        if not isinstance(schedule.expr, str) or not schedule.expr.strip():
+            raise ValueError("cron schedule requires an expression")
+        if schedule.tz is not None:
+            try:
+                from zoneinfo import ZoneInfo
 
-    if schedule.kind == "cron" and schedule.tz:
-        try:
-            from zoneinfo import ZoneInfo
-
-            ZoneInfo(schedule.tz)
-        except Exception:
-            raise ValueError(f"unknown timezone '{schedule.tz}'") from None
+                ZoneInfo(schedule.tz)
+            except (ValueError, TypeError, KeyError):
+                raise ValueError(f"unknown timezone '{schedule.tz}'") from None
+    next_run = _compute_next_run(schedule, now_ms)
+    if next_run is None or next_run <= now_ms:
+        raise ValueError("schedule has no valid future occurrence")
+    return next_run
 
 
 def _has_legacy_delivery_context(payload: CronPayload) -> bool:
@@ -158,8 +176,8 @@ class CronService:
         self.on_job = on_job
         self._store: CronStore | None = None
         self._timer_task: asyncio.Task | None = None
+        self._execution_tasks: dict[str, asyncio.Task] = {}
         self._running = False
-        self._timer_active = False
         self.max_sleep_ms = max_sleep_ms
         self.max_concurrency = max(1, max_concurrency)
         self.job_timeout_s = max(0.001, float(job_timeout_s))
@@ -281,20 +299,20 @@ class CronService:
     def _load_store(self) -> CronStore | None:
         """Load jobs from disk. Reloads automatically if file was modified externally.
         - Reload every time so mutations committed by other CronService
-          instances (transactional jobs.json writes) are picked up.
-        - During _on_timer execution, return the existing store to prevent concurrent
-          _load_store calls (e.g. from list_jobs polling) from replacing it mid-execution.
+          instances (transactional jobs.json writes) are picked up.  This is
+          safe to call from anywhere: ``_on_timer`` spawns execution tasks
+          without awaiting them, so no caller can observe a half-applied
+          store, and in-flight executions work on deep copies that are
+          reconciled through token-fenced ``_finalize_claim``.
         - When the on-disk store exists but is unreadable: keep using the
           previous in-memory ``self._store`` if we already have one (so a
           transient corruption does not drop live jobs); only the very first
-          load (during ``start``) can return ``None`` to signal an unrecoverable
-          state to the caller.
+          load (during ``start``) can return ``None`` to signal an
+          unrecoverable state to the caller.
         - A leftover legacy ``action.jsonl`` is ignored and removed (see
           ``_drop_leftover_action_log``): every mutation is applied to
           ``jobs.json`` transactionally, so the action log is never replayed.
         """
-        if self._timer_active and self._store:
-            return self._store
         loaded = self._load_jobs()
         if loaded is None:
             # Corrupt store on disk.  Prefer the last good in-memory snapshot
@@ -498,11 +516,25 @@ class CronService:
         logger.info("Cron service started with {} jobs", len(self._store.jobs if self._store else []))
 
     def stop(self) -> None:
-        """Stop the cron service."""
+        """Stop the cron service: cancel the timer and in-flight executions.
+
+        Cancellation contract: a cancelled execution keeps its claim lease
+        (see ``_run_claimed``).  The partially executed occurrence is therefore
+        not instantly re-run after a restart — it stays claim-blocked until the
+        lease expires, then runs at most once more.  Job state mutations from
+        the cancelled run are simply not committed (``_finalize_claim`` never
+        runs), so restart replays from the persisted pre-run state.
+        """
         self._running = False
         if self._timer_task:
             self._timer_task.cancel()
             self._timer_task = None
+        for task in self._execution_tasks.values():
+            task.cancel()
+
+    async def wait_stopped(self) -> None:
+        """Wait for cancelled executions to unwind (claims are kept by design)."""
+        await asyncio.gather(*self._execution_tasks.values(), return_exceptions=True)
 
     def _recompute_next_runs(self) -> None:
         """Recompute next run times for all enabled jobs."""
@@ -513,19 +545,22 @@ class CronService:
             if job.enabled and job.state.next_run_at_ms is None:
                 # Keep an overdue occurrence so restart handling can apply the
                 # persisted misfire policy instead of silently dropping it.
-                job.state.next_run_at_ms = _compute_next_run(job.schedule, now)
+                job.state.next_run_at_ms = (
+                    job.schedule.at_ms if job.schedule.kind == "at"
+                    else _compute_next_run(job.schedule, now)
+                )
 
     def _get_next_wake_ms(self) -> int | None:
         """Get the earliest next run time across all jobs."""
         if not self._store:
             return None
         times = [j.state.next_run_at_ms for j in self._store.jobs
-                 if j.enabled and j.state.next_run_at_ms]
+                 if j.enabled and j.state.next_run_at_ms and j.id not in self._execution_tasks]
         return min(times) if times else None
 
     def _arm_timer(self) -> None:
         """Schedule the next timer tick."""
-        if self._timer_task:
+        if self._timer_task and self._timer_task is not asyncio.current_task():
             self._timer_task.cancel()
 
         if not self._running:
@@ -535,7 +570,7 @@ class CronService:
         if next_wake is None:
             delay_ms = self.max_sleep_ms
         else:
-            delay_ms = min(self.max_sleep_ms, max(0, next_wake - _now_ms()))
+            delay_ms = min(self.max_sleep_ms, max(10, next_wake - _now_ms()))
         delay_s = delay_ms / 1000
 
         async def tick():
@@ -546,31 +581,28 @@ class CronService:
         self._timer_task = asyncio.create_task(tick())
 
     async def _on_timer(self) -> None:
-        """Handle timer tick - run due jobs."""
-        self._load_store()
-        # If a hot reload found a corrupt store on disk, ``self._store`` may
-        # still hold the previous, known-good in-memory snapshot.  Keep using
-        # it rather than crashing the timer or wiping live jobs.
-        if not self._store:
-            self._arm_timer()
-            return
-
-        self._timer_active = True
+        """Detect due jobs without owning or waiting for their execution."""
         try:
+            self._load_store()
             now = _now_ms()
-            due_jobs = [
-                j for j in self._store.jobs
-                if j.enabled and j.state.next_run_at_ms and now >= j.state.next_run_at_ms
-            ]
-
-            # Snapshot due jobs: each gets an independent task, bounded by a
-            # semaphore, so a slow callback cannot prevent other jobs starting.
-            tasks = [asyncio.create_task(self._execute_due_job(j, now)) for j in due_jobs]
-            if tasks:
-                await asyncio.gather(*tasks)
+            for job in self._store.jobs if self._store else []:
+                if (job.enabled and job.state.next_run_at_ms is not None
+                        and now >= job.state.next_run_at_ms
+                        and job.id not in self._execution_tasks):
+                    task = asyncio.create_task(self._execute_due_job(job, now))
+                    self._execution_tasks[job.id] = task
+                    task.add_done_callback(
+                        lambda finished, job_id=job.id: self._execution_done(job_id, finished)
+                    )
         finally:
-            self._timer_active = False
-        self._arm_timer()
+            self._arm_timer()
+
+    def _execution_done(self, job_id: str, task: asyncio.Task) -> None:
+        self._execution_tasks.pop(job_id, None)
+        if not task.cancelled() and (error := task.exception()) is not None:
+            logger.error("Cron: execution task {} failed: {}", job_id, error)
+        if self._running:
+            self._arm_timer()
 
     def _advance_schedule(self, job: CronJob, scheduled_ms: int | None) -> None:
         if job.schedule.kind == "every" and scheduled_ms is not None and job.schedule.every_ms:
@@ -607,11 +639,8 @@ class CronService:
             ))
             claimed_job.state.run_history = claimed_job.state.run_history[-self._MAX_RUN_HISTORY:]
             if claimed_job.schedule.kind == "at":
-                if claimed_job.delete_after_run:
-                    claimed_job.enabled = False
-                else:
-                    claimed_job.enabled = False
-                    claimed_job.state.next_run_at_ms = None
+                claimed_job.enabled = False
+                claimed_job.state.next_run_at_ms = None
             else:
                 self._advance_schedule(claimed_job, scheduled_ms)
             claimed_job.updated_at_ms = detected_ms
@@ -696,11 +725,8 @@ class CronService:
 
         # Handle one-shot jobs
         if job.schedule.kind == "at":
-            if job.delete_after_run:
-                self._store.jobs = [j for j in self._store.jobs if j.id != job.id]
-            else:
-                job.enabled = False
-                job.state.next_run_at_ms = None
+            job.enabled = False
+            job.state.next_run_at_ms = None
         else:
             # Advance from the scheduled occurrence, not completion time.
             self._advance_schedule(job, scheduled_ms)
@@ -732,15 +758,21 @@ class CronService:
             if require_due and job.state.next_run_at_ms != scheduled_ms:
                 return None
             # A manual run claims the same pending occurrence as the timer.
-            if not require_due and job.state.next_run_at_ms != scheduled_ms:
+            retry_one_shot = (
+                force and job.schedule.kind == "at"
+                and job.state.next_run_at_ms is None
+                and job.state.last_status == "error"
+                and job.schedule.at_ms == scheduled_ms
+            )
+            if not require_due and job.state.next_run_at_ms != scheduled_ms and not retry_one_shot:
                 return None
             claims = self._read_claims()
             key = f"{job_id}:{scheduled_ms}"
             # Remove abandoned claims while holding the same transaction lock.
             claims = {k: v for k, v in claims.items()
                       if int(v.get("lease_expires_at_ms", 0)) > now}
-            old = claims.get(key)
-            if old and int(old.get("lease_expires_at_ms", 0)) > now:
+            old = next((claim for claim in claims.values() if claim.get("job_id") == job_id), None)
+            if old:
                 return None
             token = uuid.uuid4().hex
             claims[key] = {
@@ -770,14 +802,41 @@ class CronService:
                 return
 
     async def _run_claimed(self, job: CronJob, scheduled_ms: int, detected_ms: int, token: str) -> None:
+        """Run a claimed occurrence, releasing the claim when appropriate.
+
+        Claim contract on abnormal exit:
+        - Genuine failures (callback exception, timeout surfacing as a
+          non-cancel error) release the claim immediately so the occurrence
+          can be retried without waiting out the lease.
+        - Cancellation (``stop()`` shutting down, or a caller aborting
+          ``run_job``) KEEPS the claim lease: the occurrence was possibly
+          partially executed, and releasing it would let a restart re-run
+          that half-finished work instantly.  The lease holds the occurrence
+          until it expires naturally (``_claim_lease_ms``), bounding any
+          replay to at most one delayed re-run instead of an instant one.
+        """
         heartbeat = asyncio.create_task(self._claim_heartbeat(job.id, scheduled_ms, token))
         try:
             async with self._concurrency:
                 await self._execute_job(job, scheduled_ms, detected_ms)
+        except asyncio.CancelledError:
+            # Deliberately keep the claim lease; see the contract above.
+            raise
+        except BaseException:
+            self._release_claim(job.id, scheduled_ms, token)
+            raise
         finally:
             heartbeat.cancel()
             with suppress(asyncio.CancelledError):
                 await heartbeat
+
+    def _release_claim(self, job_id: str, scheduled_ms: int, token: str) -> None:
+        with self._lock:
+            claims = self._read_claims()
+            key = f"{job_id}:{scheduled_ms}"
+            if claims.get(key, {}).get("token") == token:
+                claims.pop(key)
+                self._atomic_write(self._claims_path, json.dumps(claims, indent=2))
 
     def _finalize_claim(self, job: CronJob, scheduled_ms: int, token: str) -> bool:
         """Commit execution state only while the claim token is still fenced."""
@@ -801,7 +860,11 @@ class CronService:
 
             # Keep edits made while the agent was running. Execution owns only
             # runtime state, and advances the schedule only if it is unchanged.
-            same_occurrence = current.state.next_run_at_ms == scheduled_ms
+            same_occurrence = (
+                current.state.next_run_at_ms == scheduled_ms
+                or (current.schedule.kind == "at" and current.schedule.at_ms == scheduled_ms
+                    and current.state.next_run_at_ms is None)
+            )
             current.state.last_run_at_ms = job.state.last_run_at_ms
             current.state.last_status = job.state.last_status
             current.state.last_error = job.state.last_error
@@ -812,7 +875,9 @@ class CronService:
             if same_occurrence:
                 current.state.next_run_at_ms = job.state.next_run_at_ms
                 current.enabled = job.enabled
-                if job.delete_after_run and current.schedule.kind == "at":
+                if (job.delete_after_run and current.schedule.kind == "at"
+                        and job.state.last_status in ("ok", "skipped")
+                        and job.state.last_delivery_status not in ("failed", "unknown", "queued")):
                     jobs = [item for item in jobs if item.id != job.id]
             current.updated_at_ms = max(current.updated_at_ms, job.updated_at_ms)
             self._store = CronStore(version=version, jobs=jobs)
@@ -874,12 +939,12 @@ class CronService:
         misfire_grace_ms: int = 60_000,
     ) -> CronJob:
         """Add a new job."""
-        _validate_schedule_for_add(schedule)
+        now = _now_ms()
+        next_run = _validate_schedule_for_add(schedule, now)
         if misfire_policy not in ("skip", "coalesce"):
             raise ValueError("misfire_policy must be 'skip' or 'coalesce'")
         if misfire_grace_ms < 0:
             raise ValueError("misfire_grace_ms must be non-negative")
-        now = _now_ms()
 
         job = CronJob(
             id=str(uuid.uuid4())[:8],
@@ -901,7 +966,7 @@ class CronService:
                 model_preset=model_preset,
                 isolated=isolated,
             ),
-            state=CronJobState(next_run_at_ms=_compute_next_run(schedule, now)),
+            state=CronJobState(next_run_at_ms=next_run),
             created_at_ms=now,
             updated_at_ms=now,
             delete_after_run=delete_after_run,
@@ -928,9 +993,10 @@ class CronService:
         the same id, and the result is saved back.
         """
         now = _now_ms()
+        next_run = _validate_schedule_for_add(job.schedule, now)
 
         def _apply(store: CronStore) -> None:
-            job.state = CronJobState(next_run_at_ms=_compute_next_run(job.schedule, now))
+            job.state = CronJobState(next_run_at_ms=next_run)
             job.created_at_ms = now
             job.updated_at_ms = now
             store.jobs = [j for j in store.jobs if j.id != job.id]
@@ -1093,24 +1159,30 @@ class CronService:
 
     async def run_job(self, job_id: str, force: bool = False) -> bool:
         """Manually run a job; manual and timer runs share occurrence claims."""
-        was_running = self._running
-        self._running = True
-        try:
-            store = self._load_store()
-            job = next((j for j in store.jobs if j.id == job_id), None)
-            if job is None or (not force and not job.enabled) or job.state.next_run_at_ms is None:
+        store = self._load_store()
+        job = next((j for j in store.jobs if j.id == job_id), None) if store else None
+        if job is None or (not force and not job.enabled):
+            return False
+        scheduled_ms = job.state.next_run_at_ms
+        if scheduled_ms is None:
+            if not (force and job.schedule.kind == "at" and job.state.last_status == "error"):
                 return False
-            scheduled_ms = job.state.next_run_at_ms
-            claimed = self._claim_occurrence(job_id, scheduled_ms, force=force, require_due=False)
-            if claimed is None:
-                return False
-            claimed_job, token = claimed
+            scheduled_ms = job.schedule.at_ms
+        if scheduled_ms is None or job_id in self._execution_tasks:
+            return False
+        claimed = self._claim_occurrence(job_id, scheduled_ms, force=force, require_due=False)
+        if claimed is None:
+            return False
+        claimed_job, token = claimed
+
+        async def execute() -> bool:
             await self._run_claimed(claimed_job, scheduled_ms, _now_ms(), token)
             return self._finalize_claim(claimed_job, scheduled_ms, token)
-        finally:
-            self._running = was_running
-            if was_running:
-                self._arm_timer()
+
+        task = asyncio.create_task(execute())
+        self._execution_tasks[job_id] = task
+        task.add_done_callback(lambda finished: self._execution_done(job_id, finished))
+        return await task
 
     def get_job(self, job_id: str) -> CronJob | None:
         """Get a job by ID."""

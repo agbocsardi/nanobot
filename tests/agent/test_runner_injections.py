@@ -829,6 +829,182 @@ async def test_submitted_cron_turn_reports_pending_until_completed(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_cancelled_cron_run_never_publishes_deferred_turn(tmp_path):
+    """A cron run cancelled while its turn sits deferred must not execute later."""
+    from nanobot.bus.events import InboundMessage
+    from nanobot.cron.session_turns import (
+        CRON_DEFER_UNTIL_IDLE_META,
+        CRON_TRIGGER_META,
+    )
+
+    loop = _make_loop(tmp_path)
+    loop._running = True
+
+    session_key = "websocket:chat-1"
+    msg = InboundMessage(
+        channel="websocket",
+        sender_id="cron",
+        chat_id="chat-1",
+        content="scheduled work",
+        metadata={
+            CRON_TRIGGER_META: {"job_id": "job-1", "run_id": "run-1"},
+            CRON_DEFER_UNTIL_IDLE_META: True,
+        },
+        session_key_override=session_key,
+    )
+
+    submit_task = asyncio.create_task(loop.submit_cron_turn(msg))
+    await asyncio.wait_for(loop.bus.consume_inbound(), timeout=0.5)
+
+    # The run loop defers the turn while the target session is busy.
+    loop._pending_queues[session_key] = asyncio.Queue(maxsize=20)
+    assert loop._cron_turns.defer_if_active(
+        msg, session_key=session_key, active_session_keys=[session_key],
+    )
+
+    # The cron service times the job out, cancelling the waiting submit.
+    submit_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await submit_task
+
+    assert loop._cron_turns.is_cancelled(msg)
+    assert loop.pending_cron_job_ids_for_session(session_key) == {"job-1"}
+
+    # Session goes idle: the deferred copy is dropped, never published.
+    await loop._cron_turns.publish_next_deferred(session_key)
+    assert session_key not in loop._cron_turns.deferred_queues
+    assert loop.bus.inbound_size == 0
+    assert loop.pending_cron_job_ids_for_session(session_key) == set()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_cron_turn_dropped_at_consumption(tmp_path):
+    """A published copy of a cancelled cron run is dropped before dispatch."""
+    from nanobot.bus.events import InboundMessage
+    from nanobot.cron.session_turns import CRON_TRIGGER_META
+
+    loop = _make_loop(tmp_path)
+    loop._dispatch = AsyncMock()  # type: ignore[method-assign]
+    loop._running = True
+
+    session_key = "websocket:chat-1"
+    msg = InboundMessage(
+        channel="websocket",
+        sender_id="cron",
+        chat_id="chat-1",
+        content="scheduled work",
+        metadata={CRON_TRIGGER_META: {"job_id": "job-1", "run_id": "run-1"}},
+        session_key_override=session_key,
+    )
+
+    submit_task = asyncio.create_task(loop.submit_cron_turn(msg))
+    queued = await asyncio.wait_for(loop.bus.consume_inbound(), timeout=0.5)
+    assert queued is msg
+    submit_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await submit_task
+
+    # The message had already been published before the run was cancelled.
+    await loop.bus.publish_inbound(msg)
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(20):
+        if loop.bus.inbound_size == 0:
+            break
+        await asyncio.sleep(0.05)
+    loop.stop()
+    await asyncio.wait_for(run_task, timeout=2)
+
+    loop._dispatch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_silent_cron_reply_reports_suppressed_delivery(tmp_path):
+    """[SILENT] in-band cron replies complete as suppressed, not delivered."""
+    from nanobot.bus.events import DeliveryResult, InboundMessage, OutboundMessage
+    from nanobot.cron.session_turns import CRON_TRIGGER_META
+
+    loop = _make_loop(tmp_path)
+    loop._running = True
+
+    session_key = "websocket:chat-1"
+    msg = InboundMessage(
+        channel="websocket",
+        sender_id="cron",
+        chat_id="chat-1",
+        content="scheduled work",
+        metadata={CRON_TRIGGER_META: {"job_id": "job-1", "run_id": "run-1"}},
+        session_key_override=session_key,
+    )
+
+    submit_task = asyncio.create_task(loop.submit_cron_turn(msg))
+    await asyncio.wait_for(loop.bus.consume_inbound(), timeout=0.5)
+
+    response = OutboundMessage(
+        channel="websocket",
+        chat_id="chat-1",
+        content="[SILENT]\n",
+    )
+    loop._process_message = AsyncMock(return_value=response)  # type: ignore[method-assign]
+
+    dispatch_task = asyncio.create_task(loop._dispatch(msg))
+    result = await asyncio.wait_for(submit_task, timeout=1)
+    await asyncio.wait_for(dispatch_task, timeout=1)
+
+    assert result is response
+    assert result.delivery is not None
+    assert result.delivery.done()
+    assert result.delivery.result() == DeliveryResult("suppressed")
+    assert loop.bus.outbound_size == 0
+
+
+@pytest.mark.asyncio
+async def test_cron_reply_dispatch_attaches_delivery_future(tmp_path):
+    """In-band cron replies are tracked so run_bound_cron_job can await the ack."""
+    from nanobot.bus.events import DeliveryResult, InboundMessage, OutboundMessage
+    from nanobot.bus.queue import MessageBus
+    from nanobot.cron.session_turns import CRON_TRIGGER_META
+
+    loop = _make_loop(tmp_path)
+    loop._running = True
+
+    session_key = "websocket:chat-1"
+    msg = InboundMessage(
+        channel="websocket",
+        sender_id="cron",
+        chat_id="chat-1",
+        content="scheduled work",
+        metadata={CRON_TRIGGER_META: {"job_id": "job-1", "run_id": "run-1"}},
+        session_key_override=session_key,
+    )
+
+    submit_task = asyncio.create_task(loop.submit_cron_turn(msg))
+    await asyncio.wait_for(loop.bus.consume_inbound(), timeout=0.5)
+
+    response = OutboundMessage(
+        channel="websocket",
+        chat_id="chat-1",
+        content="Upstream released v2.6",
+    )
+    loop._process_message = AsyncMock(return_value=response)  # type: ignore[method-assign]
+
+    dispatch_task = asyncio.create_task(loop._dispatch(msg))
+    result = await asyncio.wait_for(submit_task, timeout=1)
+    await asyncio.wait_for(dispatch_task, timeout=1)
+
+    # The response carried back to the cron runner holds the pending ack.
+    assert result is response
+    assert result.delivery is not None
+    assert not result.delivery.done()
+
+    outbound_msg = loop.bus.outbound.get_nowait()
+    assert outbound_msg is response
+
+    # The channel manager acknowledges after the transport send resolves.
+    MessageBus.acknowledge(outbound_msg, DeliveryResult("delivered"))
+    assert result.delivery.result() == DeliveryResult("delivered")
+
+
+@pytest.mark.asyncio
 async def test_pending_queue_preserves_overflow_for_next_injection_cycle(tmp_path):
     """Pending queue should leave overflow messages queued for later drains."""
     from nanobot.agent.loop import AgentLoop

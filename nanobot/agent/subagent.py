@@ -568,6 +568,7 @@ class SubagentManager:
                 channel=origin.get("channel") or "system",
                 chat_id=origin.get("chat_id") or "direct",
                 session_key=sess_key,
+                sender_id=origin.get("sender_id"),
                 metadata={"interaction_mode": "delegated"},
             ))
             try:
@@ -745,6 +746,7 @@ class SubagentManager:
         *,
         session_key: str,
         sender_id: str | None = None,
+        trusted: bool = False,
     ) -> tuple[dict[str, Any] | None, str | None]:
         """Ownership-gated record lookup: ``(record, None)`` or ``(None, problem)``.
 
@@ -759,7 +761,11 @@ class SubagentManager:
         if origin.get("session_key") != session_key:
             return None, "not_owned"
         rec_sender = origin.get("sender_id")
-        if sender_id is not None and rec_sender and str(rec_sender) != str(sender_id):
+        # A caller without a sender is an internal entry point (cron, dream,
+        # task control) and is trusted; participant scoping needs a sender.
+        if not trusted and sender_id is not None and (
+            not rec_sender or str(rec_sender) != str(sender_id)
+        ):
             return None, "not_owned"
         return record, None
 
@@ -768,6 +774,7 @@ class SubagentManager:
         session_key: str,
         *,
         sender_id: str | None = None,
+        trusted: bool = False,
         limit: int = _TASK_LIST_LIMIT,
     ) -> list[dict[str, Any]]:
         """Bounded, newest-first durable records owned by *session_key*."""
@@ -785,7 +792,9 @@ class SubagentManager:
             if not isinstance(origin, dict) or origin.get("session_key") != session_key:
                 continue
             rec_sender = origin.get("sender_id")
-            if sender_id is not None and rec_sender and str(rec_sender) != str(sender_id):
+            if not trusted and sender_id is not None and (
+                not rec_sender or str(rec_sender) != str(sender_id)
+            ):
                 continue
             records.append(record)
         records.sort(
@@ -794,13 +803,21 @@ class SubagentManager:
         )
         return records[: max(1, limit)]
 
-    async def cancel_task(self, task_id: str, *, session_key: str) -> str:
+    async def cancel_task(
+        self, task_id: str, *, session_key: str,
+        sender_id: str | None = None, trusted: bool = False,
+    ) -> str:
         """Cooperatively cancel one owned task.
 
         Returns ``cancelled``, ``not_owned``, ``done`` (already terminal) or
         ``not_found``. Never kills external processes; cancellation is the
         same cooperative task cancellation used by ``/stop``.
         """
+        record, problem = self.owned_record(
+            task_id, session_key=session_key, sender_id=sender_id, trusted=trusted,
+        )
+        if problem is not None:
+            return problem
         task = self._running_tasks.get(task_id)
         if task is not None and not task.done():
             owned_ids = self._session_tasks.get(session_key, set())
@@ -812,9 +829,6 @@ class SubagentManager:
             if self._finalizer_tasks:
                 await asyncio.gather(*list(self._finalizer_tasks), return_exceptions=True)
             return "cancelled"
-        record, problem = self.owned_record(task_id, session_key=session_key)
-        if problem is not None:
-            return problem
         phase = str(record.get("phase") or "")
         if phase in ("queued", "running"):
             return "not_owned"  # live elsewhere in this process; defensive
@@ -826,6 +840,7 @@ class SubagentManager:
         *,
         session_key: str,
         sender_id: str | None = None,
+        trusted: bool = False,
     ) -> tuple[str, str]:
         """Retry a terminal task as a NEW run with explicit lineage.
 
@@ -834,6 +849,11 @@ class SubagentManager:
         The old record gains ``retried_by``; the new record carries
         ``retry_of``. Never re-marks the failed record as running.
         """
+        record, problem = self.owned_record(
+            task_id, session_key=session_key, sender_id=sender_id, trusted=trusted,
+        )
+        if problem is not None:
+            return problem, task_id
         # The in-process registry is authoritative for live runs; consult it
         # first so active tasks are never retried.
         task = self._running_tasks.get(task_id)
@@ -843,11 +863,6 @@ class SubagentManager:
                 return "not_owned", task_id
             return "still_active", task_id
 
-        record, problem = self.owned_record(
-            task_id, session_key=session_key, sender_id=sender_id
-        )
-        if problem is not None:
-            return problem, task_id
 
         params = record.get("params") or {}
         origin = record.get("origin") or {}
@@ -911,6 +926,7 @@ class SubagentManager:
         metadata: dict[str, Any] = {
             "injected_event": "subagent_result",
             "subagent_task_id": task_id,
+            "origin_sender_id": origin.get("sender_id"),
             "delivery_policy": "parent",
             "subagent_result": {
                 "task_id": task_id,
@@ -1009,10 +1025,26 @@ class SubagentManager:
             }
         return prompt
 
-    async def cancel_by_session(self, session_key: str) -> int:
-        """Cancel all subagents for the given session. Returns count cancelled."""
-        tasks = [self._running_tasks[tid] for tid in self._session_tasks.get(session_key, [])
-                 if tid in self._running_tasks and not self._running_tasks[tid].done()]
+    async def cancel_by_session(
+        self, session_key: str, *, sender_id: str | None = None, trusted: bool = False,
+    ) -> int:
+        """Cancel only the participant's tasks, or all tasks for an explicit internal caller.
+
+        A call with no sender is an internal entry point (cron, shutdown,
+        dream) and cancels session-wide; ownership scoping needs a sender.
+        """
+        effective_trusted = trusted or sender_id is None
+        tasks = [
+            self._running_tasks[tid]
+            for tid in self._session_tasks.get(session_key, [])
+            if tid in self._running_tasks and not self._running_tasks[tid].done()
+            and (
+                effective_trusted
+                or self.owned_record(
+                    tid, session_key=session_key, sender_id=sender_id,
+                )[1] is None
+            )
+        ]
         for t in tasks:
             t.cancel()
         if tasks:

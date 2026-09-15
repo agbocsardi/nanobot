@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import Field
 
-from nanobot.bus.events import OutboundMessage
+from nanobot.bus.events import DeliveryResult, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.command.builtin import build_help_text
@@ -35,6 +35,13 @@ if DISCORD_AVAILABLE:
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20MB
 MAX_MESSAGE_LEN = 2000  # Discord message character limit
 TYPING_INTERVAL_S = 8
+
+def _send_failure(exc: Exception) -> DeliveryResult:
+    """Only explicit HTTP rejection proves a submitted message wasn't accepted."""
+    status = getattr(exc, "status", None)
+    rejected = isinstance(status, int) and 400 <= status < 500
+    return DeliveryResult("failed" if rejected else "unknown", str(exc))
+
 
 
 @dataclass
@@ -243,9 +250,12 @@ if DISCORD_AVAILABLE:
                     error,
                 )
 
-        async def send_outbound(self, msg: OutboundMessage) -> None:
+        async def send_outbound(self, msg: OutboundMessage) -> DeliveryResult:
             """Send a nanobot outbound message using Discord transport rules."""
-            channel_id = int(msg.chat_id)
+            try:
+                channel_id = int(msg.chat_id)
+            except ValueError:
+                return DeliveryResult("failed", "Invalid Discord channel ID")
 
             channel = self._channel._known_channels.get(msg.chat_id) or self.get_channel(channel_id)
             if channel is None:
@@ -253,20 +263,26 @@ if DISCORD_AVAILABLE:
                     channel = await self.fetch_channel(channel_id)
                 except Exception as e:
                     self._channel.logger.warning("channel {} unavailable: {}", msg.chat_id, e)
-                    return
+                    # A 4xx rejection proves the channel is unreachable; a
+                    # network/5xx failure leaves the outcome ambiguous.
+                    return _send_failure(e)
 
             reference, mention_settings = self._build_reply_context(channel, msg.reply_to)
             sent_media = False
             failed_media: list[str] = []
+            accepted = False
 
             for index, media_path in enumerate(msg.media or []):
-                if await self._send_file(
+                result = await self._send_file(
                     channel,
                     media_path,
                     reference=reference if index == 0 else None,
                     mention_settings=mention_settings,
-                ):
-                    sent_media = True
+                )
+                if result.status == "unknown":
+                    return result
+                if result.status == "delivered":
+                    sent_media = accepted = True
                 else:
                     failed_media.append(Path(media_path).name)
 
@@ -277,7 +293,17 @@ if DISCORD_AVAILABLE:
                 if index == 0 and reference is not None and not sent_media:
                     kwargs["reference"] = reference
                     kwargs["allowed_mentions"] = mention_settings
-                await channel.send(**kwargs)
+                try:
+                    await channel.send(**kwargs)
+                    accepted = True
+                except Exception as exc:
+                    result = _send_failure(exc)
+                    return DeliveryResult("unknown", result.error) if accepted else result
+            if failed_media:
+                return DeliveryResult(
+                    "unknown" if accepted else "failed", "Some attachments were not delivered"
+                )
+            return DeliveryResult("delivered" if accepted else "suppressed")
 
         async def _send_file(
             self,
@@ -286,16 +312,16 @@ if DISCORD_AVAILABLE:
             *,
             reference: discord.PartialMessage | None,
             mention_settings: discord.AllowedMentions,
-        ) -> bool:
+        ) -> DeliveryResult:
             """Send a file attachment via discord.py."""
             path = Path(file_path)
             if not path.is_file():
                 self._channel.logger.warning("file not found, skipping: {}", file_path)
-                return False
+                return DeliveryResult("failed", f"File not found: {path.name}")
 
             if path.stat().st_size > MAX_ATTACHMENT_BYTES:
                 self._channel.logger.warning("file too large (>20MB), skipping: {}", path.name)
-                return False
+                return DeliveryResult("failed", f"File too large: {path.name}")
 
             try:
                 kwargs: dict[str, Any] = {"file": discord.File(path)}
@@ -304,10 +330,10 @@ if DISCORD_AVAILABLE:
                     kwargs["allowed_mentions"] = mention_settings
                 await channel.send(**kwargs)
                 self._channel.logger.info("file sent: {}", path.name)
-                return True
-            except Exception:
+                return DeliveryResult("delivered")
+            except Exception as exc:
                 self._channel.logger.exception("Error sending file {}", path.name)
-                return False
+                return _send_failure(exc)
 
         @staticmethod
         def _build_chunks(content: str, failed_media: list[str], sent_media: bool) -> list[str]:
@@ -474,20 +500,21 @@ class DiscordChannel(BaseChannel):
         self._running = False
         await self._reset_runtime_state(close_client=True)
 
-    async def send(self, msg: OutboundMessage) -> None:
+    async def send(self, msg: OutboundMessage) -> DeliveryResult:
         """Send a message through Discord using discord.py."""
         client = self._client
         if client is None or not client.is_ready():
             self.logger.warning("client not ready; dropping outbound message")
-            return
+            return DeliveryResult("failed", "Discord client not ready")
 
         is_progress = bool((msg.metadata or {}).get("_progress"))
 
         try:
-            await client.send_outbound(msg)
-        except Exception:
+            result = await client.send_outbound(msg)
+            return result if isinstance(result, DeliveryResult) else DeliveryResult("unknown")
+        except Exception as exc:
             self.logger.exception("Error sending message")
-            raise
+            return _send_failure(exc)
         finally:
             if not is_progress:
                 await self._stop_typing(msg.chat_id)

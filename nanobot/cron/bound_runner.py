@@ -10,11 +10,12 @@ from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
 
 from nanobot.agent.tools.cron import CronTool
-from nanobot.bus.events import InboundMessage, OutboundMessage
+from nanobot.bus.events import DeliveryResult, InboundMessage, OutboundMessage
 from nanobot.cron.session_delivery import origin_delivery_context
 from nanobot.cron.session_turns import (
     CRON_DEFER_UNTIL_IDLE_META,
     CRON_RUN_SNAPSHOT_META,
+    CRON_SILENT_MARKER,
     CRON_SILENT_META,
     CRON_TRIGGER_META,
 )
@@ -27,6 +28,16 @@ def _now_ms() -> int:
     """Wall-clock time in ms. Module-level so tests can pin it."""
     return int(time.time() * 1000)
 
+
+
+async def _await_delivery(
+    future: "asyncio.Future[DeliveryResult]", timeout_s: float = 30.0
+) -> DeliveryResult:
+    """Await a channel acknowledgement; silence is unknown, never success."""
+    try:
+        return await asyncio.wait_for(asyncio.shield(future), timeout_s)
+    except asyncio.TimeoutError:
+        return DeliveryResult("unknown", "Channel acknowledgement timed out")
 
 class BoundCronAgent(Protocol):
     tools: Any
@@ -201,9 +212,49 @@ async def run_bound_cron_job(
             cron_tool.reset_cron_context(cron_token)
 
     response = resp.content if resp else ""
-    delivery_status = "empty" if not response else "suppressed" if job.payload.silent else "delivered"
+    if not response:
+        delivery_status, delivery_error = "empty", None
+    elif job.payload.silent:
+        delivery_status, delivery_error = "suppressed", None
+    elif (future := getattr(resp, "delivery", None)) is not None:
+        # Real loop: wait for the channel acknowledgement instead of assuming
+        # the reply was seen just because it was routed.
+        ack = await _await_delivery(future)
+        delivery_status, delivery_error = ack.status, ack.error
+    elif response.strip() == CRON_SILENT_MARKER:
+        delivery_status, delivery_error = "suppressed", None
+    else:
+        # Legacy callback: the reply was routed through the loop with no
+        # acknowledgement future, so routing success is all we know.
+        delivery_status, delivery_error = "delivered", None
+    delivery_failure = (
+        RuntimeError(f"delivery failed: {delivery_error}")
+        if delivery_status == "failed"
+        else None
+    )
+    if delivery_failure is not None:
+        delivery_finished_at_ms = _now_ms()
+        job.state.last_delivery_status = delivery_status
+        job.state.last_delivery_error = delivery_error
+        job.state.last_delivery_at_ms = delivery_finished_at_ms
+        cron.write_run_record(
+            run_id,
+            {
+                **run_record_base,
+                "status": "error",
+                "error": f"delivery failed: {delivery_error}",
+                "response": response,
+                "agent_finished_at_ms": agent_finished_at_ms,
+                "delivery": {
+                    "status": delivery_status,
+                    "error": delivery_error,
+                    "at_ms": delivery_finished_at_ms,
+                },
+            },
+        )
+        raise delivery_failure
     job.state.last_delivery_status = delivery_status
-    job.state.last_delivery_error = None
+    job.state.last_delivery_error = delivery_error
     # In-band cron delivery is complete once the turn's reply has been routed
     # back through the loop; record the wall time so delivery duration is
     # separately measurable from turn duration.
@@ -228,7 +279,7 @@ async def run_bound_cron_job(
             "agent_finished_at_ms": agent_finished_at_ms,
             "delivery": {
                 "status": delivery_status,
-                "error": None,
+                "error": delivery_error,
                 "at_ms": delivery_finished_at_ms,
             },
         },
@@ -271,7 +322,7 @@ async def run_isolated_cron_job(
     )
     prompt_ref = _cron_prompt_ref(prompt)
     run_id = f"{job.id}:{_now_ms()}:{uuid.uuid4().hex[:8]}"
-    channel, chat_id, _ = origin_delivery_context(job)
+    channel, chat_id, origin_metadata = origin_delivery_context(job)
 
     # Per-job model preset wins over the global cron snapshot; fall back to
     # the global snapshot (then the main model) if resolution fails.
@@ -341,38 +392,62 @@ async def run_isolated_cron_job(
             cron_tool.reset_cron_context(cron_token)
 
     response = resp.content if resp else ""
-    delivery_status = "empty" if not response else "suppressed" if job.payload.silent else "pending"
     delivery_error = None
-    if delivery_status == "pending":
+    delivery_failure: BaseException | None = None
+    if not response:
+        delivery_status = "empty"
+    elif job.payload.silent or response.strip() == CRON_SILENT_MARKER:
+        # Silent jobs and the explicit [SILENT] marker suppress delivery on
+        # both execution paths (audit: the isolated path used to send the
+        # literal marker to the chat).
+        delivery_status = "suppressed"
+    else:
         try:
-            await deliver(
-                OutboundMessage(channel=channel, chat_id=chat_id, content=response),
+            ack = await deliver(
+                OutboundMessage(
+                    channel=channel,
+                    chat_id=chat_id,
+                    content=response,
+                    metadata=origin_metadata,
+                ),
                 record=True,
             )
-            delivery_status = "delivered"
         except (Exception, asyncio.CancelledError) as exc:
             delivery_status = "failed"
             delivery_error = str(exc) or exc.__class__.__name__
-            delivery_finished_at_ms = _now_ms()
-            job.state.last_delivery_status = delivery_status
-            job.state.last_delivery_error = delivery_error
-            job.state.last_delivery_at_ms = delivery_finished_at_ms
-            cron.write_run_record(
-                run_id,
-                {
-                    **run_record_base,
-                    "status": "error",
-                    "error": f"delivery failed: {delivery_error}",
-                    "response": response,
-                    "agent_finished_at_ms": agent_finished_at_ms,
-                    "delivery": {
-                        "status": delivery_status,
-                        "error": delivery_error,
-                        "at_ms": delivery_finished_at_ms,
-                    },
+            delivery_failure = exc
+        else:
+            if isinstance(ack, DeliveryResult):
+                delivery_status = ack.status
+                delivery_error = ack.error
+                if ack.status == "failed":
+                    delivery_failure = RuntimeError(
+                        f"delivery failed: {delivery_error}"
+                    )
+            else:
+                # Legacy callable without acknowledgement contract.
+                delivery_status = "delivered"
+    if delivery_failure is not None:
+        delivery_finished_at_ms = _now_ms()
+        job.state.last_delivery_status = delivery_status
+        job.state.last_delivery_error = delivery_error
+        job.state.last_delivery_at_ms = delivery_finished_at_ms
+        cron.write_run_record(
+            run_id,
+            {
+                **run_record_base,
+                "status": "error",
+                "error": f"delivery failed: {delivery_error}",
+                "response": response,
+                "agent_finished_at_ms": agent_finished_at_ms,
+                "delivery": {
+                    "status": delivery_status,
+                    "error": delivery_error,
+                    "at_ms": delivery_finished_at_ms,
                 },
-            )
-            raise
+            },
+        )
+        raise delivery_failure
 
     delivery_finished_at_ms = _now_ms()
     job.state.last_delivery_status = delivery_status

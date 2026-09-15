@@ -9,7 +9,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
-from nanobot.agent.tools.base import Tool, tool_parameters
+from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
 from nanobot.agent.tools.context import current_request_session_key
 from nanobot.agent.tools.schema import (
     BooleanSchema,
@@ -352,6 +352,30 @@ def format_session_poll(session_id: str, poll: _SessionPoll) -> str:
     return "\n".join(parts) if parts else "(no output yet)"
 
 
+def render_session_poll_outcome(session_id: str, poll: _SessionPoll) -> ToolResult:
+    """Classify a session poll into a structured, truthful tool outcome.
+
+    The rendered text is unchanged; only the operational status derives from
+    real process state: a still-running session is ``partial`` (never terminal
+    success), timeout/termination/nonzero exits are retryable errors, and only
+    a clean zero exit is success.
+    """
+    return _poll_outcome(session_id, poll, format_session_poll(session_id, poll))
+
+
+def _poll_outcome(session_id: str, poll: _SessionPoll, text: str) -> ToolResult:
+    data: dict[str, Any] = {
+        "state": "exited" if poll.done else "running",
+        "session_id": session_id,
+        "exit_code": poll.exit_code,
+    }
+    if not poll.done:
+        return ToolResult.partial(text, data=data)
+    if poll.timed_out or poll.terminated or poll.exit_code != 0:
+        return ToolResult.retryable_error(text, data=data, exit_code=poll.exit_code)
+    return ToolResult(text, status="success", data=data, exit_code=0)
+
+
 @tool_parameters(
     tool_parameters_schema(
         session_id=StringSchema("Session id returned by exec when yield_time_ms is used."),
@@ -537,7 +561,7 @@ class WriteStdinTool(Tool):
                 max_output_chars=output_limit,
                 owner_session_key=current_request_session_key(),
             )
-            return format_session_poll(session_id, poll)
+            return render_session_poll_outcome(session_id, poll)
         except KeyError:
             return f"Error: exec session not found: {session_id}"
         except Exception as exc:
@@ -581,15 +605,15 @@ class WriteStdinTool(Tool):
                 joined = "".join(aggregate)
                 if wait_for is not None and wait_for in joined:
                     poll.output = joined
-                    return format_session_poll(session_id, poll)
+                    return render_session_poll_outcome(session_id, poll)
             if poll.done or remaining_ms <= 0:
                 poll.output = "".join(aggregate)
-                result = format_session_poll(session_id, poll)
+                text = format_session_poll(session_id, poll)
                 if wait_for is not None and wait_for not in poll.output:
-                    result += f"\nWait target not observed: {wait_for!r}"
+                    text += f"\nWait target not observed: {wait_for!r}"
                 if until_exit and not poll.done:
-                    result += f"\nProcess still running after {timeout_ms / 1000:.1f}s."
-                return result
+                    text += f"\nProcess still running after {timeout_ms / 1000:.1f}s."
+                return _poll_outcome(session_id, poll, text)
 
 
 @tool_parameters(tool_parameters_schema())

@@ -195,17 +195,18 @@ class TestDispatch:
 
 class TestSubagentCancellation:
     @pytest.mark.asyncio
-    async def test_cancel_by_session(self):
+    async def test_cancel_by_session(self, tmp_path):
+        import json
+
         from nanobot.agent.subagent import SubagentManager
         from nanobot.bus.queue import MessageBus
 
-        bus = MessageBus()
         provider = MagicMock()
         provider.get_default_model.return_value = "test-model"
         mgr = SubagentManager(
             provider=provider,
-            workspace=MagicMock(),
-            bus=bus,
+            workspace=tmp_path,
+            bus=MessageBus(),
             max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
         )
 
@@ -222,8 +223,19 @@ class TestSubagentCancellation:
         await asyncio.sleep(0)
         mgr._running_tasks["sub-1"] = task
         mgr._session_tasks["test:c1"] = {"sub-1"}
+        # Ownership gate: internal (trusted) callers need a durable record.
+        records_dir = tmp_path / "subagents"
+        records_dir.mkdir(parents=True, exist_ok=True)
+        (records_dir / "sub-1.json").write_text(
+            json.dumps({
+                "task_id": "sub-1",
+                "origin": {"session_key": "test:c1", "sender_id": "u1"},
+                "phase": "running",
+            }),
+            encoding="utf-8",
+        )
 
-        count = await mgr.cancel_by_session("test:c1")
+        count = await mgr.cancel_by_session("test:c1", trusted=True)
         assert count == 1
         assert cancelled.is_set()
 
@@ -514,3 +526,61 @@ class TestSubagentAnnounceSessionKey:
 
         msg = await bus.consume_inbound()
         assert msg.session_key_override == UNIFIED_SESSION_KEY
+
+
+class TestStopSenderScoping:
+    @pytest.mark.asyncio
+    async def test_stop_rejects_wrong_sender_and_cancels_owner_tasks(self, tmp_path):
+        """Subagent cancellation is sender-scoped; internal no-sender stop stays session-wide."""
+        import json
+
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.bus.queue import MessageBus
+
+        provider = MagicMock()
+        provider.get_default_model.return_value = "test-model"
+        mgr = SubagentManager(
+            provider=provider,
+            workspace=tmp_path,
+            bus=MessageBus(),
+            max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        )
+        loop, _bus = _make_loop()
+        loop.subagents = mgr
+
+        def make_task(event: asyncio.Event) -> asyncio.Task:
+            async def slow():
+                try:
+                    await asyncio.sleep(60)
+                except asyncio.CancelledError:
+                    event.set()
+                    raise
+
+            return asyncio.create_task(slow())
+
+        cancelled = asyncio.Event()
+        victim = make_task(cancelled)
+        mgr._running_tasks["sub-owner-1"] = victim
+        mgr._session_tasks["test:c1"] = {"sub-owner-1"}
+        await asyncio.sleep(0)  # let the task body enter its sleep before cancelling
+        mgr.records_dir.mkdir(parents=True, exist_ok=True)
+        (mgr.records_dir / "sub-owner-1.json").write_text(
+            json.dumps({
+                "task_id": "sub-owner-1",
+                "origin": {"session_key": "test:c1", "sender_id": "userA"},
+                "phase": "running",
+            }),
+            encoding="utf-8",
+        )
+
+        # A different participant cannot cancel the task, via either entry point.
+        assert await mgr.cancel_task(
+            "sub-owner-1", session_key="test:c1", sender_id="userB",
+        ) == "not_owned"
+        assert not cancelled.is_set()
+        assert await loop._cancel_active_tasks("test:c1", sender_id="userB") == 0
+        assert not cancelled.is_set()
+
+        # The owning participant cancels it through the same /stop path.
+        assert await loop._cancel_active_tasks("test:c1", sender_id="userA") == 1
+        assert cancelled.is_set()

@@ -2,7 +2,7 @@
 
 import asyncio
 
-from nanobot.bus.events import InboundMessage, OutboundMessage
+from nanobot.bus.events import DeliveryResult, InboundMessage, OutboundMessage
 
 
 class MessageBus:
@@ -28,6 +28,30 @@ class MessageBus:
     async def publish_outbound(self, msg: OutboundMessage) -> None:
         """Publish a response from the agent to channels."""
         await self.outbound.put(msg)
+
+    async def publish_outbound_tracked(
+        self, msg: OutboundMessage,
+    ) -> asyncio.Future[DeliveryResult]:
+        """Queue the message and retain its channel acknowledgement future."""
+        if msg.delivery is None:
+            msg.delivery = asyncio.get_running_loop().create_future()
+        await self.publish_outbound(msg)
+        return msg.delivery
+
+    @staticmethod
+    def acknowledge(msg: OutboundMessage, result: DeliveryResult) -> None:
+        if msg.delivery is not None and not msg.delivery.done():
+            msg.delivery.set_result(result)
+
+    @staticmethod
+    async def wait_delivery(msg: OutboundMessage, timeout: float = 60) -> DeliveryResult:
+        """A missing or late acknowledgement is unknown, never success."""
+        if msg.delivery is None:
+            return DeliveryResult("unknown", "No channel acknowledgement requested")
+        try:
+            return await asyncio.wait_for(asyncio.shield(msg.delivery), timeout)
+        except asyncio.TimeoutError:
+            return DeliveryResult("unknown", "Channel acknowledgement timed out")
 
     async def consume_outbound(self) -> OutboundMessage:
         """Consume the next outbound message (blocks until available)."""

@@ -792,7 +792,7 @@ def _run_gateway(
         discord_runtime_handle=discord_runtime,
     )
 
-    from nanobot.bus.events import OutboundMessage
+    from nanobot.bus.events import DeliveryResult, OutboundMessage
     from nanobot.session.keys import session_key_for_channel
 
     def _channel_session_key(channel: str, chat_id: str) -> str:
@@ -804,8 +804,9 @@ def _run_gateway(
 
     async def _deliver_to_channel(
         msg: OutboundMessage, *, record: bool = False, session_key: str | None = None,
-    ) -> None:
-        """Publish a user-visible message and mirror it into that channel's session."""
+    ) -> DeliveryResult:
+        """Publish a message, await the channel acknowledgement, and mirror it
+        into that channel's session only once the channel accepted delivery."""
         metadata = dict(msg.metadata or {})
         record = record or bool(metadata.pop("_record_channel_delivery", False))
         if metadata != (msg.metadata or {}):
@@ -818,8 +819,13 @@ def _run_gateway(
                 metadata=metadata,
                 buttons=msg.buttons,
             )
+        await bus.publish_outbound_tracked(msg)
+        result = await bus.wait_delivery(msg, timeout=30.0)
+        # History must not claim an assistant statement the user never
+        # received: mirror into the session only after real delivery.
         if (
-            record
+            result.status == "delivered"
+            and record
             and msg.channel != "cli"
             and msg.content.strip()
             and hasattr(session_manager, "get_or_create")
@@ -832,7 +838,7 @@ def _run_gateway(
                 extra["media"] = list(msg.media)
             session.add_message("assistant", msg.content, **extra)
             session_manager.save(session)
-        await bus.publish_outbound(msg)
+        return result
 
     message_tool = getattr(agent, "tools", {}).get("message")
     if isinstance(message_tool, MessageTool):

@@ -27,6 +27,7 @@ from nanobot.utils.helpers import (
     estimate_message_tokens,
     estimate_prompt_tokens_chain,
     find_legal_message_start,
+    load_bundled_template,
     recent_message_start_index,
     strip_think,
     truncate_text,
@@ -355,23 +356,33 @@ class MemoryStore:
     def get_memory_context(self) -> str:
         """Return always-loaded memory context.
 
-        Reads all .md files from ``memory/system/`` and concatenates their
-        bodies. Falls back to the legacy monolithic ``memory/MEMORY.md`` if
-        the system directory is empty (backward compat).
+        Load system files alongside any legacy MEMORY.md material not yet
+        copied into them. Migration is explicit: readers never rewrite or
+        delete either source, and identical paragraphs are loaded only once.
         """
         parts: list[str] = []
+        system_paragraphs: set[str] = set()
         for md_file in sorted(self.system_dir.glob("*.md")):
             raw = md_file.read_text(encoding="utf-8")
             content = self._body_without_frontmatter(raw).strip()
             if content:
+                system_paragraphs.update(part.strip() for part in content.split("\n\n"))
                 rel_path = str(md_file.relative_to(self.workspace))
                 parts.append(f"## {rel_path}\n\n{content}")
-        if parts:
-            return "# System Memory\n\n" + "\n\n".join(parts)
-
-        # Legacy fallback — workspace hasn't migrated to system/ yet
-        long_term = self._body_without_frontmatter(self.read_memory()).strip()
-        return f"## Long-term Memory\n{long_term}" if long_term else ""
+        raw_memory = self.read_memory()
+        template = load_bundled_template("memory/MEMORY.md")
+        long_term = (
+            ""
+            if template is not None and raw_memory.strip() == template.strip()
+            else self._body_without_frontmatter(raw_memory).strip()
+        )
+        legacy = "\n\n".join(
+            part for part in long_term.split("\n\n")
+            if part.strip() and part.strip() not in system_paragraphs
+        )
+        if legacy:
+            parts.append(f"## Long-term Memory\n{legacy}")
+        return "# System Memory\n\n" + "\n\n".join(parts) if parts else ""
 
     def get_memory_tree_context(self) -> str:
         """Return a compact index of memory files and their descriptions.
@@ -386,7 +397,10 @@ class MemoryStore:
             body = self._body_without_frontmatter(raw).strip()
             description = self._description_from_markdown(raw)
             rel_path = str(md_file.relative_to(self.workspace))
-            loaded = "loaded" if md_file.is_relative_to(self.system_dir) else "topic"
+            loaded = (
+                "loaded" if md_file.is_relative_to(self.system_dir) or md_file == self.memory_file
+                else "topic"
+            )
             entries.append(
                 f"- `{rel_path}` ({loaded}, {len(body)} chars): {description}"
             )
@@ -396,7 +410,7 @@ class MemoryStore:
             return ""
         return "\n".join([
             "# Memory Tree",
-            "Files in `memory/system/` are already loaded in full. Other files are topic memories; use their descriptions to decide what may be relevant.",
+            "Files marked loaded are already included in context. Other files are topic memories; use their descriptions to decide what may be relevant.",
             *entries,
         ])
 
@@ -633,26 +647,48 @@ class MemoryStore:
         session_key: str | None,
         unified_session: bool = False,
     ) -> list[str]:
-        """Return LLM summaries of unprocessed history entries for a session.
+        """Return summaries or bounded fallback excerpts for unprocessed history.
 
-        Seeds a fresh session's [Archived Context Summary] with the recent
-        sessions Dream has not yet distilled. Reuses the same session/dream
-        filtering as ``read_recent_history_for_prompt``. Entries without a
-        ``summary`` (raw-archive fallback or legacy text entries) are skipped
-        — they would bloat the block with raw transcripts. Returned in cursor
-        order (oldest first); callers reverse to prioritize recency under the
-        char cap.
+        Reuses the session/dream filtering of ``read_recent_history_for_prompt``.
+        A failed summary must not erase archived context from the next turn:
+        structured messages provide a small, sanitized user/assistant excerpt
+        instead. Legacy text-only entries remain excluded. Returned oldest
+        first; callers reverse and cap the combined context for recency.
         """
         entries = self.read_recent_history_for_prompt(
             since_cursor=since_cursor,
             session_key=session_key,
             unified_session=unified_session,
         )
-        return [
-            f'[{entry.get("timestamp") or "?"}] {summary.strip()}'
-            for entry in entries
-            if isinstance(summary := entry.get("summary"), str) and summary.strip()
-        ]
+        summaries: list[str] = []
+        for entry in entries:
+            summary = entry.get("summary")
+            if not isinstance(summary, str) or not summary.strip():
+                summary = self._fallback_session_summary(entry.get("messages"))
+            if summary:
+                summaries.append(f'[{entry.get("timestamp") or "?"}] {summary.strip()}')
+        return summaries
+
+    @staticmethod
+    def _fallback_session_summary(messages: Any) -> str:
+        """Keep recent dialogue, not tool payloads or an unbounded raw dump."""
+        if not isinstance(messages, list):
+            return ""
+        excerpts: list[str] = []
+        remaining = _FALLBACK_SUMMARY_MAX_CHARS
+        for message in reversed(messages):
+            if not isinstance(message, dict) or message.get("role") not in ("user", "assistant"):
+                continue
+            cleaned = sanitize_message_for_persistence(message)
+            content = strip_think(str(cleaned.get("content") or "")).strip()
+            if not content:
+                continue
+            excerpt = f"{message['role'].upper()}: {truncate_text(content, 500)}"
+            if len(excerpt) + 1 > remaining:
+                break
+            excerpts.append(excerpt)
+            remaining -= len(excerpt) + 1
+        return "\n".join(reversed(excerpts))
 
     def compact_history(self) -> None:
         """Drop oldest entries if the file exceeds *max_history_entries*."""
@@ -1280,6 +1316,7 @@ class MemoryStore:
 # that catches any new caller that forgot to set its own cap.
 _RAW_ARCHIVE_MAX_CHARS = 16_000       # fallback dump (LLM failed)
 _ARCHIVE_SUMMARY_MAX_CHARS = 8_000    # LLM-produced consolidation summary
+_FALLBACK_SUMMARY_MAX_CHARS = 2_000   # bounded dialogue when no LLM summary is available
 _HISTORY_ENTRY_HARD_CAP = 64_000      # emergency cap in append_history
 
 

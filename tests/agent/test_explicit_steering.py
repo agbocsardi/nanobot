@@ -121,7 +121,9 @@ async def test_interrupt_cancels_then_replaces(tmp_path) -> None:
     await loop._handle_interrupt(_msg("/interrupt new plan"), "telegram:11")
     assert inbound and inbound[0].content == "new plan"
     assert "replacement" in outbound[-1].content
-    loop._cancel_active_tasks.assert_awaited_once_with("telegram:11")
+    loop._cancel_active_tasks.assert_awaited_once_with(
+        "telegram:11", sender_id="u1",
+    )
 
     # No active run -> ack, no replacement.
     loop._cancel_active_tasks = AsyncMock(return_value=0)
@@ -146,7 +148,7 @@ async def test_interrupt_timeout_blocks_replacement(tmp_path) -> None:
     # Make wait_for time out quickly by stubbing the cancel coroutine.
     loop._pending_queues["telegram:11"] = asyncio.Queue()
 
-    async def cancel_stub(key):
+    async def cancel_stub(key, *, sender_id=None, trusted=False):
         raise asyncio.TimeoutError()
 
     loop._cancel_active_tasks = cancel_stub

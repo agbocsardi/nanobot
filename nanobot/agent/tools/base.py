@@ -231,6 +231,10 @@ class Tool(ABC):
     effect: str = "read"  # read | local_write | external_write
     replay: str = "never"  # safe | idempotency_key | reconcile | never
 
+    def effect_for(self, params: dict[str, Any]) -> str:
+        """Classify this operation for durable replay suppression."""
+        return self.effect
+
     @staticmethod
     def _resolve_type(t: Any) -> str | None:
         """Pick first non-null type from JSON Schema unions like ``['string','null']``."""

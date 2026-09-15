@@ -220,13 +220,20 @@ class ActionReceiptStore:
         outcome: str = "",
         ok: bool = True,
     ) -> bool:
-        """Persist a terminal outcome. ``ok=False`` records failed."""
+        """Persist a terminal outcome. ``ok=False`` records failed.
+
+        ``status="unknown"`` records an unresolved outcome (e.g. a still-running
+        session): the effect may have landed, so the exec_id is never
+        auto-re-dispatched and never reported as a confirmed success.
+        """
         with self._lock:
             receipts = self._load_safe()
             receipt = next((r for r in receipts if r.exec_id == exec_id), None)
             if receipt is None:
                 return False
-            if ok:
+            if status == "unknown":
+                receipt.status = "unknown"
+            elif ok:
                 receipt.status = "succeeded"
             else:
                 receipt.status = "failed"

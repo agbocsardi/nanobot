@@ -10,11 +10,13 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin
 
 import httpx
 from loguru import logger
 
 from nanobot.providers.registry import find_by_name
+from nanobot.security.network import validate_url_target
 from nanobot.utils.helpers import detect_image_mime
 
 _OPENROUTER_ATTRIBUTION_HEADERS = {
@@ -41,6 +43,7 @@ _OLLAMA_SIZE_PRESETS = {
 }
 _OLLAMA_EXPLICIT_SIZE_RE = re.compile(r"^\s*(\d+)\s*[xX]\s*(\d+)\s*$")
 _OLLAMA_ASPECT_RATIO_RE = re.compile(r"^\s*(\d+)\s*:\s*(\d+)\s*$")
+_IMAGE_MAX_REDIRECTS = 5  # Limit redirects to prevent SSRF and DoS
 
 
 class ImageGenerationError(RuntimeError):
@@ -117,7 +120,35 @@ async def _download_image_data_url(
     client: httpx.AsyncClient,
     url: str,
 ) -> str:
-    response = await client.get(url)
+    """Download a provider-returned image URL and re-encode it as a data URL.
+
+    Provider payloads are untrusted: every hop — the original URL and each
+    redirect target — must pass SSRF validation before a request is made.
+    """
+    current_url = url
+    response: httpx.Response | None = None
+    for _ in range(_IMAGE_MAX_REDIRECTS + 1):
+        ok, error = validate_url_target(current_url)
+        if not ok:
+            raise ImageGenerationError(f"image download blocked: {error}")
+        response = await client.get(current_url, follow_redirects=False)
+        if not (300 <= response.status_code < 400):
+            break
+        location = response.headers.get("location")
+        if not location:
+            break
+        next_url = urljoin(str(response.url), location)
+        ok, error = validate_url_target(next_url)
+        if not ok:
+            await response.aclose()
+            raise ImageGenerationError(f"image redirect blocked: {error}")
+        await response.aclose()
+        current_url = next_url
+    else:
+        raise ImageGenerationError(
+            f"too many redirects downloading generated image (limit {_IMAGE_MAX_REDIRECTS})"
+        )
+    assert response is not None
     try:
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
@@ -129,7 +160,6 @@ async def _download_image_data_url(
         raise ImageGenerationError("generated image URL did not return a supported image")
     encoded = base64.b64encode(raw).decode("ascii")
     return f"data:{mime};base64,{encoded}"
-
 
 # ---------------------------------------------------------------------------
 # Registry
