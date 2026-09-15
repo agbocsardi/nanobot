@@ -69,8 +69,8 @@ async def test_run_returns_result(tmp_path):
 
 @pytest.mark.asyncio
 async def test_run_with_hooks(tmp_path):
-    from nanobot.agent.hook import AgentHook, AgentHookContext
-    from nanobot.agent.hook import SDKCaptureHook
+    from nanobot.agent.hook import AgentHook, AgentHookContext, SDKCaptureHook
+    from nanobot.bus.events import OutboundMessage
     config_path = _write_config(tmp_path)
     bot = Nanobot.from_config(config_path, workspace=tmp_path)
 
@@ -79,9 +79,8 @@ async def test_run_with_hooks(tmp_path):
             pass
 
     hooks_before = list(bot._loop._extra_hooks)
-    mock_response = OutboundMessage(
-        channel="cli", chat_id="direct", content="done"
-    )
+    mock_response = OutboundMessage(channel="cli", chat_id="direct", content="done")
+    bot._loop.process_direct = AsyncMock(return_value=mock_response)
 
     result = await bot.run("hi", hooks=[TestHook()])
 

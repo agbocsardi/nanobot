@@ -235,6 +235,7 @@ class ChannelManager:
             key = (msg.channel, msg.chat_id, message_id)
             self._origin_reply_fingerprints[key] = fingerprint
 
+        return False
 
     def _acknowledge(self, msg: OutboundMessage, result: DeliveryResult) -> None:
         """Resolve a tracked message's delivery future; untracked messages ignore this."""

@@ -9,6 +9,7 @@ import pytest
 
 from nanobot.security.network import (
     configure_ssrf_whitelist,
+    contains_internal_url,
     ssrf_whitelist_context,
     validate_url_target,
 )

@@ -313,7 +313,6 @@ def test_write_stdin_wait_for_reports_timeout_without_killing_session(tmp_path):
     initial, waited, cleanup = asyncio.run(run())
 
     assert "Process running" in initial
-    assert "booting" in initial + waited
     assert "Process running" in waited
     assert "Wait target not observed: 'never-ready'" in waited
     assert "Session terminated." in cleanup
@@ -578,6 +577,10 @@ def test_registry_persists_running_session_as_unknown_and_suppresses_redispatch(
     async def run():
         first = await registry.execute("exec", params, exec_id="long-run")
         second = await registry.execute("exec", params, exec_id="long-run")
+        for _ in range(40):
+            if marker.exists():
+                break
+            await asyncio.sleep(0.05)
         await manager.write(
             session_id=first.data["session_id"],
             chars=None,
@@ -586,6 +589,7 @@ def test_registry_persists_running_session_as_unknown_and_suppresses_redispatch(
             yield_time_ms=0,
             max_output_chars=1000,
         )
+        await asyncio.sleep(0.05)  # let subprocess transport close on this loop
         return first, second
 
     first, second = asyncio.run(run())

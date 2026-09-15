@@ -87,6 +87,11 @@ _CRON_PARAMETERS = tool_parameters_schema(
 class CronTool(Tool, ContextAware):
     """Tool to schedule reminders and recurring tasks."""
 
+    effect = "local_write"
+
+    def effect_for(self, params: dict[str, Any]) -> str:
+        return "read" if params.get("action") == "list" else self.effect
+
     def __init__(
         self,
         cron_service: CronService,

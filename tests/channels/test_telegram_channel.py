@@ -179,6 +179,7 @@ def _make_telegram_update(
     reply_to_message=None,
     forward_origin=None,
     location=None,
+    message_id: int = 1,
 ):
     user = SimpleNamespace(id=12345, username="alice", first_name="Alice")
     message = SimpleNamespace(
@@ -197,7 +198,7 @@ def _make_telegram_update(
         location=location,
         media_group_id=None,
         message_thread_id=None,
-        message_id=1,
+        message_id=message_id,
     )
     return SimpleNamespace(message=message, effective_user=user)
 
@@ -694,9 +695,9 @@ async def test_send_rich_bad_request_does_not_latch_capability() -> None:
 
     assert channel._rich_send_disabled is False
     channel._app.bot.do_api_request.assert_awaited_once()
-    # A definite rejection is reported, never papered over with a legacy re-send.
-    assert result.status == "failed"
-    assert channel._app.bot.sent_messages == []
+    # A definite rich rejection is safe to retry through the legacy API.
+    assert result.status == "delivered"
+    assert len(channel._app.bot.sent_messages) == 1
 
 
 @pytest.mark.asyncio
@@ -733,8 +734,8 @@ async def test_send_without_running_bot_reports_failed() -> None:
 
 
 @pytest.mark.asyncio
-async def test_send_media_then_rich_rejection_reports_partial_unknown(monkeypatch) -> None:
-    """Media acked + text definitely rejected ⇒ unknown, never a definite failure."""
+async def test_send_media_then_rich_rejection_uses_plain_fallback(monkeypatch) -> None:
+    """Media acked + rich text rejected ⇒ safely deliver text through legacy API."""
     from telegram.error import BadRequest
 
     channel = TelegramChannel(
@@ -756,10 +757,9 @@ async def test_send_media_then_rich_rejection_reports_partial_unknown(monkeypatc
         )
     )
 
-    assert result.status == "unknown"
-    assert "Partial delivery" in (result.error or "")
+    assert result.status == "delivered"
     assert len(channel._app.bot.sent_media) == 1
-    assert channel._app.bot.sent_messages == []
+    assert len(channel._app.bot.sent_messages) == 1
 
 
 @pytest.mark.asyncio
@@ -2371,9 +2371,17 @@ async def test_forward_command_routes_remember_and_policy_to_bus() -> None:
     channel._handle_message = capture_handle
 
     await channel._forward_command(
-        _make_telegram_update(text="/remember@nanobot_test topic: test note", reply_to_message=None), None
+        _make_telegram_update(
+            text="/remember@nanobot_test topic: test note",
+            reply_to_message=None,
+            message_id=1,
+        ),
+        None,
     )
-    await channel._forward_command(_make_telegram_update(text="/policy list", reply_to_message=None), None)
+    await channel._forward_command(
+        _make_telegram_update(text="/policy list", reply_to_message=None, message_id=2),
+        None,
+    )
 
     assert [h["content"] for h in handled] == ["/remember topic: test note", "/policy list"]
 
@@ -2804,7 +2812,7 @@ async def test_send_text_bad_request_plain_fallback_exhausted() -> None:
     async def always_bad_request(**kwargs):
         nonlocal call_count
         call_count += 1
-        raise BadRequest("Bad request")
+        raise BadRequest("Can't parse entities")
 
     channel._app.bot.send_message = always_bad_request
 

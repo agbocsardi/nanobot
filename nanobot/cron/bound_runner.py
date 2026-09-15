@@ -322,7 +322,7 @@ async def run_isolated_cron_job(
     )
     prompt_ref = _cron_prompt_ref(prompt)
     run_id = f"{job.id}:{_now_ms()}:{uuid.uuid4().hex[:8]}"
-    channel, chat_id, _ = origin_delivery_context(job)
+    channel, chat_id, origin_metadata = origin_delivery_context(job)
 
     # Per-job model preset wins over the global cron snapshot; fall back to
     # the global snapshot (then the main model) if resolution fails.
@@ -404,7 +404,12 @@ async def run_isolated_cron_job(
     else:
         try:
             ack = await deliver(
-                OutboundMessage(channel=channel, chat_id=chat_id, content=response),
+                OutboundMessage(
+                    channel=channel,
+                    chat_id=chat_id,
+                    content=response,
+                    metadata=origin_metadata,
+                ),
                 record=True,
             )
         except (Exception, asyncio.CancelledError) as exc:

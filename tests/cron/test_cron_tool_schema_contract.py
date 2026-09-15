@@ -16,6 +16,14 @@ from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.registry import ToolRegistry
 
 
+def test_cron_receipts_only_cover_mutations() -> None:
+    tool = CronTool(_SvcStub())
+
+    assert tool.effect_for({"action": "list"}) == "read"
+    assert tool.effect_for({"action": "add"}) == "local_write"
+    assert tool.effect_for({"action": "remove"}) == "local_write"
+
+
 class _SvcStub:
     """Minimal CronService stand-in; we only exercise schema/dispatch paths."""
 

@@ -111,7 +111,13 @@ def _make_deliver() -> tuple[list[dict[str, Any]], Any]:
     calls: list[dict[str, Any]] = []
 
     async def deliver(msg: OutboundMessage, *, record: bool = False, session_key: str | None = None) -> None:
-        calls.append({"channel": msg.channel, "chat_id": msg.chat_id, "content": msg.content, "record": record})
+        calls.append({
+            "channel": msg.channel,
+            "chat_id": msg.chat_id,
+            "content": msg.content,
+            "metadata": msg.metadata,
+            "record": record,
+        })
 
     return calls, deliver
 
@@ -122,7 +128,9 @@ async def test_isolated_runs_via_process_direct_and_delivers_when_not_silent() -
     recorder = _FakeRecorder()
     delivered, deliver = _make_deliver()
 
-    resp = await run_isolated_cron_job(_job(silent=False), agent=agent, cron=recorder, deliver=deliver)
+    job = _job(silent=False)
+    job.payload.origin_metadata = {"message_thread_id": 7}
+    resp = await run_isolated_cron_job(job, agent=agent, cron=recorder, deliver=deliver)
 
     assert resp == "biometrics ok"
     # process_direct, never submit_cron_turn
@@ -136,7 +144,13 @@ async def test_isolated_runs_via_process_direct_and_delivers_when_not_silent() -
     assert agent.tools.cron._spy_tokens == [True]
     assert len(agent.tools.cron._spy_resets) == 1
     # final reply delivered to origin chat, recorded
-    assert delivered == [{"channel": "telegram", "chat_id": "42", "content": "biometrics ok", "record": True}]
+    assert delivered == [{
+        "channel": "telegram",
+        "chat_id": "42",
+        "content": "biometrics ok",
+        "metadata": {"message_thread_id": 7},
+        "record": True,
+    }]
     # run records: queued -> ok
     statuses = [r["status"] for _, r in recorder.records]
     assert statuses == ["queued", "ok"]

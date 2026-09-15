@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
-from contextvars import ContextVar
+from typing import Any, Iterator
 
 from nanobot.agent.hook import (
     AgentHook,

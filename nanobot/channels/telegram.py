@@ -928,7 +928,10 @@ class TelegramChannel(BaseChannel):
         multipart message were acknowledged, so the whole-message state is
         no longer a definite failure either.
         """
-        definite = isinstance(exc, (BadRequest, Forbidden, InvalidToken, RetryAfter, ValueError, OSError))
+        definite = isinstance(
+            exc,
+            (AttributeError, BadRequest, Forbidden, InvalidToken, RetryAfter, ValueError, OSError),
+        )
         status = "failed" if definite and not partial else "unknown"
         error = f"{type(exc).__name__}: {exc}"
         if partial:
@@ -1154,11 +1157,19 @@ class TelegramChannel(BaseChannel):
                     chat_id, text, reply_params, thread_kwargs, reply_markup,
                 )
                 if result is not None:
-                    if delivered and result.status != "delivered":
-                        return DeliveryResult(
-                            status="unknown", error=f"Partial delivery: {result.error}",
+                    if result.status == "failed":
+                        # The rich request was definitely rejected, so plain
+                        # fallback is safe. Unknown outcomes must not be resent.
+                        self.logger.debug(
+                            "sendRichMessage rejected, falling back to legacy path: {}",
+                            result.error,
                         )
-                    return result
+                    else:
+                        if delivered and result.status != "delivered":
+                            return DeliveryResult(
+                                status="unknown", error=f"Partial delivery: {result.error}",
+                            )
+                        return result
 
             chunks = _split_telegram_markdown(text, TELEGRAM_MAX_MESSAGE_LEN)
             for i, chunk in enumerate(chunks):

@@ -125,7 +125,9 @@ async def test_task_stop_and_retry_route_through_manager() -> None:
     subagents = _subagents([_record("t5")])
     stop = await cmd_task(_ctx(SimpleNamespace(subagents=subagents), args="stop t5"))
     assert "Cancelled task t5." in stop.content
-    subagents.cancel_task.assert_awaited_once_with("t5", session_key="telegram:1")
+    subagents.cancel_task.assert_awaited_once_with(
+        "t5", session_key="telegram:1", sender_id="u1"
+    )
 
     retry = await cmd_task(_ctx(SimpleNamespace(subagents=subagents), args="retry t5"))
     assert "Retried t5 as new9ab" in retry.content

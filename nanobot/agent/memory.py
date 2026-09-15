@@ -27,6 +27,7 @@ from nanobot.utils.helpers import (
     estimate_message_tokens,
     estimate_prompt_tokens_chain,
     find_legal_message_start,
+    load_bundled_template,
     recent_message_start_index,
     strip_think,
     truncate_text,
@@ -368,7 +369,13 @@ class MemoryStore:
                 system_paragraphs.update(part.strip() for part in content.split("\n\n"))
                 rel_path = str(md_file.relative_to(self.workspace))
                 parts.append(f"## {rel_path}\n\n{content}")
-        long_term = self._body_without_frontmatter(self.read_memory()).strip()
+        raw_memory = self.read_memory()
+        template = load_bundled_template("memory/MEMORY.md")
+        long_term = (
+            ""
+            if template is not None and raw_memory.strip() == template.strip()
+            else self._body_without_frontmatter(raw_memory).strip()
+        )
         legacy = "\n\n".join(
             part for part in long_term.split("\n\n")
             if part.strip() and part.strip() not in system_paragraphs

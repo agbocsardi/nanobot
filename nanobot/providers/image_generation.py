@@ -8,6 +8,7 @@ import binascii
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 
@@ -41,6 +42,7 @@ _OLLAMA_SIZE_PRESETS = {
     "4K": 4096,
 }
 _OLLAMA_EXPLICIT_SIZE_RE = re.compile(r"^\s*(\d+)\s*[xX]\s*(\d+)\s*$")
+_OLLAMA_ASPECT_RATIO_RE = re.compile(r"^\s*(\d+)\s*:\s*(\d+)\s*$")
 _IMAGE_MAX_REDIRECTS = 5  # Limit redirects to prevent SSRF and DoS
 
 
