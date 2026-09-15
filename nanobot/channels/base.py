@@ -8,7 +8,7 @@ from typing import Any
 
 from loguru import logger
 
-from nanobot.bus.events import InboundMessage, OutboundMessage
+from nanobot.bus.events import DeliveryResult, InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.pairing import (
     PAIRING_CODE_META_KEY,
@@ -91,15 +91,15 @@ class BaseChannel(ABC):
         pass
 
     @abstractmethod
-    async def send(self, msg: OutboundMessage) -> None:
+    async def send(self, msg: OutboundMessage) -> DeliveryResult:
         """
         Send a message through this channel.
 
         Args:
             msg: The message to send.
 
-        Implementations should raise on delivery failure so the channel manager
-        can apply any retry policy in one place.
+        Return delivered only after transport acknowledgement; ambiguous outcomes
+        are unknown and must not be retried as definitely unsent.
         """
         pass
 

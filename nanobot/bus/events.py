@@ -1,8 +1,9 @@
 """Event types for the message bus."""
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 # Optional ``OutboundMessage.metadata`` key for structured, channel-agnostic UI
 # payloads. Value is JSON-serializable with at least ``kind``; rich clients may
@@ -42,6 +43,14 @@ class InboundMessage:
         """Unique key for session identification."""
         return self.session_key_override or f"{self.channel}:{self.chat_id}"
 
+@dataclass(frozen=True, slots=True)
+class DeliveryResult:
+    """Transport acknowledgement, not a claim that a person read the message."""
+
+    status: Literal["queued", "delivered", "failed", "unknown", "suppressed"]
+    error: str | None = None
+
+
 
 @dataclass
 class OutboundMessage:
@@ -59,3 +68,5 @@ class OutboundMessage:
     media: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
     buttons: list[list[ButtonSpec]] = field(default_factory=list)
+    # In-process acknowledgement; never copied into wire metadata or history.
+    delivery: asyncio.Future[DeliveryResult] | None = field(default=None, repr=False, compare=False)

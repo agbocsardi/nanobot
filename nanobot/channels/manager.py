@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from nanobot.bus.events import OutboundMessage
+from nanobot.bus.events import DeliveryResult, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import Config
@@ -235,7 +235,15 @@ class ChannelManager:
             key = (msg.channel, msg.chat_id, message_id)
             self._origin_reply_fingerprints[key] = fingerprint
 
-        return False
+
+    def _acknowledge(self, msg: OutboundMessage, result: DeliveryResult) -> None:
+        """Resolve a tracked message's delivery future; untracked messages ignore this."""
+        MessageBus.acknowledge(msg, result)
+
+    def _acknowledge_skipped(self, msg: OutboundMessage) -> None:
+        """A tracked message the dispatcher intentionally did not send stays unsent."""
+        MessageBus.acknowledge(msg, DeliveryResult("suppressed", "Dispatcher skipped delivery"))
+
 
     async def _dispatch_outbound(self) -> None:
         """Dispatch outbound messages to the appropriate channel."""
@@ -271,19 +279,23 @@ class ChannelManager:
                     channel = self.channels.get(msg.channel)
                     if channel is not None and channel.show_reasoning:
                         await self._send_with_retry(channel, msg)
-                    continue
+                    else:
+                        self._acknowledge_skipped(msg)
 
                 if msg.metadata.get("_progress"):
                     if msg.metadata.get("_tool_hint") and not self._should_send_progress(
                         msg.channel, tool_hint=True,
                     ):
+                        self._acknowledge_skipped(msg)
                         continue
                     if not msg.metadata.get("_tool_hint") and not self._should_send_progress(
                         msg.channel, tool_hint=False,
                     ):
+                        self._acknowledge_skipped(msg)
                         continue
 
                 if msg.metadata.get("_retry_wait"):
+                    self._acknowledge_skipped(msg)
                     continue
 
                 if (
@@ -291,6 +303,7 @@ class ChannelManager:
                     and msg.channel == "websocket"
                     and "websocket" not in self.channels
                 ):
+                    self._acknowledge_skipped(msg)
                     continue
 
                 # Coalesce consecutive _stream_delta messages for the same (channel, chat_id)
@@ -310,10 +323,16 @@ class ChannelManager:
                     ):
                         if self._should_suppress_outbound(msg):
                             logger.info("Suppressing duplicate outbound message to {}:{}", msg.channel, msg.chat_id)
+                            self._acknowledge_skipped(msg)
                             continue
-                    await self._send_with_retry(channel, msg)
+                    result = await self._send_with_retry(channel, msg)
+                    if msg.delivery is not None and result is not None:
+                        self._acknowledge(msg, result)
                 else:
                     logger.warning("Unknown channel: {}", msg.channel)
+                    self._acknowledge(
+                        msg, DeliveryResult("failed", f"Unknown channel: {msg.channel}")
+                    )
 
             except asyncio.TimeoutError:
                 continue
@@ -321,8 +340,12 @@ class ChannelManager:
                 break
 
     @staticmethod
-    async def _send_once(channel: BaseChannel, msg: OutboundMessage) -> None:
-        """Send one outbound message without retry policy."""
+    async def _send_once(channel: BaseChannel, msg: OutboundMessage) -> DeliveryResult | None:
+        """Send one outbound message without retry policy.
+
+        Returns the channel's DeliveryResult for plain sends; streaming and
+        reasoning primitives have no per-message acknowledgement and return None.
+        """
         if msg.metadata.get("_reasoning_end"):
             await channel.send_reasoning_end(msg.chat_id, msg.metadata)
         elif msg.metadata.get("_reasoning_delta"):
@@ -342,7 +365,11 @@ class ChannelManager:
         elif msg.metadata.get("_stream_delta") or msg.metadata.get("_stream_end"):
             await channel.send_delta(msg.chat_id, msg.content, msg.metadata)
         elif not msg.metadata.get("_streamed"):
-            await channel.send(msg)
+            result = await channel.send(msg)
+            if isinstance(result, DeliveryResult):
+                return result
+            return DeliveryResult("unknown", "Channel returned no acknowledgement")
+        return None
 
     def _coalesce_stream_deltas(
         self, first_msg: OutboundMessage
@@ -394,17 +421,22 @@ class ChannelManager:
         )
         return merged, non_matching
 
-    async def _send_with_retry(self, channel: BaseChannel, msg: OutboundMessage) -> None:
+    async def _send_with_retry(
+        self, channel: BaseChannel, msg: OutboundMessage,
+    ) -> DeliveryResult | None:
         """Send a message with retry on failure using exponential backoff.
 
         Note: CancelledError is re-raised to allow graceful shutdown.
+        A DeliveryResult returned by the channel is final — ambiguous or
+        definite outcomes are never retried (retrying an ambiguous send can
+        duplicate a delivered message). Only raised exceptions retry.
         """
         max_attempts = max(self.config.channels.send_max_retries, 1)
 
         for attempt in range(max_attempts):
             try:
-                await self._send_once(channel, msg)
-                return  # Send succeeded
+                result = await self._send_once(channel, msg)
+                return result  # None for streaming/reasoning primitives
             except asyncio.CancelledError:
                 raise  # Propagate cancellation for graceful shutdown
             except Exception as e:
@@ -413,7 +445,7 @@ class ChannelManager:
                         "Failed to send to {} after {} attempts",
                         msg.channel, max_attempts
                     )
-                    return
+                    return DeliveryResult("failed", str(e) or e.__class__.__name__)
                 delay = _SEND_RETRY_DELAYS[min(attempt, len(_SEND_RETRY_DELAYS) - 1)]
                 logger.warning(
                     "Send to {} failed (attempt {}/{}): {}, retrying in {}s",
