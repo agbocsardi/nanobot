@@ -208,11 +208,12 @@ class ToolRegistry:
             )
 
         receipt = None
-        if (
-            exec_id is not None
-            and self.receipt_store is not None
-            and getattr(tool, "effect", "read") != "read"
-        ):
+        effect = "read"
+        if exec_id is not None and self.receipt_store is not None:
+            # Parameter-aware classification: a tool may mutate only for some
+            # actions (e.g. standing_intents list vs create).
+            effect = tool.effect_for(params)
+        if effect != "read":
             from nanobot.agent.tools.action_receipts import canonical_arg_hash, redact_preview
             from nanobot.agent.tools.context import current_request_context
 
@@ -226,7 +227,7 @@ class ToolRegistry:
                 sender_id=sender_id,
                 tool=tool.name,
                 arg_hash=arg_hash,
-                effect=str(getattr(tool, "effect", "read")),
+                effect=effect,
                 replay=str(getattr(tool, "replay", "never")),
             )
             if replay_decision == "mismatch":
@@ -256,13 +257,24 @@ class ToolRegistry:
         try:
             outcome = adapt_legacy_tool_result(await tool.execute(**params))
             if receipt is not None:
-                ok = outcome.status in ("success", "partial")
-                self.receipt_store.complete(
-                    exec_id,
-                    status="succeeded" if ok else "failed",
-                    outcome=redact_preview(str(outcome)) if ok else redact_preview(str(outcome)),
-                    ok=ok,
-                )
+                if outcome.status == "partial":
+                    # Unresolved outcome (e.g. a still-running session): the
+                    # effect may have landed, so record unknown — never claim
+                    # success and never re-dispatch this exec_id.
+                    self.receipt_store.complete(
+                        exec_id,
+                        status="unknown",
+                        ok=False,
+                        outcome=redact_preview(str(outcome)),
+                    )
+                else:
+                    ok = outcome.status == "success"
+                    self.receipt_store.complete(
+                        exec_id,
+                        status="succeeded" if ok else "failed",
+                        outcome=redact_preview(str(outcome)),
+                        ok=ok,
+                    )
             if outcome.retryable and str(outcome).startswith("Error"):
                 return self._replace_content(outcome, str(outcome) + hint)
             return outcome

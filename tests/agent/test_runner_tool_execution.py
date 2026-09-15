@@ -9,9 +9,16 @@ import pytest
 
 from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.agent.tools.action_receipts import ActionReceiptStore
+from nanobot.agent.tools.approval import ApprovalStore
 from nanobot.agent.tools.base import Tool
+from nanobot.agent.tools.context import (
+    RequestContext,
+    bind_request_context,
+    reset_request_context,
+)
+from nanobot.agent.tools.policy import ToolPolicy
 from nanobot.agent.tools.registry import ToolRegistry
-from nanobot.config.schema import AgentDefaults
+from nanobot.config.schema import AgentDefaults, ToolPolicyRuleConfig
 from nanobot.providers.base import LLMResponse, ToolCallRequest
 from nanobot.providers.openai_compat_provider import OpenAICompatProvider
 from nanobot.providers.openai_responses.parsing import parse_response_output
@@ -399,3 +406,61 @@ async def test_runner_routes_local_side_effect_tool_through_receipt_store(tmp_pa
     assert error is None
     assert results == ["write_a"]
     assert events == ["start:write_a", "end:write_a"]
+
+
+class _ApprovalWriteTool(Tool):
+    effect = "local_write"
+
+    @property
+    def name(self) -> str:
+        return "write_state"
+
+    @property
+    def description(self) -> str:
+        return "mutating tool gated behind an ask rule"
+
+    @property
+    def parameters(self) -> dict:
+        return {"type": "object", "properties": {}}
+
+    async def execute(self, **kwargs):
+        return "wrote"
+
+
+@pytest.mark.asyncio
+async def test_runner_carries_approval_token_into_policy_tool_result():
+    """A runner-issued ask block must surface the token and approve/deny instructions."""
+    store = ApprovalStore()
+    policy = ToolPolicy([ToolPolicyRuleConfig(id="deploy", outcome="ask", tool="write_state")])
+    tools = ToolRegistry(policy=policy)
+    tools.register(_ApprovalWriteTool())
+
+    runner = AgentRunner(MagicMock())
+    spec = AgentRunSpec(
+        initial_messages=[],
+        tools=tools,
+        model="test-model",
+        max_iterations=1,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    )
+    ctx_token = bind_request_context(RequestContext(
+        channel="cli", chat_id="direct", metadata={}, approvals=store,
+    ))
+    try:
+        results, events, error = await runner._execute_tools(
+            spec,
+            [ToolCallRequest(id="ask-1", name="write_state", arguments={})],
+            {},
+            {},
+        )
+    finally:
+        reset_request_context(ctx_token)
+
+    pending = store.pending_list()
+    assert len(pending) == 1
+    assert error is None
+    assert "requires explicit approval" in results[0]
+    assert f"/policy approve {pending[0].token}" in results[0]
+    assert f"/policy deny {pending[0].token}" in results[0]
+    assert events[0]["data"]["approval_token"] == pending[0].token
+    assert events[0]["evidence"][0]["approval_token"] == pending[0].token

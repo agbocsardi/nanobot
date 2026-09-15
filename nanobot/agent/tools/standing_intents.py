@@ -287,6 +287,11 @@ class StandingIntentStore:
 class IntentTool(Tool, ContextAware):
     """Durable standing intents for event-conditioned reminders."""
 
+    effect = "local_write"
+
+    def effect_for(self, params: dict[str, Any]) -> str:
+        return "read" if params.get("action") == "list" else self.effect
+
     _scopes = {"core"}
 
     @property

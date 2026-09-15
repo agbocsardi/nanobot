@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -40,7 +41,9 @@ class _SideEffectTool(Tool):
 
     async def execute(self, message: str, **kwargs) -> ToolResult:
         self._calls.append(1)
-        return ToolResult(f"sent: {message}", side_effects=[{"kind": "fixture"}])
+        return ToolResult(
+            f"sent: {message}", side_effects=[{"kind": "fixture"}], postcondition="checked",
+        )
 
 
 class _ReadOnlyTool(Tool):
@@ -60,6 +63,42 @@ class _ReadOnlyTool(Tool):
 
     async def execute(self, **kwargs) -> ToolResult:
         return ToolResult("looked")
+
+
+class _ConditionalMutatorTool(Tool):
+    """Mutator whose effect depends on the action param (effect_for contract)."""
+
+    effect = "local_write"
+
+    def __init__(self, calls: list[int]):
+        self._calls = calls
+
+    def effect_for(self, params: dict[str, Any]) -> str:
+        return "read" if params.get("action") == "list" else self.effect
+
+    @property
+    def name(self) -> str:
+        return "conditional"
+
+    @property
+    def description(self) -> str:
+        return "params-dependent mutator"
+
+    @property
+    def parameters(self) -> dict:
+        return {"type": "object", "properties": {"action": {"type": "string"}}}
+
+    async def execute(self, action: str = "list", **kwargs) -> ToolResult:
+        self._calls.append(1)
+        return ToolResult(f"did {action}")
+
+
+class _PartialTool(_SideEffectTool):
+    """Side-effect tool reporting an unresolved (running) outcome."""
+
+    async def execute(self, message: str, **kwargs) -> ToolResult:
+        self._calls.append(1)
+        return ToolResult.partial(f"dispatched: {message}", data={"state": "running"})
 
 
 def _registry(tmp_path: Path) -> ToolRegistry:
@@ -206,6 +245,64 @@ def test_readonly_tool_is_not_receipt_gated(tmp_path) -> None:
     a, b = __import__("asyncio").run(run())
     reset_request_context(token)
     assert a == "looked" and b == "looked"
+
+
+def test_effect_for_read_action_skips_receipt_enrollment(tmp_path) -> None:
+    calls: list[int] = []
+    registry = ToolRegistry(receipt_store=ActionReceiptStore(tmp_path))
+    registry.register(_ConditionalMutatorTool(calls))
+    token = _bind_ctx()
+
+    async def run() -> tuple[str, str]:
+        a = await registry.execute("conditional", {"action": "list"}, exec_id="e10")
+        b = await registry.execute("conditional", {"action": "list"}, exec_id="e10")
+        return str(a), str(b)
+
+    a, b = __import__("asyncio").run(run())
+    reset_request_context(token)
+
+    assert calls == [1, 1]  # read action executes every time: no receipt gate
+    assert not registry.receipt_store.path.exists()  # never enrolled
+
+
+def test_effect_for_mutating_action_is_enrolled(tmp_path) -> None:
+    calls: list[int] = []
+    registry = ToolRegistry(receipt_store=ActionReceiptStore(tmp_path))
+    registry.register(_ConditionalMutatorTool(calls))
+    token = _bind_ctx()
+
+    async def run() -> tuple[str, str]:
+        a = await registry.execute("conditional", {"action": "create"}, exec_id="e11")
+        b = await registry.execute("conditional", {"action": "create"}, exec_id="e11")
+        return str(a), str(b)
+
+    a, b = __import__("asyncio").run(run())
+    reset_request_context(token)
+
+    assert calls == [1]  # mutation dispatched exactly once
+    assert "Replayed from receipt" in b
+    assert registry.receipt_store.get("e11").status == "succeeded"
+
+
+def test_partial_outcome_persists_unknown_and_never_replays_as_success(tmp_path) -> None:
+    calls: list[int] = []
+    registry = ToolRegistry(receipt_store=ActionReceiptStore(tmp_path))
+    registry.register(_PartialTool(calls))
+    token = _bind_ctx()
+
+    async def run() -> tuple[Any, Any]:
+        first = await registry.execute("side_effect", {"message": "hi"}, exec_id="p1")
+        second = await registry.execute("side_effect", {"message": "hi"}, exec_id="p1")
+        return first, second
+
+    first, second = __import__("asyncio").run(run())
+    reset_request_context(token)
+
+    assert len(calls) == 1  # never dispatched twice
+    assert first.status == "partial"
+    assert registry.receipt_store.get("p1").status == "unknown"
+    assert second.status == "partial"  # suppressed without claiming success
+    assert "not auto-repeated" in str(second)
 
 
 # ---------------------------------------------------------------------------

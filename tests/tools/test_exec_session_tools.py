@@ -6,11 +6,13 @@ import shlex
 import subprocess
 import sys
 
+from nanobot.agent.tools.action_receipts import ActionReceiptStore
 from nanobot.agent.tools.exec_session import (
     ExecSessionManager,
     ListExecSessionsTool,
     WriteStdinTool,
 )
+from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 
 
@@ -503,3 +505,150 @@ def test_write_stdin_timeout_ms_unifies_wait_budget(tmp_path):
 
     assert "Wait target not observed: 'never-ready'" in from_timeout
     assert "Wait target not observed: 'never-ready'" in from_alias
+
+
+# ---------------------------------------------------------------------------
+# structured outcomes: nonzero exit / timeout / cancel / still-running are
+# never ordinary prose success (#structured-outcomes)
+# ---------------------------------------------------------------------------
+
+
+def test_registry_classifies_nonzero_session_exit_as_retryable(tmp_path):
+    """A session exit code N through the real registry is a retryable failure."""
+    registry = ToolRegistry()
+    registry.register(ExecTool(working_dir=str(tmp_path), timeout=10))
+
+    async def run():
+        return await registry.execute(
+            "exec",
+            {
+                "command": _python_command("import sys; sys.exit(3)"),
+                "yield_time_ms": 1000,
+            },
+            exec_id="exit-3",
+        )
+
+    result = asyncio.run(run())
+
+    assert "Exit code: 3" in str(result)
+    assert result.status == "retryable_error"
+    assert result.data["state"] == "exited"
+    assert result.exit_code == 3
+
+
+def test_registry_replay_does_not_reexecute_completed_mutation(tmp_path):
+    marker = tmp_path / "marker.txt"
+    code = (
+        "import pathlib;"
+        f"p = pathlib.Path({marker.as_posix()!r});"
+        "p.open('a').write('ran\\n')"
+    )
+    registry = ToolRegistry(receipt_store=ActionReceiptStore(tmp_path))
+    registry.register(ExecTool(working_dir=str(tmp_path), timeout=10))
+    params = {"command": _python_command(code), "yield_time_ms": 1000}
+
+    async def run():
+        first = await registry.execute("exec", params, exec_id="once-only")
+        second = await registry.execute("exec", params, exec_id="once-only")
+        return first, second
+
+    first, second = asyncio.run(run())
+
+    assert first.status == "success"
+    assert "Replayed from receipt" in str(second)
+    assert second.status == "success"
+    assert marker.read_text().count("ran") == 1
+
+
+def test_registry_persists_running_session_as_unknown_and_suppresses_redispatch(tmp_path):
+    marker = tmp_path / "started.txt"
+    code = (
+        "import pathlib, time;"
+        f"p = pathlib.Path({marker.as_posix()!r});"
+        "p.open('a').write('started\\n');"
+        "time.sleep(10)"
+    )
+    manager = ExecSessionManager()
+    registry = ToolRegistry(receipt_store=ActionReceiptStore(tmp_path))
+    registry.register(
+        ExecTool(working_dir=str(tmp_path), timeout=30, session_manager=manager)
+    )
+    params = {"command": _python_command(code), "yield_time_ms": 0}
+
+    async def run():
+        first = await registry.execute("exec", params, exec_id="long-run")
+        second = await registry.execute("exec", params, exec_id="long-run")
+        await manager.write(
+            session_id=first.data["session_id"],
+            chars=None,
+            close_stdin=False,
+            terminate=True,
+            yield_time_ms=0,
+            max_output_chars=1000,
+        )
+        return first, second
+
+    first, second = asyncio.run(run())
+
+    assert first.status == "partial"
+    assert first.data["state"] == "running"
+    assert "Process running" in str(first)
+    assert registry.receipt_store.get("long-run").status == "unknown"
+    assert second.status == "partial"
+    assert "not auto-repeated" in str(second)
+    assert marker.read_text().count("started") == 1
+
+
+def test_write_stdin_running_poll_is_partial_not_success(tmp_path):
+    async def run():
+        manager = ExecSessionManager()
+        exec_tool = ExecTool(working_dir=str(tmp_path), timeout=10, session_manager=manager)
+        stdin_tool = WriteStdinTool(manager=manager)
+        start = await exec_tool.execute(
+            command=_python_command("import time; time.sleep(5)"), yield_time_ms=0
+        )
+        sid = _session_id(start)
+        poll = await stdin_tool.execute(session_id=sid, yield_time_ms=0)
+        await stdin_tool.execute(session_id=sid, terminate=True)
+        return start, poll
+
+    start, poll = asyncio.run(run())
+
+    assert start.status == "partial"
+    assert poll.status == "partial"
+    assert "Process running." in str(poll)
+    assert poll.data["state"] == "running"
+
+
+def test_write_stdin_session_timeout_is_retryable_not_success(tmp_path):
+    async def run():
+        manager = ExecSessionManager()
+        exec_tool = ExecTool(working_dir=str(tmp_path), timeout=1, session_manager=manager)
+        stdin_tool = WriteStdinTool(manager=manager)
+        start = await exec_tool.execute(
+            command=_python_command("import time; time.sleep(30)"), yield_time_ms=0
+        )
+        return await stdin_tool.execute(
+            session_id=_session_id(start), yield_time_ms=1500
+        )
+
+    poll = asyncio.run(run())
+
+    assert poll.status == "retryable_error"
+    assert "timed out" in str(poll)
+
+
+def test_write_stdin_terminate_is_retryable_not_success(tmp_path):
+    async def run():
+        manager = ExecSessionManager()
+        exec_tool = ExecTool(working_dir=str(tmp_path), timeout=10, session_manager=manager)
+        stdin_tool = WriteStdinTool(manager=manager)
+        start = await exec_tool.execute(
+            command=_python_command("import time; time.sleep(30)"), yield_time_ms=0
+        )
+        return await stdin_tool.execute(session_id=_session_id(start), terminate=True)
+
+    poll = asyncio.run(run())
+
+    assert poll.status == "retryable_error"
+    assert "Session terminated." in str(poll)
