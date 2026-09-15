@@ -1104,7 +1104,6 @@ def _run_gateway(
             schedule=CronSchedule(
                 kind="every",
                 every_ms=hb_cfg.interval_s * 1000,
-                tz=config.agents.defaults.timezone,
             ),
             payload=CronPayload(kind="system_event"),
         ))

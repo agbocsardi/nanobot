@@ -194,9 +194,12 @@ class _FakeChannels:
 
 
 class _FakeCron:
+    instances: list["_FakeCron"] = []
+
     def __init__(self, *args, **kwargs) -> None:
         self.on_job = None
         self.jobs = []
+        self.instances.append(self)
 
     async def start(self) -> None:
         return None
@@ -238,6 +241,7 @@ class TestGatewayWiring:
             seen["handler"] = on_change
 
         _FakeLoop.instances.clear()
+        _FakeCron.instances.clear()
         with patch("nanobot.cli.commands.AgentLoop", _FakeLoop), \
              patch("nanobot.channels.manager.ChannelManager", _FakeChannels), \
              patch("nanobot.cron.service.CronService", _FakeCron), \
@@ -267,3 +271,35 @@ class TestGatewayWiring:
         build_handler.assert_called_once()
         assert build_handler.call_args.args[0] is _FakeLoop.instances[0]
         assert build_handler.call_args.args[1] == config_path
+
+    def test_gateway_registers_timezone_free_heartbeat_interval(self, tmp_path: Path) -> None:
+        """A non-UTC agent timezone must not leak into the heartbeat interval schedule."""
+        from nanobot.cron.service import _validate_schedule_for_add
+
+        config_path = tmp_path / "config.json"
+        _write_config(config_path, model_preset="fast", presets=_PRESETS)
+        set_config_path(config_path)
+        config = load_config(config_path)
+        config.agents.defaults.workspace = str(tmp_path / "ws")
+        config.agents.defaults.timezone = "Europe/Amsterdam"
+        config.gateway.heartbeat.enabled = True
+
+        async def fake_watch(_config_path, _on_change):
+            return None
+
+        _FakeCron.instances.clear()
+        with patch("nanobot.cli.commands.AgentLoop", _FakeLoop), \
+             patch("nanobot.channels.manager.ChannelManager", _FakeChannels), \
+             patch("nanobot.cron.service.CronService", _FakeCron), \
+             patch("nanobot.cli.commands.sync_workspace_templates"), \
+             patch("nanobot.providers.factory.build_provider_snapshot", side_effect=_fake_provider_snapshot), \
+             patch("nanobot.providers.factory.load_provider_snapshot", side_effect=_fake_provider_snapshot), \
+             patch("nanobot.config.watcher.watch_config_file", side_effect=fake_watch):
+            _run_gateway(config, port=19999, health_server_enabled=False)
+
+        assert len(_FakeCron.instances) == 1
+        heartbeat = next(job for job in _FakeCron.instances[0].jobs if job.id == "heartbeat")
+        assert heartbeat.schedule.kind == "every"
+        assert heartbeat.schedule.every_ms == config.gateway.heartbeat.interval_s * 1000
+        assert heartbeat.schedule.tz is None
+        _validate_schedule_for_add(heartbeat.schedule)
