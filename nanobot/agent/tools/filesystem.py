@@ -19,6 +19,7 @@ from nanobot.agent.tools.schema import (
 from nanobot.config_base import Base
 from nanobot.security.workspace_access import current_tool_workspace
 from nanobot.utils.helpers import build_image_content_blocks, detect_image_mime
+from nanobot.utils.image_budget import prepare_image
 
 
 class FileToolsConfig(Base):
@@ -246,7 +247,11 @@ class ReadFileTool(_FsTool):
 
             mime = detect_image_mime(raw) or mimetypes.guess_type(path)[0]
             if mime and mime.startswith("image/"):
-                return build_image_content_blocks(raw, mime, str(fp), f"(Image file: {path})")
+                prepared = prepare_image(raw, mime)
+                if prepared is None:
+                    return f"Error: Cannot safely ingest image {path}"
+                image_raw, image_mime = prepared
+                return build_image_content_blocks(image_raw, image_mime, str(fp), f"(Image file: {path})")
 
             # Read dedup: same path + offset + limit + unchanged mtime → stub
             # Always check for external modifications before dedup
@@ -292,7 +297,11 @@ class ReadFileTool(_FsTool):
                 # Binary file - return error message
                 mime = detect_image_mime(raw) or mimetypes.guess_type(path)[0]
                 if mime and mime.startswith("image/"):
-                    return build_image_content_blocks(raw, mime, str(fp), f"(Image file: {path})")
+                    prepared = prepare_image(raw, mime)
+                    if prepared is None:
+                        return f"Error: Cannot safely ingest image {path}"
+                    image_raw, image_mime = prepared
+                    return build_image_content_blocks(image_raw, image_mime, str(fp), f"(Image file: {path})")
                 return f"Error: Cannot read binary file {path} (MIME: {mime or 'unknown'}). Only UTF-8 text and images are supported."
 
             # Normalize CRLF -> LF before line-splitting. Primarily a Windows

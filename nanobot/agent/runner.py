@@ -69,6 +69,7 @@ _MAX_INJECTIONS_PER_TURN = 3
 _MAX_INJECTION_CYCLES = 5
 _SNIP_SAFETY_BUFFER = 1024
 _MICROCOMPACT_KEEP_RECENT = 10
+_MICROCOMPACT_KEEP_RECENT_IMAGES = 1
 _MICROCOMPACT_MIN_CHARS = 500
 _COMPACTABLE_TOOLS = frozenset({
     "read_file", "exec", "grep", "find_files",
@@ -86,6 +87,15 @@ _POLICY_BLOCK_PREFIX = "Incomplete: one or more required operations were blocked
 # persisted run records stay small even across 100+ iteration runs.
 _RECORDED_ARG_MAX_CHARS = 200
 _RECORDED_PREVIEW_MAX_CHARS = 500
+
+
+class ContextBudgetExceededError(Exception):
+    """The model prompt cannot fit, even after context governance."""
+
+    def __init__(self, estimate: int, budget: int):
+        self.estimate = estimate
+        self.budget = budget
+        super().__init__(f"Prompt context is too large ({estimate} tokens; limit {budget}).")
 
 
 def _truncate_recorded_text(text: str, max_chars: int) -> str:
@@ -428,7 +438,21 @@ class AgentRunner:
                 session_key=spec.session_key,
             )
             await hook.before_iteration(context)
-            response = await self._request_model(spec, messages_for_model, hook, context)
+            try:
+                response = await self._request_model(spec, messages_for_model, hook, context)
+            except ContextBudgetExceededError as exc:
+                final_content = (
+                    "I could not send this request because the conversation, including its "
+                    f"images, is too large ({exc.estimate} tokens; limit {exc.budget})."
+                )
+                error = final_content
+                stop_reason = "context_budget_exceeded"
+                context.final_content = final_content
+                context.error = error
+                context.stop_reason = stop_reason
+                self._append_final_message(messages, final_content)
+                await hook.after_iteration(context)
+                break
             context.response = response
             context.tool_calls = list(response.tool_calls)
 
@@ -792,6 +816,28 @@ class AgentRunner:
             kwargs["reasoning_effort"] = spec.reasoning_effort
         return kwargs
 
+    def _enforce_context_budget(self, spec: AgentRunSpec, messages: list[dict[str, Any]]) -> None:
+        """Reject oversized prompts immediately before any provider call."""
+        if not spec.context_window_tokens and not spec.context_block_limit:
+            return
+        provider_max_tokens = getattr(getattr(self.provider, "generation", None), "max_tokens", 4096)
+        max_output = spec.max_tokens if isinstance(spec.max_tokens, int) else (
+            provider_max_tokens if isinstance(provider_max_tokens, int) else 4096
+        )
+        window_budget = (
+            spec.context_window_tokens - max_output - _SNIP_SAFETY_BUFFER
+            if spec.context_window_tokens else 0
+        )
+        budget = min(spec.context_block_limit, window_budget) if (
+            spec.context_block_limit and spec.context_window_tokens
+        ) else (spec.context_block_limit or window_budget)
+        budget = max(0, budget)
+        estimate, _ = estimate_prompt_tokens_chain(
+            self.provider, spec.model, messages, spec.tools.get_definitions()
+        )
+        if estimate > budget:
+            raise ContextBudgetExceededError(estimate, budget)
+
     async def _request_model(
         self,
         spec: AgentRunSpec,
@@ -813,6 +859,9 @@ class AgentRunner:
             timeout_s = None
 
         messages = await self._maybe_vision_handoff(spec, messages)
+        # Vision handoff can add image blocks after history snipping. Recheck
+        # the complete payload, including those blocks, before calling provider.
+        self._enforce_context_budget(spec, messages)
         kwargs = self._build_request_kwargs(
             spec,
             messages,
@@ -1630,18 +1679,41 @@ class AgentRunner:
             if msg.get("role") == "tool" and msg.get("name") in _COMPACTABLE_TOOLS:
                 compactable_indices.append(idx)
 
-        if len(compactable_indices) <= _MICROCOMPACT_KEEP_RECENT:
-            return messages
-
-        stale = compactable_indices[: len(compactable_indices) - _MICROCOMPACT_KEEP_RECENT]
+        stale = compactable_indices[: max(0, len(compactable_indices) - _MICROCOMPACT_KEEP_RECENT)]
+        image_indices = [
+            idx for idx in compactable_indices
+            if isinstance(messages[idx].get("content"), list)
+            and any(
+                isinstance(block, dict) and block.get("type") == "image_url"
+                for block in messages[idx]["content"]
+            )
+        ]
+        # All images from the newest tool-call batch have not been seen by the
+        # model yet. Never compact them before their first model response.
+        latest_batch_start = max(
+            (idx for idx, msg in enumerate(messages)
+             if msg.get("role") == "assistant" and msg.get("tool_calls")),
+            default=-1,
+        )
+        seen_images = [idx for idx in image_indices if idx < latest_batch_start]
+        stale_images = set(seen_images[:-_MICROCOMPACT_KEEP_RECENT_IMAGES])
         updated: list[dict[str, Any]] | None = None
-        for idx in stale:
+        for idx in sorted(set(stale) | stale_images):
             msg = messages[idx]
             content = msg.get("content")
-            if not isinstance(content, str) or len(content) < _MICROCOMPACT_MIN_CHARS:
+            if idx in stale_images:
+                paths = [
+                    block.get("_meta", {}).get("path")
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "image_url"
+                    and isinstance(block.get("_meta"), dict)
+                ]
+                path_hint = f"; re-read {', '.join(str(path) for path in paths if path)}" if paths else ""
+                summary = f"[{msg.get('name', 'tool')} image omitted from context{path_hint}]"
+            elif isinstance(content, str) and len(content) >= _MICROCOMPACT_MIN_CHARS:
+                summary = f"[{msg.get('name', 'tool')} result omitted from context]"
+            else:
                 continue
-            name = msg.get("name", "tool")
-            summary = f"[{name} result omitted from context]"
             if updated is None:
                 updated = [dict(m) for m in messages]
             updated[idx]["content"] = summary
@@ -1681,9 +1753,8 @@ class AgentRunner:
         max_output = spec.max_tokens if isinstance(spec.max_tokens, int) else (
             provider_max_tokens if isinstance(provider_max_tokens, int) else 4096
         )
-        budget = spec.context_block_limit or (
-            spec.context_window_tokens - max_output - _SNIP_SAFETY_BUFFER
-        )
+        window_budget = spec.context_window_tokens - max_output - _SNIP_SAFETY_BUFFER
+        budget = min(spec.context_block_limit, window_budget) if spec.context_block_limit else window_budget
         if budget <= 0:
             return messages
 

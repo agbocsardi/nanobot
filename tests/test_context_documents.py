@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from PIL import Image
+
 from nanobot.agent.context import ContextBuilder
 from nanobot.utils.document import extract_documents
 
@@ -28,7 +30,7 @@ def test_build_user_content_with_image_returns_list(tmp_path: Path) -> None:
     """Image files should produce base64 content blocks."""
     builder = _make_builder(tmp_path)
     png = tmp_path / "test.png"
-    png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)
+    Image.new("RGB", (1, 1)).save(png)
     result = builder._build_user_content("describe this", [str(png)])
     assert isinstance(result, list)
     types = [b["type"] for b in result]
@@ -49,7 +51,7 @@ def test_build_user_content_mixed_image_and_non_image(tmp_path: Path) -> None:
     """Only images should be included; non-image files are skipped."""
     builder = _make_builder(tmp_path)
     png = tmp_path / "chart.png"
-    png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)
+    Image.new("RGB", (1, 1)).save(png)
     txt = tmp_path / "report.txt"
     txt.write_text("report text", encoding="utf-8")
 

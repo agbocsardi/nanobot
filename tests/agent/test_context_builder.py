@@ -10,6 +10,11 @@ from nanobot.session.goal_state import GOAL_STATE_KEY
 
 from .conftest import archive_summary
 
+VALID_PNG = __import__("base64").b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgZGIGAAAOAAfXb+R4AAAAAElFTkSuQmCC"
+)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -242,7 +247,7 @@ class TestBuildUserContent:
 
     def test_valid_image_returns_list(self, tmp_path):
         png = tmp_path / "test.png"
-        png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
+        png.write_bytes(VALID_PNG)
         builder = _builder(tmp_path)
         result = builder._build_user_content("hello", [str(png)])
         assert isinstance(result, list)
@@ -254,7 +259,7 @@ class TestBuildUserContent:
 
     def test_image_meta_includes_path(self, tmp_path):
         png = tmp_path / "test.png"
-        png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
+        png.write_bytes(VALID_PNG)
         builder = _builder(tmp_path)
         result = builder._build_user_content("hello", [str(png)])
         assert "_meta" in result[0]
@@ -440,7 +445,7 @@ class TestBuildMessages:
 
     def test_media_with_history(self, tmp_path):
         png = tmp_path / "img.png"
-        png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
+        png.write_bytes(VALID_PNG)
         builder = _builder(tmp_path)
         history = [{"role": "assistant", "content": "see this"}]
         messages = builder.build_messages(history, "check image", media=[str(png)])

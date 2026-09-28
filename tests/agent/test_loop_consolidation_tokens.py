@@ -249,6 +249,9 @@ async def test_preflight_consolidation_before_llm_call(tmp_path, monkeypatch) ->
         return (1000 if call_count[0] <= 1 else 80, "test")
     loop.consolidator.estimate_session_prompt_tokens = mock_estimate  # type: ignore[method-assign]
 
+    # Keep the consolidation threshold tiny but give the runner a realistic
+    # provider window for its full system prompt and tool definitions.
+    loop.context_window_tokens = 32_000
     await loop.process_direct("hello", session_key="cli:test")
 
     assert "consolidate" in order

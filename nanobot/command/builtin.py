@@ -55,6 +55,12 @@ BUILTIN_COMMAND_SPECS: tuple[BuiltinCommandSpec, ...] = (
         "square-pen",
     ),
     BuiltinCommandSpec(
+        "/compact",
+        "Compact chat",
+        "Summarize old conversation history while keeping recent messages.",
+        "fold-vertical",
+    ),
+    BuiltinCommandSpec(
         "/stop",
         "Stop current task",
         "Cancel the active agent turn for this chat.",
@@ -340,6 +346,63 @@ def _status_model_chain(loop: Any) -> str:
         "- fallback order: per-job override -> runPresets[kind] -> active modelPreset -> default",
     ])
 
+
+
+_COMPACT_RECENT_SUFFIX_MESSAGES = 8
+
+
+async def cmd_compact(ctx: CommandContext) -> OutboundMessage:
+    """Summarize old history while retaining a recent legal message suffix.
+
+    Consolidator owns the lock, archival, and legal-boundary handling.  This
+    command deliberately does not retry or otherwise recover provider errors.
+    """
+    if ctx.args.strip():
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content="Usage: `/compact`",
+            metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+        )
+
+    loop = ctx.loop
+    sessions = loop.sessions
+    before = sessions.get_or_create(ctx.key)
+    before_count = len(before.messages)
+    summary = await loop.consolidator.compact_idle_session(
+        ctx.key, _COMPACT_RECENT_SUFFIX_MESSAGES,
+    )
+    after = sessions.get_or_create(ctx.key)
+    # The consolidator invalidates and replaces the cached session.  The turn
+    # state machine persists the command after this handler using its original
+    # session object, so synchronize that object before returning; otherwise
+    # it could save stale history over the compacted session.
+    if ctx.session is not None and ctx.session is not after:
+        ctx.session.messages = after.messages
+        for attr in ("created_at", "updated_at", "metadata", "last_consolidated"):
+            if hasattr(after, attr):
+                setattr(ctx.session, attr, getattr(after, attr))
+    ctx.session = after
+    archived = max(0, before_count - len(after.messages))
+    metadata = {**dict(ctx.msg.metadata or {}), "render_as": "text"}
+    if not archived:
+        content = f"Nothing to compact; kept {len(after.messages)} recent message(s)."
+    elif summary is None:
+        content = (
+            f"Archived {archived} old message(s) and kept {len(after.messages)} "
+            "recent message(s), but no summary was produced."
+        )
+    else:
+        content = (
+            f"Compacted session: archived {archived} old message(s) and kept "
+            f"{len(after.messages)} recent message(s)."
+        )
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content=content,
+        metadata=metadata,
+    )
 
 
 async def cmd_new(ctx: CommandContext) -> OutboundMessage:
@@ -1261,6 +1324,7 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.priority("/restart", cmd_restart)
     router.priority("/status", cmd_status)
     router.exact("/new", cmd_new)
+    router.exact("/compact", cmd_compact)
     router.exact("/status", cmd_status)
     router.exact("/model", cmd_model)
     router.prefix("/model ", cmd_model)

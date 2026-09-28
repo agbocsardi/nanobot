@@ -23,6 +23,7 @@ from nanobot.agent.tools.schema import (
 )
 from nanobot.config_base import Base
 from nanobot.utils.helpers import build_image_content_blocks
+from nanobot.utils.image_budget import prepare_image
 
 # Shared constants
 _DEFAULT_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36"
@@ -866,7 +867,11 @@ class WebFetchTool(Tool):
                     if ctype.startswith("image/"):
                         r.raise_for_status()
                         raw = await r.aread()
-                        return build_image_content_blocks(raw, ctype, url, f"(Image fetched from: {url})")
+                        prepared = prepare_image(raw, ctype)
+                        if prepared is None:
+                            return json.dumps({"error": "Image cannot be safely ingested", "url": url}, ensure_ascii=False)
+                        image_raw, image_mime = prepared
+                        return build_image_content_blocks(image_raw, image_mime, url, f"(Image fetched from: {url})")
                 finally:
                     if stream is not None:
                         await stream.__aexit__(None, None, None)
@@ -936,7 +941,11 @@ class WebFetchTool(Tool):
 
             ctype = r.headers.get("content-type", "")
             if ctype.startswith("image/"):
-                return build_image_content_blocks(r.content, ctype, url, f"(Image fetched from: {url})")
+                prepared = prepare_image(r.content, ctype)
+                if prepared is None:
+                    return json.dumps({"error": "Image cannot be safely ingested", "url": url}, ensure_ascii=False)
+                image_raw, image_mime = prepared
+                return build_image_content_blocks(image_raw, image_mime, url, f"(Image fetched from: {url})")
 
             if "application/json" in ctype:
                 text, extractor = json.dumps(r.json(), indent=2, ensure_ascii=False), "json"

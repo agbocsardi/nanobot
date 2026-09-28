@@ -566,6 +566,14 @@ def estimate_prompt_tokens(
                         txt = part.get("text", "")
                         if txt:
                             parts.append(txt)
+                    elif part is not None:
+                        # Image and other multimodal blocks are serialized by
+                        # providers too. Include their full JSON payload so a
+                        # large image block cannot evade context governance.
+                        parts.append(json.dumps(part, ensure_ascii=False))
+
+            elif content is not None:
+                parts.append(json.dumps(content, ensure_ascii=False))
 
             tc = msg.get("tool_calls")
             if tc:
@@ -633,16 +641,23 @@ def estimate_prompt_tokens_chain(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None = None,
 ) -> tuple[int, str]:
-    """Estimate prompt tokens via provider counter first, then tiktoken fallback."""
+    """Estimate prompt tokens, never omitting multimodal content."""
+    provider_tokens: int | None = None
+    provider_source = "provider_counter"
     provider_counter = getattr(provider, "estimate_prompt_tokens", None)
     if callable(provider_counter):
         with suppress(Exception):
             tokens, source = provider_counter(messages, tools, model)
             if isinstance(tokens, (int, float)) and tokens > 0:
-                return int(tokens), str(source or "provider_counter")
+                provider_tokens = int(tokens)
+                provider_source = str(source or "provider_counter")
     estimated = estimate_prompt_tokens(messages, tools)
     if estimated > 0:
+        if provider_tokens is not None:
+            return max(provider_tokens, int(estimated)), f"{provider_source}+multimodal"
         return int(estimated), "tiktoken"
+    if provider_tokens is not None:
+        return provider_tokens, provider_source
     return 0, "none"
 
 

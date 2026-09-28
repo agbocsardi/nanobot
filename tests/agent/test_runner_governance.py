@@ -111,6 +111,7 @@ def test_snip_history_reserves_budget_for_tool_definitions(monkeypatch):
     from nanobot.agent.runner import AgentRunner, AgentRunSpec
 
     provider = MagicMock()
+    provider.generation.max_tokens = 0
     tools = MagicMock()
     tools.get_definitions.return_value = [{"type": "function", "function": {"name": "large_tool"}}]
     runner = AgentRunner(provider)
@@ -576,6 +577,7 @@ def test_snip_history_preserves_user_message_after_truncation(monkeypatch):
     from nanobot.agent.runner import AgentRunner, AgentRunSpec
 
     provider = MagicMock()
+    provider.generation.max_tokens = 0
     tools = MagicMock()
     tools.get_definitions.return_value = []
     runner = AgentRunner(provider)
