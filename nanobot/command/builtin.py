@@ -368,6 +368,13 @@ async def cmd_compact(ctx: CommandContext) -> OutboundMessage:
     loop = ctx.loop
     sessions = loop.sessions
     before = sessions.get_or_create(ctx.key)
+    # ``compact_idle_session`` may invalidate and reload this session. Persist
+    # turn-local mutations first (for example, workspace scope from restore),
+    # or the reload would discard them before compaction can archive safely.
+    current = ctx.session if ctx.session is not None else before
+    if current is not before:
+        before = current
+    sessions.save(before)
     before_count = len(before.messages)
     summary = await loop.consolidator.compact_idle_session(
         ctx.key, _COMPACT_RECENT_SUFFIX_MESSAGES,

@@ -27,3 +27,13 @@ def test_small_image_is_validated():
     raw = _image((20, 20))
     prepared = prepare_image(raw, "image/png")
     assert prepared == (raw, "image/png")
+
+
+def test_huge_dimensions_rejected_from_header():
+    import struct
+    import zlib
+
+    ihdr = struct.pack("!IIBBBBB", 8000, 8000, 8, 2, 0, 0, 0)
+    raw = b"\x89PNG\r\n\x1a\n" + struct.pack("!I", 13) + b"IHDR" + ihdr
+    raw += struct.pack("!I", zlib.crc32(b"IHDR" + ihdr) & 0xffffffff)
+    assert prepare_image(raw, "image/png") is None

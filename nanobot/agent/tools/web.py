@@ -23,7 +23,7 @@ from nanobot.agent.tools.schema import (
 )
 from nanobot.config_base import Base
 from nanobot.utils.helpers import build_image_content_blocks
-from nanobot.utils.image_budget import prepare_image
+from nanobot.utils.image_budget import MAX_IMAGE_INPUT_BYTES, prepare_image
 
 # Shared constants
 _DEFAULT_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36"
@@ -106,7 +106,7 @@ async def _get_with_safe_redirects(
             return None, f"Redirect blocked: {error_msg}"
 
         response = await client.get(current_url, headers=headers, follow_redirects=False)
-        is_redirect = 300 <= response.status_code < 400
+        is_redirect = 300 <= getattr(response, "status_code", 200) < 400
         if not is_redirect:
             return response, None
 
@@ -145,7 +145,7 @@ async def _stream_with_safe_redirects(
             follow_redirects=False,
         )
         response = await stream.__aenter__()
-        is_redirect = 300 <= response.status_code < 400
+        is_redirect = 300 <= getattr(response, "status_code", 200) < 400
         if not is_redirect:
             return response, stream, None
 
@@ -784,6 +784,22 @@ class WebSearchTool(Tool):
             return f"Error: {e}"
 
 
+async def _read_limited(response: httpx.Response, limit: int = MAX_IMAGE_INPUT_BYTES) -> bytes | None:
+    """Read a response with a hard bound, including chunked responses."""
+    try:
+        declared = int(response.headers.get("content-length", "0"))
+    except ValueError:
+        declared = 0
+    if declared > limit:
+        return None
+    data = bytearray()
+    async for chunk in response.aiter_bytes():
+        data.extend(chunk)
+        if len(data) > limit:
+            return None
+    return bytes(data)
+
+
 @tool_parameters(
     tool_parameters_schema(
         url=StringSchema("URL to fetch"),
@@ -866,7 +882,9 @@ class WebFetchTool(Tool):
                     ctype = r.headers.get("content-type", "")
                     if ctype.startswith("image/"):
                         r.raise_for_status()
-                        raw = await r.aread()
+                        raw = await _read_limited(r)
+                        if raw is None:
+                            return json.dumps({"error": "Image response exceeds safe download limit", "url": url}, ensure_ascii=False)
                         prepared = prepare_image(raw, ctype)
                         if prepared is None:
                             return json.dumps({"error": "Image cannot be safely ingested", "url": url}, ensure_ascii=False)
@@ -928,36 +946,44 @@ class WebFetchTool(Tool):
                 timeout=30.0,
                 proxy=self.proxy,
             ) as client:
-                r, redirect_error = await _get_with_safe_redirects(
-                    client,
-                    url,
-                    headers={"User-Agent": self.user_agent},
+                r, stream, redirect_error = await _stream_with_safe_redirects(
+                    client, url, headers={"User-Agent": self.user_agent}
                 )
                 if redirect_error:
                     return json.dumps({"error": redirect_error, "url": url}, ensure_ascii=False)
                 if r is None:
                     return json.dumps({"error": "Fetch failed", "url": url}, ensure_ascii=False)
-                r.raise_for_status()
+                try:
+                    # A response with no redirect location is still not a fetchable body.
+                    if 300 <= getattr(r, "status_code", 200) < 400:
+                        return json.dumps({"error": f"Redirect blocked: HTTP redirect {r.status_code}", "url": url}, ensure_ascii=False)
+                    r.raise_for_status()
+                    ctype = r.headers.get("content-type", "")
+                    raw = await _read_limited(r)
+                    if raw is None:
+                        return json.dumps({"error": "Response exceeds safe download limit", "url": url}, ensure_ascii=False)
+                finally:
+                    if stream is not None:
+                        await stream.__aexit__(None, None, None)
 
-            ctype = r.headers.get("content-type", "")
             if ctype.startswith("image/"):
-                prepared = prepare_image(r.content, ctype)
+                prepared = prepare_image(raw, ctype)
                 if prepared is None:
                     return json.dumps({"error": "Image cannot be safely ingested", "url": url}, ensure_ascii=False)
                 image_raw, image_mime = prepared
                 return build_image_content_blocks(image_raw, image_mime, url, f"(Image fetched from: {url})")
 
             if "application/json" in ctype:
-                text, extractor = json.dumps(r.json(), indent=2, ensure_ascii=False), "json"
-            elif "text/html" in ctype or r.text[:256].lower().startswith(("<!doctype", "<html")):
+                text, extractor = json.dumps(json.loads(raw), indent=2, ensure_ascii=False), "json"
+            elif "text/html" in ctype or raw[:256].lower().startswith((b"<!doctype", b"<html")):
                 try:
-                    text = self._extract_readable_html(r.text, extract_mode)
+                    text = self._extract_readable_html(raw.decode("utf-8", errors="replace"), extract_mode)
                     extractor = "readability"
                 except Exception as e:
                     logger.warning("Readability failed for {}, using raw HTML fallback: {}", url, e)
-                    text, extractor = _normalize(_strip_tags(r.text)), "html"
+                    text, extractor = _normalize(_strip_tags(raw.decode("utf-8", errors="replace"))), "html"
             else:
-                text, extractor = r.text, "raw"
+                text, extractor = raw.decode("utf-8", errors="replace"), "raw"
 
             truncated = len(text) > max_chars
             if truncated:

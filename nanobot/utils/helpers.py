@@ -548,14 +548,19 @@ def estimate_prompt_tokens(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None = None,
 ) -> int:
-    """Estimate prompt tokens with tiktoken.
+    """Estimate prompt tokens using provider-like multimodal serialization.
 
-    Counts all fields that providers send to the LLM: content, tool_calls,
-    reasoning_content, tool_call_id, name, plus per-message framing overhead.
+    Image data URLs are sent as binary image inputs by the kept vision
+    providers, not as tokenized base64 text.  Count a conservative vision
+    allowance for those blocks while retaining the URL bytes for unknown
+    image-like payloads.  This avoids rejecting ordinary images merely
+    because their transport encoding is large; the separate request-byte
+    guard protects providers that do serialize the payload as text.
     """
     try:
         enc = tiktoken.get_encoding("cl100k_base")
         parts: list[str] = []
+        vision_images = 0
         for msg in messages:
             content = msg.get("content")
             if isinstance(content, str):
@@ -566,10 +571,16 @@ def estimate_prompt_tokens(
                         txt = part.get("text", "")
                         if txt:
                             parts.append(txt)
-                    elif part is not None:
-                        # Image and other multimodal blocks are serialized by
-                        # providers too. Include their full JSON payload so a
-                        # large image block cannot evade context governance.
+                    elif isinstance(part, dict) and part.get("type") == "image_url":
+                        image = part.get("image_url") or {}
+                        url = image.get("url") if isinstance(image, dict) else None
+                        if (msg.get("role") == "user" and isinstance(url, str)
+                                and url.startswith("data:image/")):
+                            vision_images += 1
+                            parts.append("[vision image]")
+                        else:
+                            parts.append(json.dumps(part, ensure_ascii=False))
+                    else:
                         parts.append(json.dumps(part, ensure_ascii=False))
 
             elif content is not None:
@@ -582,6 +593,9 @@ def estimate_prompt_tokens(
             rc = msg.get("reasoning_content")
             if isinstance(rc, str) and rc:
                 parts.append(rc)
+            tb = msg.get("thinking_blocks")
+            if tb:
+                parts.append(json.dumps(tb, ensure_ascii=False))
 
             for key in ("name", "tool_call_id"):
                 value = msg.get(key)
@@ -592,7 +606,7 @@ def estimate_prompt_tokens(
             parts.append(json.dumps(tools, ensure_ascii=False))
 
         per_message_overhead = len(messages) * 4
-        return len(enc.encode("\n".join(parts))) + per_message_overhead
+        return len(enc.encode("\n".join(parts))) + per_message_overhead + vision_images * 1024
     except Exception:
         return 0
 
@@ -601,6 +615,7 @@ def estimate_message_tokens(message: dict[str, Any]) -> int:
     """Estimate prompt tokens contributed by one persisted message."""
     content = message.get("content")
     parts: list[str] = []
+    vision_images = 0
     if isinstance(content, str):
         parts.append(content)
     elif isinstance(content, list):
@@ -609,6 +624,15 @@ def estimate_message_tokens(message: dict[str, Any]) -> int:
                 text = part.get("text", "")
                 if text:
                     parts.append(text)
+            elif isinstance(part, dict) and part.get("type") == "image_url":
+                image = part.get("image_url") or {}
+                url = image.get("url") if isinstance(image, dict) else None
+                if (message.get("role") == "user" and isinstance(url, str)
+                        and url.startswith("data:image/")):
+                    vision_images += 1
+                    parts.append("[vision image]")
+                else:
+                    parts.append(json.dumps(part, ensure_ascii=False))
             else:
                 parts.append(json.dumps(part, ensure_ascii=False))
     elif content is not None:
@@ -624,15 +648,68 @@ def estimate_message_tokens(message: dict[str, Any]) -> int:
     rc = message.get("reasoning_content")
     if isinstance(rc, str) and rc:
         parts.append(rc)
+    tb = message.get("thinking_blocks")
+    if tb:
+        parts.append(json.dumps(tb, ensure_ascii=False))
 
     payload = "\n".join(parts)
     if not payload:
         return 4
     try:
         enc = tiktoken.get_encoding("cl100k_base")
-        return max(4, len(enc.encode(payload)) + 4)
+        return max(4, len(enc.encode(payload)) + 4 + vision_images * 1024)
     except Exception:
-        return max(4, len(payload) // 4 + 4)
+        return max(4, len(payload) // 4 + 4 + vision_images * 1024)
+
+
+def estimate_request_bytes(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> int:
+    """Return the UTF-8 JSON size of the request payload (before HTTP framing)."""
+    try:
+        payload: dict[str, Any] = {"messages": messages}
+        if tools is not None:
+            payload["tools"] = tools
+        return len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    except Exception:
+        # Callers use this value for a hard upper bound.  Serialization failure
+        # must never turn an unsafe payload into an apparent zero-byte request.
+        return 2**63 - 1
+
+
+def _is_codex_responses_provider(provider: Any, model: str | None) -> bool:
+    """Identify Codex, including the configured failover wrapper's primary."""
+    primary = getattr(provider, "_primary", None)
+    if primary is not None:
+        provider = primary
+    cls = type(provider)
+    return cls.__module__.endswith("openai_codex_provider") and cls.__name__ == "OpenAICodexProvider"
+
+
+def _codex_estimation_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Mirror the Codex converter's tool-image representation for token counting."""
+    # Import lazily: helpers is used by providers during package initialisation.
+    from nanobot.providers.openai_responses.converters import _convert_tool_output
+
+    converted: list[dict[str, Any]] = []
+    for message in messages:
+        if message.get("role") != "tool" or not isinstance(message.get("content"), list):
+            converted.append(message)
+            continue
+        output, images = _convert_tool_output(message["content"])
+        replacement = dict(message)
+        replacement["content"] = output
+        converted.append(replacement)
+        if images:
+            converted.append({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Tool image output:"},
+                    # The converter sends these as input_image, regardless of
+                    # whether the URL is a data URL or a remote image URL.
+                    *({"type": "image_url", "image_url": {"url": "data:image/codex-tool"}}
+                      for _url in images),
+                ],
+            })
+    return converted
 
 
 def estimate_prompt_tokens_chain(
@@ -642,16 +719,18 @@ def estimate_prompt_tokens_chain(
     tools: list[dict[str, Any]] | None = None,
 ) -> tuple[int, str]:
     """Estimate prompt tokens, never omitting multimodal content."""
+    codex = _is_codex_responses_provider(provider, model)
+    estimation_messages = _codex_estimation_messages(messages) if codex else messages
     provider_tokens: int | None = None
     provider_source = "provider_counter"
     provider_counter = getattr(provider, "estimate_prompt_tokens", None)
     if callable(provider_counter):
         with suppress(Exception):
-            tokens, source = provider_counter(messages, tools, model)
+            tokens, source = provider_counter(estimation_messages, tools, model)
             if isinstance(tokens, (int, float)) and tokens > 0:
                 provider_tokens = int(tokens)
                 provider_source = str(source or "provider_counter")
-    estimated = estimate_prompt_tokens(messages, tools)
+    estimated = estimate_prompt_tokens(estimation_messages, tools)
     if estimated > 0:
         if provider_tokens is not None:
             return max(provider_tokens, int(estimated)), f"{provider_source}+multimodal"

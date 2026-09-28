@@ -33,6 +33,7 @@ from nanobot.utils.helpers import (
     build_assistant_message,
     estimate_message_tokens,
     estimate_prompt_tokens_chain,
+    estimate_request_bytes,
     extract_reasoning,
     find_legal_message_start,
     maybe_persist_tool_result,
@@ -68,6 +69,7 @@ _MAX_LENGTH_RECOVERIES = 3
 _MAX_INJECTIONS_PER_TURN = 3
 _MAX_INJECTION_CYCLES = 5
 _SNIP_SAFETY_BUFFER = 1024
+_MAX_REQUEST_BYTES = 16 * 1024 * 1024
 _MICROCOMPACT_KEEP_RECENT = 10
 _MICROCOMPACT_KEEP_RECENT_IMAGES = 1
 _MICROCOMPACT_MIN_CHARS = 500
@@ -453,6 +455,7 @@ class AgentRunner:
                 self._append_final_message(messages, final_content)
                 await hook.after_iteration(context)
                 break
+            self._mark_images_seen(messages)
             context.response = response
             context.tool_calls = list(response.tool_calls)
 
@@ -816,8 +819,14 @@ class AgentRunner:
             kwargs["reasoning_effort"] = spec.reasoning_effort
         return kwargs
 
-    def _enforce_context_budget(self, spec: AgentRunSpec, messages: list[dict[str, Any]]) -> None:
+    def _enforce_context_budget(
+        self, spec: AgentRunSpec, messages: list[dict[str, Any]], *, include_tools: bool = True,
+    ) -> None:
         """Reject oversized prompts immediately before any provider call."""
+        tools = spec.tools.get_definitions() if include_tools else None
+        request_bytes = estimate_request_bytes(messages, tools)
+        if request_bytes > _MAX_REQUEST_BYTES:
+            raise ContextBudgetExceededError(request_bytes, _MAX_REQUEST_BYTES)
         if not spec.context_window_tokens and not spec.context_block_limit:
             return
         provider_max_tokens = getattr(getattr(self.provider, "generation", None), "max_tokens", 4096)
@@ -833,7 +842,7 @@ class AgentRunner:
         ) else (spec.context_block_limit or window_budget)
         budget = max(0, budget)
         estimate, _ = estimate_prompt_tokens_chain(
-            self.provider, spec.model, messages, spec.tools.get_definitions()
+            self.provider, spec.model, messages, tools
         )
         if estimate > budget:
             raise ContextBudgetExceededError(estimate, budget)
@@ -1052,7 +1061,17 @@ class AgentRunner:
         spec: AgentRunSpec,
         messages: list[dict[str, Any]],
     ) -> LLMResponse:
+        # Finalization is a model call too: apply the same governance and hard
+        # preflight as the normal path before vision handoff/serialization.
+        messages = self._drop_orphan_tool_results(messages)
+        messages = self._backfill_missing_tool_results(messages)
+        messages = self._microcompact(messages)
+        messages = self._apply_tool_result_budget(spec, messages)
+        messages = self._snip_history(spec, messages)
+        messages = self._drop_orphan_tool_results(messages)
+        messages = self._backfill_missing_tool_results(messages)
         messages = await self._maybe_vision_handoff(spec, messages)
+        self._enforce_context_budget(spec, messages, include_tools=False)
         kwargs = self._build_request_kwargs(spec, messages, tools=None)
         return await self.provider.chat_with_retry(**kwargs)
 
@@ -1672,6 +1691,19 @@ class AgentRunner:
         return updated
 
     @staticmethod
+    def _mark_images_seen(messages: list[dict[str, Any]]) -> None:
+        """Mark image tool results as observed after the first model response."""
+        latest = max((idx for idx, msg in enumerate(messages)
+                      if msg.get("role") == "assistant" and msg.get("tool_calls")), default=-1)
+        for idx in range(latest + 1, len(messages)):
+            msg = messages[idx]
+            if msg.get("role") == "tool" and isinstance(msg.get("content"), list) and any(
+                isinstance(block, dict) and block.get("type") == "image_url"
+                for block in msg["content"]
+            ):
+                msg["_images_seen"] = True
+
+    @staticmethod
     def _microcompact(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Replace old compactable tool results with one-line summaries."""
         compactable_indices: list[int] = []
@@ -1695,7 +1727,8 @@ class AgentRunner:
              if msg.get("role") == "assistant" and msg.get("tool_calls")),
             default=-1,
         )
-        seen_images = [idx for idx in image_indices if idx < latest_batch_start]
+        seen_images = [idx for idx in image_indices
+                       if idx < latest_batch_start or messages[idx].get("_images_seen")]
         stale_images = set(seen_images[:-_MICROCOMPACT_KEEP_RECENT_IMAGES])
         updated: list[dict[str, Any]] | None = None
         for idx in sorted(set(stale) | stale_images):

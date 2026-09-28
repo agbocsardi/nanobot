@@ -78,7 +78,14 @@ async def test_compact_shortcut_cannot_restore_stale_session(tmp_path):
     original = sessions.get_or_create("test:chat")
     original.add_message("user", "old")
     original.add_message("assistant", "old answer")
+    # Simulate _state_restore's dirty mutation before /compact dispatch.
+    original.metadata["workspace_scope"] = {
+        "project": str(tmp_path / "project"),
+        "mode": "restricted",
+    }
     sessions.save(original)
+    # Make the scope dirty after the last save, as the live turn does.
+    original.metadata["workspace_scope"]["project"] = str(tmp_path / "project-dirty")
 
     async def compact(key, _max_suffix):
         sessions.invalidate(key)
@@ -101,3 +108,4 @@ async def test_compact_shortcut_cannot_restore_stale_session(tmp_path):
     sessions.invalidate("test:chat")
     retained = sessions.get_or_create("test:chat")
     assert [item["content"] for item in retained.messages] == ["old answer", "/compact"]
+    assert retained.metadata["workspace_scope"]["project"] == str(tmp_path / "project-dirty")

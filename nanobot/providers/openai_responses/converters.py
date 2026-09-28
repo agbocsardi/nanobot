@@ -54,10 +54,56 @@ def convert_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str
 
         if role == "tool":
             call_id, _ = split_tool_call_id(msg.get("tool_call_id"))
-            output_text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+            output_text, images = _convert_tool_output(content)
+            # Responses function_call_output only accepts text. Do not stringify
+            # image data into it: that loses vision semantics and can consume
+            # the whole context window. Keep the tool result for call legality,
+            # then expose images in a separate user multimodal item.
             input_items.append({"type": "function_call_output", "call_id": call_id, "output": output_text})
+            if images:
+                input_items.append({
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Tool image output:"},
+                        *({"type": "input_image", "image_url": url, "detail": "auto"} for url in images),
+                    ],
+                })
 
     return system_prompt, input_items
+
+
+def _convert_tool_output(content: Any) -> tuple[str, list[str]]:
+    """Return text function output and image URLs from a tool result.
+
+    Images cannot be embedded in a Responses ``function_call_output`` (its
+    ``output`` field is text). Extract them into a following user item instead
+    of serialising potentially very large data URLs as JSON text.
+    """
+    if not isinstance(content, list):
+        return (content if isinstance(content, str) else json.dumps(content, ensure_ascii=False), [])
+
+    text_parts: list[str] = []
+    images: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "image_url":
+            image = block.get("image_url") or {}
+            url = image.get("url") if isinstance(image, dict) else None
+            if isinstance(url, str) and url:
+                images.append(url)
+                meta = block.get("_meta") or {}
+                path = meta.get("path") if isinstance(meta, dict) else None
+                text_parts.append(f"[image: {path}]" if path else "[image]")
+        elif block.get("type") == "text":
+            text = block.get("text")
+            if isinstance(text, str) and text:
+                text_parts.append(text)
+        else:
+            text_parts.append(json.dumps(block, ensure_ascii=False))
+    if not images:
+        return json.dumps(content, ensure_ascii=False), []
+    return "\n".join(text_parts), images
 
 
 def convert_user_message(content: Any) -> dict[str, Any]:
