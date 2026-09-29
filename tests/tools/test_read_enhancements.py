@@ -5,6 +5,7 @@ import sys
 from unittest.mock import patch
 
 import pytest
+from PIL import Image
 
 from nanobot.agent.tools import file_state
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool
@@ -89,7 +90,7 @@ class TestReadDedup:
     @pytest.mark.asyncio
     async def test_dedup_does_not_apply_to_images(self, tool, tmp_path):
         f = tmp_path / "img.png"
-        f.write_bytes(b"\x89PNG\r\n\x1a\nfake-png-data")
+        Image.new("RGB", (1, 1)).save(f)
         first = await tool.execute(path=str(f))
         assert isinstance(first, list)
         second = await tool.execute(path=str(f))

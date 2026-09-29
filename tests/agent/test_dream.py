@@ -178,7 +178,7 @@ class TestEphemeralDirect:
                 bus=bus,
                 provider=provider,
                 workspace=tmp_path,
-                context_window_tokens=8000,
+                context_window_tokens=32000,
             )
 
         return loop, store
@@ -338,7 +338,7 @@ class TestEphemeralDirect:
             bus=MessageBus(),
             provider=provider,
             workspace=tmp_path,
-            context_window_tokens=8000,
+            context_window_tokens=32000,
         )
 
         await loop.process_direct(

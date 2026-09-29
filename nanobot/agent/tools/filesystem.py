@@ -19,6 +19,8 @@ from nanobot.agent.tools.schema import (
 from nanobot.config_base import Base
 from nanobot.security.workspace_access import current_tool_workspace
 from nanobot.utils.helpers import build_image_content_blocks, detect_image_mime
+from nanobot.utils.image_budget import prepare_image
+from nanobot.utils.image_cache import cache_prepared_image, path_within_workspace
 
 
 class FileToolsConfig(Base):
@@ -105,6 +107,17 @@ class _FsTool(Tool):
 
     def _display_workspace(self) -> Path | None:
         return current_tool_workspace(self._workspace).project_path
+
+    def _image_metadata_path(self, source: Path, prepared: bytes, raw: bytes, mime: str) -> Path | None:
+        workspace = self._display_workspace()
+        if workspace is not None and path_within_workspace(source, workspace) and prepared == raw:
+            return source
+        if workspace is None:
+            return None
+        try:
+            return cache_prepared_image(prepared, mime, workspace)
+        except (OSError, ValueError):
+            return None
 
 
 # ---------------------------------------------------------------------------
@@ -246,7 +259,15 @@ class ReadFileTool(_FsTool):
 
             mime = detect_image_mime(raw) or mimetypes.guess_type(path)[0]
             if mime and mime.startswith("image/"):
-                return build_image_content_blocks(raw, mime, str(fp), f"(Image file: {path})")
+                prepared = prepare_image(raw, mime)
+                if prepared is None:
+                    return f"Error: Cannot safely ingest image {path}"
+                image_raw, image_mime = prepared
+                metadata_path = self._image_metadata_path(fp, image_raw, raw, image_mime)
+                blocks = build_image_content_blocks(image_raw, image_mime, str(metadata_path or fp), f"(Image file: {path})")
+                if metadata_path is None:
+                    blocks[0].pop("_meta", None)
+                return blocks
 
             # Read dedup: same path + offset + limit + unchanged mtime → stub
             # Always check for external modifications before dedup
@@ -292,7 +313,15 @@ class ReadFileTool(_FsTool):
                 # Binary file - return error message
                 mime = detect_image_mime(raw) or mimetypes.guess_type(path)[0]
                 if mime and mime.startswith("image/"):
-                    return build_image_content_blocks(raw, mime, str(fp), f"(Image file: {path})")
+                    prepared = prepare_image(raw, mime)
+                    if prepared is None:
+                        return f"Error: Cannot safely ingest image {path}"
+                    image_raw, image_mime = prepared
+                    metadata_path = self._image_metadata_path(fp, image_raw, raw, image_mime)
+                    blocks = build_image_content_blocks(image_raw, image_mime, str(metadata_path or fp), f"(Image file: {path})")
+                    if metadata_path is None:
+                        blocks[0].pop("_meta", None)
+                    return blocks
                 return f"Error: Cannot read binary file {path} (MIME: {mime or 'unknown'}). Only UTF-8 text and images are supported."
 
             # Normalize CRLF -> LF before line-splitting. Primarily a Windows

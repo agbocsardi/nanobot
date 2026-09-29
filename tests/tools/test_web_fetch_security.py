@@ -76,20 +76,20 @@ async def test_web_fetch_result_contains_untrusted_flag():
     fake_html = "<html><head><title>Test</title></head><body><p>Hello world</p></body></html>"
 
 
-    class FakeResponse:
-        status_code = 200
-        url = "https://example.com/page"
-        text = fake_html
-        headers = {"content-type": "text/html"}
-        is_redirect = False
-        def raise_for_status(self): pass
-        def json(self): return {}
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            200, headers={"content-type": "text/html"}, content=fake_html.encode(), request=request,
+        )
+    )
+    real_async_client = httpx.AsyncClient
 
-    async def _fake_get(self, url, **kwargs):
-        return FakeResponse()
+    class MockAsyncClient(real_async_client):
+        def __init__(self, *args, **kwargs):
+            kwargs.pop("proxy", None)
+            super().__init__(*args, transport=transport, **kwargs)
 
     with patch("nanobot.security.network.socket.getaddrinfo", _fake_resolve_public), \
-         patch("httpx.AsyncClient.get", _fake_get):
+         patch("nanobot.agent.tools.web.httpx.AsyncClient", MockAsyncClient):
         result = await tool.execute(url="https://example.com/page")
 
     data = json.loads(result)
@@ -119,8 +119,11 @@ async def test_web_fetch_can_skip_jina_and_use_custom_user_agent(monkeypatch):
         async def __aexit__(self, exc_type, exc, tb):
             return False
 
-        async def aread(self):
-            raise AssertionError("non-image prefetch body should not be read")
+        def raise_for_status(self):
+            return None
+
+        async def aiter_bytes(self):
+            yield b"<html><body><p>Hello world</p></body></html>"
 
     class FakeResponse:
         status_code = 200
@@ -178,6 +181,15 @@ async def test_web_fetch_falls_back_when_readability_dependency_is_missing(monke
         def raise_for_status(self):
             return None
 
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def aiter_bytes(self):
+            yield self.text.encode()
+
     class FakeClient:
         def __init__(self, *args, **kwargs):
             pass
@@ -188,7 +200,7 @@ async def test_web_fetch_falls_back_when_readability_dependency_is_missing(monke
         async def __aexit__(self, exc_type, exc, tb):
             return False
 
-        async def get(self, url, headers=None, follow_redirects=False, **kwargs):
+        def stream(self, method, url, headers=None, follow_redirects=False, **kwargs):
             return FakeResponse()
 
     def _missing_readability(*args, **kwargs):
@@ -212,8 +224,8 @@ async def test_web_fetch_blocks_private_redirect_before_readability_request(monk
     requested: list[str] = []
 
     class FakeStreamResponse:
-        status_code = 200
-        headers = {"content-type": "text/html"}
+        status_code = 302
+        headers = {"location": "http://127.0.0.1:8765/metadata"}
         url = "https://attacker.example/start"
 
         async def __aenter__(self):
@@ -244,6 +256,7 @@ async def test_web_fetch_blocks_private_redirect_before_readability_request(monk
             return False
 
         def stream(self, method, url, headers=None, **kwargs):
+            requested.append(url)
             return FakeStreamResponse()
 
         async def get(self, url, headers=None, **kwargs):

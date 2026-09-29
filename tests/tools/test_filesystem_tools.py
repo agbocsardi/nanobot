@@ -1,6 +1,7 @@
 """Tests for enhanced filesystem tools: ReadFileTool, EditFileTool, ListDirTool."""
 
 import pytest
+from PIL import Image
 
 from nanobot.agent.tools.filesystem import (
     EditFileTool,
@@ -60,7 +61,7 @@ class TestReadFileTool:
     @pytest.mark.asyncio
     async def test_image_file_returns_multimodal_blocks(self, tool, tmp_path):
         f = tmp_path / "pixel.png"
-        f.write_bytes(b"\x89PNG\r\n\x1a\nfake-png-data")
+        Image.new("RGB", (1, 1)).save(f)
 
         result = await tool.execute(path=str(f))
 

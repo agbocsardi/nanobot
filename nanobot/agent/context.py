@@ -21,6 +21,8 @@ from nanobot.utils.helpers import (
     load_bundled_template,
     truncate_text,
 )
+from nanobot.utils.image_budget import prepare_image
+from nanobot.utils.image_cache import cache_prepared_image, path_within_workspace
 from nanobot.utils.prompt_templates import render_template
 
 
@@ -303,7 +305,7 @@ class ContextBuilder:
             sender_id=sender_id,
             supplemental_lines=extra or None,
         )
-        user_content = self._build_user_content(current_message, media)
+        user_content = self._build_user_content(current_message, media, workspace=root)
 
         # Merge runtime context and user content into a single user message
         # to avoid consecutive same-role messages that some providers reject.
@@ -338,12 +340,13 @@ class ContextBuilder:
         messages.append({"role": current_role, "content": merged})
         return messages
 
-    def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
+    def _build_user_content(self, text: str, media: list[str] | None, workspace: Path | None = None) -> str | list[dict[str, Any]]:
         """Build user message content with optional base64-encoded images."""
         if not media:
             return text
 
         images = []
+        cache_workspace = workspace or self.workspace
         for path in media:
             p = Path(path)
             if not p.is_file():
@@ -352,12 +355,30 @@ class ContextBuilder:
             mime = detect_image_mime(raw) or mimetypes.guess_type(path)[0]
             if not mime or not mime.startswith("image/"):
                 continue
-            b64 = base64.b64encode(raw).decode()
-            images.append({
+            prepared = prepare_image(raw, mime)
+            if prepared is None:
+                images.append({
+                    "type": "text",
+                    "text": f"[Image could not be safely ingested: {path}]",
+                })
+                continue
+            image_raw, image_mime = prepared
+            # Keep a re-readable path for compaction/retry.  Never retain an
+            # out-of-workspace attachment path; cache transformed bytes locally.
+            metadata_path = p if path_within_workspace(p, cache_workspace) and image_raw == raw else None
+            if metadata_path is None:
+                try:
+                    metadata_path = cache_prepared_image(image_raw, image_mime, cache_workspace)
+                except (OSError, ValueError):
+                    metadata_path = None
+            b64 = base64.b64encode(image_raw).decode()
+            block = {
                 "type": "image_url",
-                "image_url": {"url": f"data:{mime};base64,{b64}"},
-                "_meta": {"path": str(p)},
-            })
+                "image_url": {"url": f"data:{image_mime};base64,{b64}"},
+            }
+            if metadata_path is not None:
+                block["_meta"] = {"path": str(metadata_path)}
+            images.append(block)
 
         if not images:
             return text

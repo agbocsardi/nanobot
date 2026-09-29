@@ -33,6 +33,7 @@ from nanobot.utils.helpers import (
     build_assistant_message,
     estimate_message_tokens,
     estimate_prompt_tokens_chain,
+    estimate_request_bytes,
     extract_reasoning,
     find_legal_message_start,
     maybe_persist_tool_result,
@@ -68,7 +69,12 @@ _MAX_LENGTH_RECOVERIES = 3
 _MAX_INJECTIONS_PER_TURN = 3
 _MAX_INJECTION_CYCLES = 5
 _SNIP_SAFETY_BUFFER = 1024
+_MAX_REQUEST_BYTES = 16 * 1024 * 1024
+# Upper bound on provider-chain walks; guards duck-typed stand-ins that mint a
+# fresh object per attribute access and would otherwise loop forever.
+_MAX_PROVIDER_CHAIN_DEPTH = 8
 _MICROCOMPACT_KEEP_RECENT = 10
+_MICROCOMPACT_KEEP_RECENT_IMAGES = 1
 _MICROCOMPACT_MIN_CHARS = 500
 _COMPACTABLE_TOOLS = frozenset({
     "read_file", "exec", "grep", "find_files",
@@ -86,6 +92,16 @@ _POLICY_BLOCK_PREFIX = "Incomplete: one or more required operations were blocked
 # persisted run records stay small even across 100+ iteration runs.
 _RECORDED_ARG_MAX_CHARS = 200
 _RECORDED_PREVIEW_MAX_CHARS = 500
+
+
+class ContextBudgetExceededError(Exception):
+    """The model prompt cannot fit, even after context governance."""
+
+    def __init__(self, estimate: int, budget: int, *, unit: str = "tokens"):
+        self.estimate = estimate
+        self.budget = budget
+        self.unit = unit
+        super().__init__(f"Prompt context is too large ({estimate} {unit}; limit {budget}).")
 
 
 def _truncate_recorded_text(text: str, max_chars: int) -> str:
@@ -428,7 +444,29 @@ class AgentRunner:
                 session_key=spec.session_key,
             )
             await hook.before_iteration(context)
-            response = await self._request_model(spec, messages_for_model, hook, context)
+            try:
+                response = await self._request_model(spec, messages_for_model, hook, context)
+            except ContextBudgetExceededError as exc:
+                if exc.unit == "images":
+                    final_content = (
+                        "I could not send this request because Umans allows at most "
+                        f"{exc.budget} images per request, but {exc.estimate} images "
+                        "are in the current unseen batch."
+                    )
+                else:
+                    final_content = (
+                        "I could not send this request because the conversation, including its "
+                        f"images, is too large ({exc.estimate} {exc.unit}; limit {exc.budget})."
+                    )
+                error = final_content
+                stop_reason = "context_budget_exceeded"
+                context.final_content = final_content
+                context.error = error
+                context.stop_reason = stop_reason
+                self._append_final_message(messages, final_content)
+                await hook.after_iteration(context)
+                break
+            self._mark_images_seen(messages)
             context.response = response
             context.tool_calls = list(response.tool_calls)
 
@@ -792,6 +830,34 @@ class AgentRunner:
             kwargs["reasoning_effort"] = spec.reasoning_effort
         return kwargs
 
+    def _enforce_context_budget(
+        self, spec: AgentRunSpec, messages: list[dict[str, Any]], *, include_tools: bool = True,
+    ) -> None:
+        """Reject oversized prompts immediately before any provider call."""
+        tools = spec.tools.get_definitions() if include_tools else None
+        request_bytes = estimate_request_bytes(messages, tools)
+        if request_bytes > _MAX_REQUEST_BYTES:
+            raise ContextBudgetExceededError(request_bytes, _MAX_REQUEST_BYTES)
+        if not spec.context_window_tokens and not spec.context_block_limit:
+            return
+        provider_max_tokens = getattr(getattr(self.provider, "generation", None), "max_tokens", 4096)
+        max_output = spec.max_tokens if isinstance(spec.max_tokens, int) else (
+            provider_max_tokens if isinstance(provider_max_tokens, int) else 4096
+        )
+        window_budget = (
+            spec.context_window_tokens - max_output - _SNIP_SAFETY_BUFFER
+            if spec.context_window_tokens else 0
+        )
+        budget = min(spec.context_block_limit, window_budget) if (
+            spec.context_block_limit and spec.context_window_tokens
+        ) else (spec.context_block_limit or window_budget)
+        budget = max(0, budget)
+        estimate, _ = estimate_prompt_tokens_chain(
+            self.provider, spec.model, messages, tools
+        )
+        if estimate > budget:
+            raise ContextBudgetExceededError(estimate, budget)
+
     async def _request_model(
         self,
         spec: AgentRunSpec,
@@ -813,6 +879,10 @@ class AgentRunner:
             timeout_s = None
 
         messages = await self._maybe_vision_handoff(spec, messages)
+        messages = self._prepare_umans_image_budget(messages)
+        # Vision handoff can add image blocks after history snipping. Recheck
+        # the complete payload, including those blocks, before calling provider.
+        self._enforce_context_budget(spec, messages)
         kwargs = self._build_request_kwargs(
             spec,
             messages,
@@ -1003,9 +1073,85 @@ class AgentRunner:
         spec: AgentRunSpec,
         messages: list[dict[str, Any]],
     ) -> LLMResponse:
+        # Finalization is a model call too: apply the same governance and hard
+        # preflight as the normal path before vision handoff/serialization.
+        messages = self._drop_orphan_tool_results(messages)
+        messages = self._backfill_missing_tool_results(messages)
+        messages = self._microcompact(messages)
+        messages = self._apply_tool_result_budget(spec, messages)
+        messages = self._snip_history(spec, messages)
+        messages = self._drop_orphan_tool_results(messages)
+        messages = self._backfill_missing_tool_results(messages)
         messages = await self._maybe_vision_handoff(spec, messages)
+        messages = self._prepare_umans_image_budget(messages)
+        self._enforce_context_budget(spec, messages, include_tools=False)
         kwargs = self._build_request_kwargs(spec, messages, tools=None)
         return await self.provider.chat_with_retry(**kwargs)
+
+    def _is_umans_provider(self) -> bool:
+        """Return whether the active provider (including fallback primary) is Umans.
+
+        The walk is depth-bounded.  A plain attribute chain can be traversed by
+        duck-typed stand-ins (test doubles, proxies) that mint a fresh object per
+        attribute access, so an ``id()``-only cycle guard can loop forever and
+        exhaust memory.  The bound terminates such chains.
+        """
+        provider: Any = self.provider
+        for _ in range(_MAX_PROVIDER_CHAIN_DEPTH):
+            if provider is None:
+                return False
+            spec = getattr(provider, "_spec", None)
+            if getattr(spec, "name", None) == "umans":
+                return True
+            nxt = getattr(provider, "_primary", None)
+            if nxt is None or nxt is provider:
+                return False
+            provider = nxt
+        return False
+
+    def _prepare_umans_image_budget(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not self._is_umans_provider():
+            return messages
+        locations: list[tuple[int, int, dict[str, Any], bool]] = []
+        latest_tool_batch = max(
+            (idx for idx, msg in enumerate(messages)
+             if msg.get("role") == "assistant" and msg.get("tool_calls")),
+            default=-1,
+        )
+        for mi, message in enumerate(messages):
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for bi, block in enumerate(content):
+                if not isinstance(block, dict) or block.get("type") != "image_url":
+                    continue
+                seen = bool(message.get("_images_seen")) or (
+                    message.get("role") == "tool" and mi < latest_tool_batch
+                )
+                locations.append((mi, bi, block, seen))
+        unseen = [item for item in locations if not item[3]]
+        if len(unseen) > 20:
+            raise ContextBudgetExceededError(len(unseen), 20, unit="images")
+        excess = len(locations) - 20
+        if excess <= 0:
+            return messages
+        # Remove oldest seen images only. Unseen images are never silently dropped.
+        removable = [item for item in locations if item[3]]
+        if len(removable) < excess:
+            raise ContextBudgetExceededError(len(locations), 20, unit="images")
+        remove = {(mi, bi) for mi, bi, _block, _seen in removable[:excess]}
+        updated = deepcopy(messages)
+        for mi, bi, block, _seen in locations:
+            if (mi, bi) not in remove:
+                continue
+            meta = block.get("_meta")
+            path = meta.get("path") if isinstance(meta, dict) else None
+            if not path:
+                path = "unknown path"
+            content = updated[mi].get("content")
+            if isinstance(content, list):
+                content[bi] = {"type": "text", "text": f"[image: {path}; re-read via read_file({path})]"}
+        return updated
 
     async def _maybe_vision_handoff(
         self,
@@ -1639,6 +1785,19 @@ class AgentRunner:
         return updated
 
     @staticmethod
+    def _mark_images_seen(messages: list[dict[str, Any]]) -> None:
+        """Mark image tool results as observed after the first model response."""
+        latest = max((idx for idx, msg in enumerate(messages)
+                      if msg.get("role") == "assistant" and msg.get("tool_calls")), default=-1)
+        for idx in range(latest + 1, len(messages)):
+            msg = messages[idx]
+            if msg.get("role") == "tool" and isinstance(msg.get("content"), list) and any(
+                isinstance(block, dict) and block.get("type") == "image_url"
+                for block in msg["content"]
+            ):
+                msg["_images_seen"] = True
+
+    @staticmethod
     def _microcompact(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Replace old compactable tool results with one-line summaries."""
         compactable_indices: list[int] = []
@@ -1646,18 +1805,47 @@ class AgentRunner:
             if msg.get("role") == "tool" and msg.get("name") in _COMPACTABLE_TOOLS:
                 compactable_indices.append(idx)
 
-        if len(compactable_indices) <= _MICROCOMPACT_KEEP_RECENT:
-            return messages
-
-        stale = compactable_indices[: len(compactable_indices) - _MICROCOMPACT_KEEP_RECENT]
+        stale = compactable_indices[: max(0, len(compactable_indices) - _MICROCOMPACT_KEEP_RECENT)]
+        image_indices = [
+            idx for idx in compactable_indices
+            if isinstance(messages[idx].get("content"), list)
+            and any(
+                isinstance(block, dict) and block.get("type") == "image_url"
+                for block in messages[idx]["content"]
+            )
+        ]
+        # All images from the newest tool-call batch have not been seen by the
+        # model yet. Never compact them before their first model response.
+        latest_batch_start = max(
+            (idx for idx, msg in enumerate(messages)
+             if msg.get("role") == "assistant" and msg.get("tool_calls")),
+            default=-1,
+        )
+        seen_images = [idx for idx in image_indices
+                       if idx < latest_batch_start or messages[idx].get("_images_seen")]
+        stale_images = set(seen_images[:-_MICROCOMPACT_KEEP_RECENT_IMAGES])
+        # A tool result that still carries an unseen image must not be dropped by
+        # the generic stale rule either; the image budget handles that case and
+        # can report a hard local error instead of silently losing the image.
+        unseen_images = set(image_indices) - set(seen_images)
+        stale = [idx for idx in stale if idx not in unseen_images]
         updated: list[dict[str, Any]] | None = None
-        for idx in stale:
+        for idx in sorted(set(stale) | stale_images):
             msg = messages[idx]
             content = msg.get("content")
-            if not isinstance(content, str) or len(content) < _MICROCOMPACT_MIN_CHARS:
+            if idx in stale_images:
+                paths = [
+                    block.get("_meta", {}).get("path")
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "image_url"
+                    and isinstance(block.get("_meta"), dict)
+                ]
+                path_hint = f"; re-read {', '.join(str(path) for path in paths if path)}" if paths else ""
+                summary = f"[{msg.get('name', 'tool')} image omitted from context{path_hint}]"
+            elif isinstance(content, str) and len(content) >= _MICROCOMPACT_MIN_CHARS:
+                summary = f"[{msg.get('name', 'tool')} result omitted from context]"
+            else:
                 continue
-            name = msg.get("name", "tool")
-            summary = f"[{name} result omitted from context]"
             if updated is None:
                 updated = [dict(m) for m in messages]
             updated[idx]["content"] = summary
@@ -1697,9 +1885,8 @@ class AgentRunner:
         max_output = spec.max_tokens if isinstance(spec.max_tokens, int) else (
             provider_max_tokens if isinstance(provider_max_tokens, int) else 4096
         )
-        budget = spec.context_block_limit or (
-            spec.context_window_tokens - max_output - _SNIP_SAFETY_BUFFER
-        )
+        window_budget = spec.context_window_tokens - max_output - _SNIP_SAFETY_BUFFER
+        budget = min(spec.context_block_limit, window_budget) if spec.context_block_limit else window_budget
         if budget <= 0:
             return messages
 

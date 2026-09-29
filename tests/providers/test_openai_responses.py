@@ -232,6 +232,36 @@ class TestConvertMessages:
         assert items[0]["call_id"] == "call_abc"
         assert items[0]["output"] == "result text"
 
+    def test_tool_image_is_promoted_to_user_input_image(self):
+        data_url = "data:image/png;base64," + "A" * 200
+        _, items = convert_messages([{
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": [
+                {"type": "text", "text": "Generated image", "_meta": {"ignored": True}},
+                {"type": "image_url", "image_url": {"url": data_url},
+                 "_meta": {"path": "/tmp/generated.png"}},
+            ],
+        }])
+        assert len(items) == 2
+        assert items[0] == {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": "Generated image\n[image: /tmp/generated.png]",
+        }
+        assert data_url not in items[0]["output"]
+        assert items[1]["role"] == "user"
+        assert items[1]["content"][1] == {
+            "type": "input_image", "image_url": data_url, "detail": "auto",
+        }
+
+    def test_tool_list_without_images_keeps_json_output(self):
+        _, items = convert_messages([{
+            "role": "tool", "tool_call_id": "call_1", "content": [{"type": "text", "text": "ok"}],
+        }])
+        assert len(items) == 1
+        assert items[0]["output"] == '[{"type": "text", "text": "ok"}]'
+
     def test_tool_message_dict_content(self):
         _, items = convert_messages([{
             "role": "tool",
