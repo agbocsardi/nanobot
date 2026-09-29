@@ -61,6 +61,12 @@ BUILTIN_COMMAND_SPECS: tuple[BuiltinCommandSpec, ...] = (
         "square",
     ),
     BuiltinCommandSpec(
+        "/abort",
+        "Hard abort",
+        "Killswitch: stop tasks, drop queued messages, end the sustained goal.",
+        "octagon-x",
+    ),
+    BuiltinCommandSpec(
         "/restart",
         "Restart nanobot",
         "Restart the bot process in place.",
@@ -200,6 +206,25 @@ async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
     content = f"Stopped {total} task(s)." if total else "No active task to stop."
     return OutboundMessage(
         channel=msg.channel, chat_id=msg.chat_id, content=content,
+        metadata=dict(msg.metadata or {})
+    )
+
+
+async def cmd_abort(ctx: CommandContext) -> OutboundMessage:
+    """Hard abort: cancel tasks, drop queued messages, end the sustained goal.
+
+    Unlike ``/stop``, nothing parked in the mid-turn pending queue is
+    re-published afterwards and any active sustained goal is marked aborted so
+    continuation rounds cannot restart the work.
+    """
+    msg = ctx.msg
+    cancelled, goal_ended = await ctx.loop.abort_session(ctx.key)
+    parts = [f"Aborted {cancelled} task(s)." if cancelled else "No active task."]
+    if goal_ended:
+        parts.append("Sustained goal marked aborted.")
+    parts.append("Queued messages dropped.")
+    return OutboundMessage(
+        channel=msg.channel, chat_id=msg.chat_id, content=" ".join(parts),
         metadata=dict(msg.metadata or {})
     )
 
@@ -1408,6 +1433,7 @@ def build_help_text() -> str:
 def register_builtin_commands(router: CommandRouter) -> None:
     """Register the default set of slash commands."""
     router.priority("/stop", cmd_stop)
+    router.priority("/abort", cmd_abort)
     router.priority("/restart", cmd_restart)
     router.priority("/status", cmd_status)
     router.exact("/new", cmd_new)

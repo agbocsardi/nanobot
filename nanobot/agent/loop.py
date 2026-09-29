@@ -68,7 +68,11 @@ from nanobot.security.workspace_access import (
 )
 from nanobot.session import turn_continuation
 from nanobot.session.goal_state import (
+    GOAL_STATE_KEY,
+    discard_legacy_goal_state_key,
+    goal_state_raw,
     goal_state_runtime_lines,
+    parse_goal_state,
     runner_wall_llm_timeout_s,
     sustained_goal_active,
 )
@@ -428,6 +432,9 @@ class AgentLoop:
         # When a session has an active task, new messages for that session
         # are routed here instead of creating a new task.
         self._pending_queues: dict[str, asyncio.Queue] = {}
+        # Sessions hard-aborted via /abort: their dispatch task's finally
+        # block drops (instead of re-publishing) queued messages and followups.
+        self._abort_flags: set[str] = set()
         self._cron_turns = CronTurnCoordinator(
             publish_inbound=self.bus.publish_inbound,
             dispatch=self._dispatch,
@@ -1234,6 +1241,38 @@ class AgentLoop:
         )
         return cancelled + sub_cancelled
 
+    async def abort_session(self, key: str) -> tuple[int, bool]:
+        """Hard-stop a session: cancel tasks, drop queued messages, end any goal.
+
+        Killswitch semantics for ``/abort``. Unlike ``/stop`` — which cancels the
+        in-flight task and then re-publishes whatever was parked in the pending
+        queue — an abort discards those messages and marks any active sustained
+        goal as aborted so continuation rounds cannot re-arm the turn.
+        """
+        goal_ended = False
+        try:
+            session = self.sessions.get_or_create(key)
+        except Exception:
+            session = None
+        if session is not None:
+            prior = parse_goal_state(goal_state_raw(session.metadata))
+            if isinstance(prior, dict) and prior.get("status") == "active":
+                session.metadata[GOAL_STATE_KEY] = {
+                    **prior,
+                    "status": "aborted",
+                    "completed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    "recap": "Aborted by user via /abort.",
+                }
+                discard_legacy_goal_state_key(session.metadata)
+                self.sessions.save(session)
+                goal_ended = True
+        cancelled = 0
+        if any(not t.done() for t in self._active_tasks.get(key, [])):
+            self._abort_flags.add(key)
+            cancelled = await self._cancel_active_tasks(key)
+        self._drain_followups(key)
+        return cancelled, goal_ended
+
     def discard_session_file_state(self, key: str) -> None:
         """Forget ephemeral file-read state for a reset or removed session."""
         self._file_state_store.discard(key)
@@ -1772,7 +1811,10 @@ class AgentLoop:
                     # them to the bus so they are processed as fresh inbound messages
                     # rather than silently lost.  Only remove our own queue; a
                     # later task waiting on the lock must not be able to steal
-                    # cleanup ownership.
+                    # cleanup ownership.  A hard abort (/abort) drops everything
+                    # instead: killswitch semantics.
+                    aborted = session_key in self._abort_flags
+                    self._abort_flags.discard(session_key)
                     queue = None
                     if self._pending_queues.get(session_key) is pending:
                         queue = self._pending_queues.pop(session_key, None)
@@ -1785,24 +1827,32 @@ class AgentLoop:
                                 item = queue.get_nowait()
                             except asyncio.QueueEmpty:
                                 break
-                            await self.bus.publish_inbound(item)
+                            if not aborted:
+                                await self.bus.publish_inbound(item)
                             leftover += 1
                         if leftover:
-                            logger.info(
-                                "Re-published {} leftover message(s) to bus for session {}",
-                                leftover, session_key,
-                            )
-                    if not turn_continuation.internal_continuation_pending(msg.metadata):
+                            if aborted:
+                                logger.info(
+                                    "Abort: dropped {} queued message(s) for session {}",
+                                    leftover, session_key,
+                                )
+                            else:
+                                logger.info(
+                                    "Re-published {} leftover message(s) to bus for session {}",
+                                    leftover, session_key,
+                                )
+                    if aborted or not turn_continuation.internal_continuation_pending(msg.metadata):
                         followups = self._drain_followups(session_key)
-                        for item in followups:
-                            await self.bus.publish_inbound(InboundMessage(
-                                channel=str(item.get("channel") or msg.channel),
-                                sender_id=str(item.get("sender_id") or msg.sender_id),
-                                chat_id=str(item.get("chat_id") or msg.chat_id),
-                                content=str(item.get("content") or ""),
-                                metadata=dict(item.get("metadata") or {}),
-                                session_key_override=session_key,
-                            ))
+                        if not aborted:
+                            for item in followups:
+                                await self.bus.publish_inbound(InboundMessage(
+                                    channel=str(item.get("channel") or msg.channel),
+                                    sender_id=str(item.get("sender_id") or msg.sender_id),
+                                    chat_id=str(item.get("chat_id") or msg.chat_id),
+                                    content=str(item.get("content") or ""),
+                                    metadata=dict(item.get("metadata") or {}),
+                                    session_key_override=session_key,
+                                ))
                         await self._runtime_events().run_status_changed(
                             msg, session_key, "idle"
                         )
