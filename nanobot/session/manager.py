@@ -33,6 +33,8 @@ _SESSION_PREVIEW_MAX_CHARS = 120
 _SESSION_LIST_PREVIEW_MAX_RECORDS = 200
 _SESSION_LIST_PREVIEW_MAX_CHARS = 1_000_000
 _PERSISTED_TOOL_RESULT_PREVIEW_CHARS = 0
+_IMAGE_CACHE_RELATIVE_PREFIX = Path("tmp") / "context-images"
+_IMAGE_STAGED_SUFFIXES = {".img", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
 _RUNTIME_CHECKPOINT_KEY = "runtime_checkpoint"
 _FORK_VOLATILE_METADATA_KEYS = {
     "goal_state",
@@ -123,16 +125,69 @@ def _compact_tool_call(tool_call: Any) -> dict[str, Any] | None:
     return compact
 
 
-def _tool_result_placeholder(message: dict[str, Any]) -> str:
+def _safe_image_reference(path: Any, workspace: Path | None) -> str | None:
+    """Return a workspace-relative cache path, never an arbitrary path/URL."""
+    if not isinstance(path, str) or not path or any(ch in path for ch in "\\\r\n"):
+        return None
+    candidate = Path(path).expanduser()
+    # Cache paths are deliberately restricted to the private image staging dir.
+    if workspace is None:
+        if candidate.is_absolute():
+            return None
+        relative = candidate
+    else:
+        root = workspace.expanduser().resolve()
+        try:
+            relative = (candidate if candidate.is_absolute() else root / candidate).resolve().relative_to(root)
+        except (OSError, ValueError):
+            return None
+    relative = Path(relative)
+    in_cache = relative.parts[:2] == _IMAGE_CACHE_RELATIVE_PREFIX.parts and len(relative.parts) >= 3
+    # Prepared cache files use .img; allow existing workspace-local image files
+    # too, while excluding arbitrary workspace paths such as secrets/logs.
+    if not in_cache and relative.suffix.lower() not in _IMAGE_STAGED_SUFFIXES:
+        return None
+    return relative.as_posix()
+
+
+def _tool_image_references(content: Any, workspace: Path | None) -> list[str]:
+    if not isinstance(content, list):
+        return []
+    refs: list[str] = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "image_url":
+            continue
+        meta = block.get("_meta")
+        image = block.get("image_url")
+        url = image.get("url") if isinstance(image, dict) else None
+        # Only generated/staged data images may carry a persisted local path.
+        # This prevents metadata attached to arbitrary remote/user URLs leaking.
+        if not isinstance(url, str) or not url.startswith("data:image/"):
+            continue
+        if not isinstance(meta, dict):
+            continue
+        ref = _safe_image_reference(meta.get("path"), workspace)
+        if ref and ref not in refs:
+            refs.append(ref)
+    return refs
+
+
+def _tool_result_placeholder(message: dict[str, Any], workspace: Path | None = None) -> str:
     content = message.get("content", "")
     if isinstance(content, str) and content.startswith("[tool result omitted:"):
         return content
     name = str(message.get("name") or "tool")
     chars = _content_size(content)
-    return f"[tool result omitted: {name}, {chars} chars]"
+    result = f"[tool result omitted: {name}, {chars} chars]"
+    refs = _tool_image_references(content, workspace)
+    if refs:
+        result += "\n" + "\n".join(f"[image: {ref}; re-read via read_file]" for ref in refs)
+    return result
 
 
-def sanitize_message_for_persistence(message: dict[str, Any]) -> dict[str, Any]:
+def sanitize_message_for_persistence(
+    message: dict[str, Any], *, workspace: Path | None = None
+) -> dict[str, Any]:
     """Return a replay-safe persisted message without hidden/tool payload bloat."""
     entry = deepcopy(message)
     entry.pop("reasoning_content", None)
@@ -144,26 +199,33 @@ def sanitize_message_for_persistence(message: dict[str, Any]) -> dict[str, Any]:
         else:
             entry.pop("tool_calls", None)
     if role == "tool":
-        entry["content"] = _tool_result_placeholder(entry)
+        entry["content"] = _tool_result_placeholder(entry, workspace)
     return entry
 
 
-def sanitize_messages_for_persistence(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [sanitize_message_for_persistence(m) if isinstance(m, dict) else m for m in messages]
+def sanitize_messages_for_persistence(
+    messages: list[dict[str, Any]], *, workspace: Path | None = None
+) -> list[dict[str, Any]]:
+    return [
+        sanitize_message_for_persistence(m, workspace=workspace) if isinstance(m, dict) else m
+        for m in messages
+    ]
 
 
-def sanitize_metadata_for_persistence(metadata: dict[str, Any]) -> dict[str, Any]:
+def sanitize_metadata_for_persistence(
+    metadata: dict[str, Any], *, workspace: Path | None = None
+) -> dict[str, Any]:
     out = deepcopy(metadata)
     checkpoint = out.get(_RUNTIME_CHECKPOINT_KEY)
     if isinstance(checkpoint, dict):
         checkpoint = dict(checkpoint)
         assistant = checkpoint.get("assistant_message")
         if isinstance(assistant, dict):
-            checkpoint["assistant_message"] = sanitize_message_for_persistence(assistant)
+            checkpoint["assistant_message"] = sanitize_message_for_persistence(assistant, workspace=workspace)
         completed = checkpoint.get("completed_tool_results")
         if isinstance(completed, list):
             checkpoint["completed_tool_results"] = [
-                sanitize_message_for_persistence(m) if isinstance(m, dict) else m
+                sanitize_message_for_persistence(m, workspace=workspace) if isinstance(m, dict) else m
                 for m in completed
             ]
         pending = checkpoint.get("pending_tool_calls")
@@ -573,10 +635,10 @@ class SessionManager:
 
             return Session(
                 key=key,
-                messages=sanitize_messages_for_persistence(messages),
+                messages=sanitize_messages_for_persistence(messages, workspace=self.workspace),
                 created_at=created_at or datetime.now(),
                 updated_at=updated_at or datetime.now(),
-                metadata=sanitize_metadata_for_persistence(metadata),
+                metadata=sanitize_metadata_for_persistence(metadata, workspace=self.workspace),
                 last_consolidated=last_consolidated
             )
         except Exception as e:
@@ -631,10 +693,10 @@ class SessionManager:
 
             return Session(
                 key=key,
-                messages=sanitize_messages_for_persistence(messages),
+                messages=sanitize_messages_for_persistence(messages, workspace=self.workspace),
                 created_at=created_at or datetime.now(),
                 updated_at=updated_at or datetime.now(),
-                metadata=sanitize_metadata_for_persistence(metadata),
+                metadata=sanitize_metadata_for_persistence(metadata, workspace=self.workspace),
                 last_consolidated=last_consolidated
             )
         except Exception as e:
@@ -663,8 +725,8 @@ class SessionManager:
         """
         path = self._get_session_path(session.key)
         tmp_path = path.with_suffix(".jsonl.tmp")
-        session.messages = sanitize_messages_for_persistence(session.messages)
-        sanitized_metadata = sanitize_metadata_for_persistence(session.metadata)
+        session.messages = sanitize_messages_for_persistence(session.messages, workspace=self.workspace)
+        sanitized_metadata = sanitize_metadata_for_persistence(session.metadata, workspace=self.workspace)
         session.metadata.clear()
         session.metadata.update(sanitized_metadata)
 
@@ -824,8 +886,8 @@ class SessionManager:
                         stored_key = data.get("key")
                     else:
                         messages.append(data)
-            messages = sanitize_messages_for_persistence(messages)
-            metadata = sanitize_metadata_for_persistence(metadata)
+            messages = sanitize_messages_for_persistence(messages, workspace=self.workspace)
+            metadata = sanitize_metadata_for_persistence(metadata, workspace=self.workspace)
             return {
                 "key": stored_key or key,
                 "created_at": created_at,

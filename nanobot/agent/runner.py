@@ -70,6 +70,9 @@ _MAX_INJECTIONS_PER_TURN = 3
 _MAX_INJECTION_CYCLES = 5
 _SNIP_SAFETY_BUFFER = 1024
 _MAX_REQUEST_BYTES = 16 * 1024 * 1024
+# Upper bound on provider-chain walks; guards duck-typed stand-ins that mint a
+# fresh object per attribute access and would otherwise loop forever.
+_MAX_PROVIDER_CHAIN_DEPTH = 8
 _MICROCOMPACT_KEEP_RECENT = 10
 _MICROCOMPACT_KEEP_RECENT_IMAGES = 1
 _MICROCOMPACT_MIN_CHARS = 500
@@ -94,10 +97,11 @@ _RECORDED_PREVIEW_MAX_CHARS = 500
 class ContextBudgetExceededError(Exception):
     """The model prompt cannot fit, even after context governance."""
 
-    def __init__(self, estimate: int, budget: int):
+    def __init__(self, estimate: int, budget: int, *, unit: str = "tokens"):
         self.estimate = estimate
         self.budget = budget
-        super().__init__(f"Prompt context is too large ({estimate} tokens; limit {budget}).")
+        self.unit = unit
+        super().__init__(f"Prompt context is too large ({estimate} {unit}; limit {budget}).")
 
 
 def _truncate_recorded_text(text: str, max_chars: int) -> str:
@@ -443,10 +447,17 @@ class AgentRunner:
             try:
                 response = await self._request_model(spec, messages_for_model, hook, context)
             except ContextBudgetExceededError as exc:
-                final_content = (
-                    "I could not send this request because the conversation, including its "
-                    f"images, is too large ({exc.estimate} tokens; limit {exc.budget})."
-                )
+                if exc.unit == "images":
+                    final_content = (
+                        "I could not send this request because Umans allows at most "
+                        f"{exc.budget} images per request, but {exc.estimate} images "
+                        "are in the current unseen batch."
+                    )
+                else:
+                    final_content = (
+                        "I could not send this request because the conversation, including its "
+                        f"images, is too large ({exc.estimate} {exc.unit}; limit {exc.budget})."
+                    )
                 error = final_content
                 stop_reason = "context_budget_exceeded"
                 context.final_content = final_content
@@ -868,6 +879,7 @@ class AgentRunner:
             timeout_s = None
 
         messages = await self._maybe_vision_handoff(spec, messages)
+        messages = self._prepare_umans_image_budget(messages)
         # Vision handoff can add image blocks after history snipping. Recheck
         # the complete payload, including those blocks, before calling provider.
         self._enforce_context_budget(spec, messages)
@@ -1071,9 +1083,75 @@ class AgentRunner:
         messages = self._drop_orphan_tool_results(messages)
         messages = self._backfill_missing_tool_results(messages)
         messages = await self._maybe_vision_handoff(spec, messages)
+        messages = self._prepare_umans_image_budget(messages)
         self._enforce_context_budget(spec, messages, include_tools=False)
         kwargs = self._build_request_kwargs(spec, messages, tools=None)
         return await self.provider.chat_with_retry(**kwargs)
+
+    def _is_umans_provider(self) -> bool:
+        """Return whether the active provider (including fallback primary) is Umans.
+
+        The walk is depth-bounded.  A plain attribute chain can be traversed by
+        duck-typed stand-ins (test doubles, proxies) that mint a fresh object per
+        attribute access, so an ``id()``-only cycle guard can loop forever and
+        exhaust memory.  The bound terminates such chains.
+        """
+        provider: Any = self.provider
+        for _ in range(_MAX_PROVIDER_CHAIN_DEPTH):
+            if provider is None:
+                return False
+            spec = getattr(provider, "_spec", None)
+            if getattr(spec, "name", None) == "umans":
+                return True
+            nxt = getattr(provider, "_primary", None)
+            if nxt is None or nxt is provider:
+                return False
+            provider = nxt
+        return False
+
+    def _prepare_umans_image_budget(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not self._is_umans_provider():
+            return messages
+        locations: list[tuple[int, int, dict[str, Any], bool]] = []
+        latest_tool_batch = max(
+            (idx for idx, msg in enumerate(messages)
+             if msg.get("role") == "assistant" and msg.get("tool_calls")),
+            default=-1,
+        )
+        for mi, message in enumerate(messages):
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for bi, block in enumerate(content):
+                if not isinstance(block, dict) or block.get("type") != "image_url":
+                    continue
+                seen = bool(message.get("_images_seen")) or (
+                    message.get("role") == "tool" and mi < latest_tool_batch
+                )
+                locations.append((mi, bi, block, seen))
+        unseen = [item for item in locations if not item[3]]
+        if len(unseen) > 20:
+            raise ContextBudgetExceededError(len(unseen), 20, unit="images")
+        excess = len(locations) - 20
+        if excess <= 0:
+            return messages
+        # Remove oldest seen images only. Unseen images are never silently dropped.
+        removable = [item for item in locations if item[3]]
+        if len(removable) < excess:
+            raise ContextBudgetExceededError(len(locations), 20, unit="images")
+        remove = {(mi, bi) for mi, bi, _block, _seen in removable[:excess]}
+        updated = deepcopy(messages)
+        for mi, bi, block, _seen in locations:
+            if (mi, bi) not in remove:
+                continue
+            meta = block.get("_meta")
+            path = meta.get("path") if isinstance(meta, dict) else None
+            if not path:
+                path = "unknown path"
+            content = updated[mi].get("content")
+            if isinstance(content, list):
+                content[bi] = {"type": "text", "text": f"[image: {path}; re-read via read_file({path})]"}
+        return updated
 
     async def _maybe_vision_handoff(
         self,
@@ -1730,6 +1808,11 @@ class AgentRunner:
         seen_images = [idx for idx in image_indices
                        if idx < latest_batch_start or messages[idx].get("_images_seen")]
         stale_images = set(seen_images[:-_MICROCOMPACT_KEEP_RECENT_IMAGES])
+        # A tool result that still carries an unseen image must not be dropped by
+        # the generic stale rule either; the image budget handles that case and
+        # can report a hard local error instead of silently losing the image.
+        unseen_images = set(image_indices) - set(seen_images)
+        stale = [idx for idx in stale if idx not in unseen_images]
         updated: list[dict[str, Any]] | None = None
         for idx in sorted(set(stale) | stale_images):
             msg = messages[idx]
