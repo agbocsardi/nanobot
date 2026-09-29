@@ -241,9 +241,16 @@ Targeted checks during an update are more useful than broad lint:
 
 ```bash
 uv run ruff check nanobot/agent/memory.py nanobot/agent/context.py nanobot/config/schema.py
-uv run --extra dev python -m pytest tests/agent/test_memory_store.py tests/agent/test_context_builder.py
-uv run --extra dev python -m pytest tests/channels/test_base_channel.py
+scripts/run-tests.sh tests/agent/test_memory_store.py tests/agent/test_context_builder.py
+scripts/run-tests.sh tests/channels/test_base_channel.py
 ```
+
+Run pytest through `scripts/run-tests.sh`, which forwards its arguments to
+pytest inside a memory-capped cgroup. This box runs `earlyoom`; an unbounded
+test (e.g. a loop that allocates per iteration) can grow to several GB and get
+the *server* killed. The cap confines such a runaway to its own scope. Override
+the cap with `NANOBOT_TEST_MEMORY_MB` (default 3072). Plain
+`uv run --extra dev python -m pytest` still works for a quick, known-small file.
 
 If STT changed, restart Nanobot and send a voice note — a successful
 transcription is the real end-to-end check.
