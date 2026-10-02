@@ -46,11 +46,23 @@ class InboundMessage:
     media: list[str] = field(default_factory=list)  # Media URLs
     metadata: dict[str, Any] = field(default_factory=dict)  # Channel-specific data
     session_key_override: str | None = None  # Optional override for thread-scoped sessions
+    # Fork additions (WebUI integration, pinned upstream bus/events.py d0d0a44e).
+    # Defaulted; the fork loop does not enforce them yet — ported WebUI code
+    # sets them and temporary-chat operations refuse until semantics exist.
+    require_existing_session: bool = False
+    input_role: Literal["user", "system"] | None = None
 
     @property
     def session_key(self) -> str:
         """Unique key for session identification."""
         return self.session_key_override or f"{self.channel}:{self.chat_id}"
+
+    @property
+    def is_user_input(self) -> bool:
+        """Whether this message should enter the conversation as user input."""
+        if self.input_role is not None:
+            return self.input_role == "user"
+        return self.channel != "system"
 
 @dataclass(frozen=True, slots=True)
 class DeliveryResult:

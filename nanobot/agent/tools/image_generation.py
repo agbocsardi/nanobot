@@ -31,6 +31,7 @@ from nanobot.utils.artifacts import (
 from nanobot.utils.helpers import detect_image_mime
 
 if TYPE_CHECKING:
+    from nanobot.bus.queue import MessageBus
     from nanobot.config.schema import ProviderConfig
 
 
@@ -207,3 +208,23 @@ class ImageGenerationTool(Tool):
             return generated_image_tool_result(artifacts)
         except (ArtifactError, ImageGenerationError, OSError) as exc:
             return f"Error: {exc}"
+
+
+async def request_image_generation_reload(
+    bus: MessageBus,
+    *,
+    timeout: float = 5.0,
+) -> dict[str, Any]:
+    """Ask the running agent loop to refresh its image generation tool.
+
+    Fork addition (WebUI integration): the fork loop has no image-generation
+    runtime-control handler, so publishing the control message would leak into
+    a chat session. Report the capability as unavailable honestly; a gateway
+    restart applies image settings instead.
+    """
+    return {
+        "ok": False,
+        "message": "Image generation settings require a gateway restart in this build.",
+        "requires_restart": True,
+        "unavailable": True,
+    }

@@ -204,6 +204,29 @@ def builtin_command_palette() -> list[dict[str, str]]:
     return [spec.as_dict() for spec in BUILTIN_COMMAND_SPECS]
 
 
+# Fork additions (WebUI integration, pinned upstream command/builtin.py
+# d0d0a44e). The shell escape constant is kept for WebUI ingress parity, but
+# the fork loop has no /__shell handler, so user-shell turns are refused at
+# ingress instead of dispatched.
+USER_SHELL_COMMAND = "/__shell"
+
+
+def builtin_command_starts_agent_turn(text: str) -> bool:
+    """Return whether WebUI ingress should expect a normal agent lifecycle.
+
+    Fork adaptation: the fork router handles every registered builtin command
+    locally (no LLM turn), and the fork specs carry no lifecycle field — so a
+    known builtin command never starts an agent turn, and anything else
+    (ordinary text, unknown slash commands) does.
+    """
+    normalized = text.strip()
+    command, _separator, _args = normalized.partition(" ")
+    command = command.lower()
+    if not command.startswith("/"):
+        return True
+    return all(spec.command != command for spec in BUILTIN_COMMAND_SPECS)
+
+
 async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
     """Cancel all active tasks and subagents for the session."""
     loop = ctx.loop

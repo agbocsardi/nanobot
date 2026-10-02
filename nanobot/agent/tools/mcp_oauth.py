@@ -134,6 +134,38 @@ async def has_stored_token(name: str) -> bool:
     return bool(await FileTokenStorage(name).get_tokens())
 
 
+# Fork additions (WebUI integration): minimal, honest WebUI-side MCP OAuth
+# surface. Fork MCP OAuth is CLI-based (``nanobot mcp auth``) over the same
+# token files; the upstream WebUI browser-flow machinery (MCPOAuthHandlers)
+# is not shipped here.
+MCP_OAUTH_CALLBACK_PATH = "/auth/mcp/callback"
+
+
+class MCPOAuthHandlers:
+    """Unavailable: constructing the WebUI OAuth flow machinery is refused."""
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        raise NotImplementedError("mcp_oauth_unavailable_in_this_build")
+
+
+def mcp_oauth_has_credentials(server_name: str, server_url: str) -> bool:
+    """True when the CLI OAuth flow has stored tokens for this server."""
+    storage = FileTokenStorage(server_name)
+    return bool(storage._load().get("tokens"))  # noqa: SLF001 - same-module storage
+
+
+def delete_mcp_oauth_credentials(server_name: str) -> bool:
+    """Delete the stored CLI OAuth token file for one server."""
+    path = _token_path(server_name)
+    try:
+        existed = path.exists()
+        if existed:
+            path.unlink()
+        return existed
+    except OSError:
+        return False
+
+
 def build_oauth_provider(
     server_url: str,
     name: str,

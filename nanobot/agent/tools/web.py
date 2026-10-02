@@ -38,6 +38,23 @@ _VOLCENGINE_TRAFFIC_TAG = "nanobot"
 _VOLCENGINE_TIME_RANGES = {"OneDay", "OneWeek", "OneMonth", "OneYear"}
 _VOLCENGINE_DATE_RANGE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.\.\d{4}-\d{2}-\d{2}$")
 
+# Fork addition (WebUI integration, pinned upstream agent/tools/web.py
+# d0d0a44e): single source of truth for selectable search providers (WebUI
+# settings). Trimmed to the providers this fork's _effective_provider supports;
+# "credential" describes what each provider needs: none / api_key / base_url.
+SEARCH_PROVIDER_OPTIONS: tuple[dict[str, str], ...] = (
+    {"name": "duckduckgo", "label": "DuckDuckGo", "credential": "none"},
+    {"name": "brave", "label": "Brave Search", "credential": "api_key"},
+    {"name": "tavily", "label": "Tavily", "credential": "api_key"},
+    {"name": "searxng", "label": "SearXNG", "credential": "base_url"},
+    {"name": "jina", "label": "Jina", "credential": "api_key"},
+    {"name": "kagi", "label": "Kagi", "credential": "api_key"},
+    {"name": "exa", "label": "Exa", "credential": "api_key"},
+    {"name": "olostep", "label": "Olostep", "credential": "api_key"},
+    {"name": "bocha", "label": "Bocha", "credential": "api_key"},
+    {"name": "volcengine", "label": "Volcengine Search", "credential": "api_key"},
+)
+
 
 class WebSearchConfig(Base):
     """Web search configuration."""

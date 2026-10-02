@@ -38,6 +38,11 @@ def safe_record_name(name: str) -> str:
     return cleaned or "run"
 
 
+# Fork addition (WebUI integration): pinned-upstream name for the same
+# contract, used by the ported webui automation surfaces.
+safe_run_record_name = safe_record_name
+
+
 def _utc_now_ms() -> int:
     return int(datetime.now(timezone.utc).timestamp() * 1000)
 

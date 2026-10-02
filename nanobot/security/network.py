@@ -25,6 +25,23 @@ _BLOCKED_NETWORKS = [
 
 _URL_RE = re.compile(r"https?://[^\s\"'`;|<>]+", re.IGNORECASE)
 
+
+def is_loopback_host(host: str) -> bool:
+    """Return whether a bind target is explicitly limited to loopback.
+
+    Fork addition (WebUI integration, pinned upstream security/network.py
+    d0d0a44e): used by the WebUI HTTP handler for local-only capability gates.
+    """
+    normalized = host.strip().rstrip(".").lower()
+    if normalized == "localhost":
+        return True
+    if normalized.startswith("[") and normalized.endswith("]"):
+        normalized = normalized[1:-1]
+    with suppress(ValueError):
+        return ipaddress.ip_address(normalized).is_loopback
+    return False
+
+
 _allowed_networks: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = ()
 _scoped_allowed_networks: ContextVar[
     tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] | None
