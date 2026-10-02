@@ -33,6 +33,15 @@ def get_media_dir(channel: str | None = None) -> Path:
     return ensure_dir(base / channel) if channel else base
 
 
+def get_webui_dir() -> Path:
+    """Return the directory for WebUI-only persisted display threads (JSON).
+
+    Fork addition (WebUI integration, pinned upstream config/paths.py
+    d0d0a44e).
+    """
+    return get_runtime_subdir("webui")
+
+
 def get_cron_dir() -> Path:
     """Return the cron storage directory."""
     return get_runtime_subdir("cron")

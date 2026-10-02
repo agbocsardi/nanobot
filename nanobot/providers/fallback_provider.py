@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
 from loguru import logger
@@ -53,6 +54,20 @@ _FALLBACK_ERROR_TOKENS = (
     "balance",
     "out of credits",
 )
+
+
+# Fork additions (WebUI integration, pinned upstream
+# providers/fallback_provider.py d0d0a44e): display-safe fallback selection
+# forwarded to the WebUI coordinator's fallback model observer.
+@dataclass(frozen=True)
+class FallbackModelSelection:
+    """Display-safe fallback result; no upstream error text or credentials."""
+
+    model: str
+    reauth_provider: str | None = None
+
+
+FallbackModelObserver = Callable[[FallbackModelSelection], Awaitable[None]]
 
 
 class FallbackProvider(LLMProvider):

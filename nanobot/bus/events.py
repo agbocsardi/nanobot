@@ -3,7 +3,10 @@
 import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from nanobot.events import AgentEvent
 
 # Optional ``OutboundMessage.metadata`` key for structured, channel-agnostic UI
 # payloads. Value is JSON-serializable with at least ``kind``; rich clients may
@@ -16,6 +19,12 @@ OUTBOUND_META_REACTION = "_reaction"
 INBOUND_META_RUNTIME_CONTROL = "_runtime_control"
 RUNTIME_CONTROL_ACK = "_ack"
 RUNTIME_CONTROL_MCP_RELOAD = "mcp_reload"
+# Fork additions (WebUI integration, pinned upstream bus/events.py d0d0a44e):
+# user-shell turns bypass the chat composer path; the loop answers them like
+# ordinary user input but tags the turn so session history stays attributed.
+INBOUND_META_USER_SHELL = "_user_shell"
+RUNTIME_CONTROL_SESSION_DISCARD = "session_discard"
+RUNTIME_CONTROL_IMAGE_GENERATION_RELOAD = "image_generation_reload"
 
 
 # A button is either a legacy plain label string (rendered with the label as
@@ -68,5 +77,9 @@ class OutboundMessage:
     media: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
     buttons: list[list[ButtonSpec]] = field(default_factory=list)
+    # Typed outbound event carried for event-aware channels (WebUI). Defaulted
+    # so every existing constructor and consumer is unaffected; fork turns
+    # leave it None and keep their metadata-flag dialect.
+    event: "AgentEvent | None" = None
     # In-process acknowledgement; never copied into wire metadata or history.
     delivery: asyncio.Future[DeliveryResult] | None = field(default=None, repr=False, compare=False)

@@ -1,6 +1,7 @@
 """Utility functions for nanobot."""
 
 import base64
+import errno
 import json
 import os
 import re
@@ -8,6 +9,7 @@ import shutil
 import stat
 import time
 import uuid
+from collections.abc import Iterable
 from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
@@ -444,6 +446,44 @@ def _write_text_atomic(path: Path, content: str) -> None:
     finally:
         if tmp.exists():
             tmp.unlink(missing_ok=True)
+
+
+def atomic_write_lines(path: Path, lines: Iterable[str], *, fsync: bool = True) -> None:
+    """Atomically replace *path* with already-serialized record lines.
+
+    Fork addition (WebUI integration, pinned upstream utils/helpers.py
+    d0d0a44e): used by the WebUI transcript writer. Each item is one record;
+    a trailing newline is added when missing. Writes a unique temp file in
+    the same directory, then publishes with ``os.replace``.
+    """
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with open(tmp, "x", encoding="utf-8") as handle:
+            for line in lines:
+                handle.write(line if line.endswith("\n") else f"{line}\n")
+            if fsync:
+                handle.flush()
+                os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        if fsync:
+            _fsync_directory_after_replace(path.parent)
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+
+
+def _fsync_directory_after_replace(directory: Path) -> None:
+    """Fsync *directory* after a replace, ignoring unsupported platforms."""
+    with suppress(PermissionError):
+        fd = os.open(str(directory), os.O_RDONLY)
+        try:
+            try:
+                os.fsync(fd)
+            except OSError as exc:
+                if exc.errno != errno.EINVAL:
+                    raise
+        finally:
+            os.close(fd)
 
 
 def maybe_persist_tool_result(

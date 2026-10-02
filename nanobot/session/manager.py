@@ -4,7 +4,8 @@ import json
 import os
 import re
 import shutil
-from contextlib import suppress
+import threading
+from contextlib import contextmanager, suppress
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -36,6 +37,18 @@ _PERSISTED_TOOL_RESULT_PREVIEW_CHARS = 0
 _IMAGE_CACHE_RELATIVE_PREFIX = Path("tmp") / "context-images"
 _IMAGE_STAGED_SUFFIXES = {".img", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
 _RUNTIME_CHECKPOINT_KEY = "runtime_checkpoint"
+# Fork additions (WebUI integration, pinned upstream session/manager.py
+# d0d0a44e): recognize the upstream private provider-state record when scanning
+# persisted files so session listing/preview helpers can skip opaque lines.
+_PROVIDER_STATE_RECORD_TYPE = "provider_state"
+_PROVIDER_STATE_RECORD_PREFIX_RE = re.compile(
+    r'^\s*\{\s*"_type"\s*:\s*"provider_state"\s*(?:,|\})'
+)
+
+
+def _is_provider_state_record_line(line: str) -> bool:
+    """Recognize the upstream private record without decoding its payload."""
+    return _PROVIDER_STATE_RECORD_PREFIX_RE.match(line) is not None
 _FORK_VOLATILE_METADATA_KEYS = {
     "goal_state",
     "pending_user_turn",
@@ -561,6 +574,9 @@ class SessionManager:
         self.sessions_dir = ensure_dir(self.workspace / "sessions")
         self.legacy_sessions_dir = get_legacy_sessions_dir()
         self._cache: dict[str, Session] = {}
+        # Fork addition (WebUI integration): guards direct canonical-file
+        # access (locked_session_files) and metadata-line rewrites.
+        self._session_files_lock = threading.Lock()
 
     @staticmethod
     def safe_key(key: str) -> str:
@@ -941,6 +957,96 @@ class SessionManager:
                     "metadata": repaired.metadata,
                 }
             return None
+
+    def session_exists(self, key: str) -> bool:
+        """Return True when a session exists, without creating or loading one.
+
+        Fork addition (WebUI integration): this is the side-effect-free
+        existence probe consumed by GatewayServices for the transport's
+        audience-binding checks. Cached sessions count as evidence; otherwise
+        the persisted file's metadata-line ``key`` must match the requested
+        key exactly, so an aliased filename (``a_b`` vs ``a:b`` mapping to the
+        same storage stem) can never impersonate another session.
+        """
+        if key in self._cache:
+            return True
+        path = self._get_session_path(key)
+        if not path.exists():
+            return False
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    data = json.loads(line)
+                    if data.get("_type") != "metadata":
+                        return False
+                    return data.get("key") == key
+            return False
+        except (OSError, json.JSONDecodeError):
+            return False
+
+    def get_cached(self, key: str) -> Session | None:
+        """Return a cached session without creating or loading one from disk."""
+        return self._cache.get(key)
+
+    @contextmanager
+    def locked_session_files(self):
+        """Guard exceptional direct access to canonical session files."""
+        with self._session_files_lock:
+            yield self.sessions_dir
+
+    def update_session_metadata(
+        self,
+        key: str,
+        updates: dict[str, Any],
+        *,
+        fsync: bool = False,
+    ) -> bool:
+        """Atomically merge metadata updates into a session's metadata line.
+
+        Fork addition (WebUI integration): rewrites only the metadata record
+        (first line), keeping the conversation history untouched; mirrors the
+        pinned upstream manager contract (returns False when the session does
+        not exist or the rewrite fails).
+        """
+        path = self._get_session_path(key)
+        with self._session_files_lock:
+            if not path.exists():
+                return False
+            try:
+                with open(path, encoding="utf-8") as f:
+                    lines = f.readlines()
+                if not lines:
+                    return False
+                header = json.loads(lines[0])
+                if header.get("_type") != "metadata":
+                    return False
+                metadata = header.get("metadata")
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                metadata.update(deepcopy(updates))
+                header["metadata"] = metadata
+                header["updated_at"] = datetime.now().isoformat()
+                lines[0] = json.dumps(header, ensure_ascii=False) + "\n"
+                tmp_path = path.with_name(f".{path.name}.metadata-tmp")
+                try:
+                    with open(tmp_path, "w", encoding="utf-8") as f:
+                        f.writelines(lines)
+                        if fsync:
+                            f.flush()
+                            os.fsync(f.fileno())
+                    os.replace(tmp_path, path)
+                finally:
+                    tmp_path.unlink(missing_ok=True)
+            except (OSError, json.JSONDecodeError) as exc:
+                logger.warning("Failed to update session metadata {}: {}", key, exc)
+                return False
+        cached = self._cache.get(key)
+        if cached is not None:
+            cached.metadata.update(deepcopy(updates))
+        return True
 
     def list_sessions(self) -> list[dict[str, Any]]:
         """
