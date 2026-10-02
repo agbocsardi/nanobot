@@ -2789,7 +2789,7 @@ function Shell({
       <StarPrompt ready={localActive && !managingConnections && !loading && !sidebarStateLoading} />
       <div
         className={cn(
-          "relative h-full w-full overflow-hidden",
+          "relative h-full w-full overflow-hidden pt-[env(safe-area-inset-top)]",
           showHostChrome && "host-window-shell",
         )}
       >

@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta
       name="viewport"
-      content="width=device-width, initial-scale=1.0, viewport-fit=auto"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover"
     />
     <meta name="color-scheme" content="light dark" />
     <meta
@@ -57,6 +57,36 @@
         color: #fafafa;
       }
 
+      /* iOS 26+ renders installed PWAs fullscreen underneath the status bar, and
+         iOS 27 blurs that top band. A fixed, opaque strip at the very top edge is
+         currently the only thing that makes iOS paint a solid status bar instead of
+         the blur: theme-color and apple-mobile-web-app-status-bar-style are both
+         ignored since iOS 26. iOS requires at least 6px height, at least 80% width
+         and a position within 4px of the top of the screen. */
+      .pwa-status-bar-backdrop {
+        display: none;
+      }
+
+      @supports (-webkit-touch-callout: none) {
+        @media (display-mode: standalone) {
+          .pwa-status-bar-backdrop {
+            display: block;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: max(6px, env(safe-area-inset-top));
+            background: #ffffff;
+            pointer-events: none;
+            z-index: 40;
+          }
+
+          html.dark .pwa-status-bar-backdrop {
+            background: #303030;
+          }
+        }
+      }
+
       .startup-shell { position: relative; height: 100%; }
       .startup-header { display: flex; justify-content: space-between; padding: 5px 13px; }
       .startup-control-shadow {
@@ -99,6 +129,7 @@
     <title>nanobot</title>
   </head>
   <body class="bg-background text-foreground antialiased">
+    <div class="pwa-status-bar-backdrop" aria-hidden="true"></div>
     <div id="root">
       <main class="startup-shell" aria-busy="true">
         <div class="startup-header" aria-hidden="true">

@@ -13,12 +13,37 @@ describe("index.html", () => {
     expect(viewport).not.toMatch(/maximum-scale\s*=\s*1(?:\.0)?(?:,|$)/);
   });
 
-  it("lets iOS keep standalone content inside the safe area", () => {
+  it("extends the layout under the status bar so the top edge can be painted", () => {
     const html = readFileSync(resolve(process.cwd(), "index.html"), "utf8");
     const viewport = html.match(/<meta\s+name="viewport"\s+content="([^"]+)"/i)?.[1];
 
-    expect(viewport).toContain("viewport-fit=auto");
-    expect(viewport).not.toContain("viewport-fit=cover");
+    // iOS 26+ renders installed PWAs fullscreen regardless of viewport-fit, so the
+    // app shell pads itself back down with env(safe-area-inset-top) instead.
+    expect(viewport).toContain("viewport-fit=cover");
+    expect(viewport).not.toContain("viewport-fit=auto");
+  });
+
+  it("paints a solid status bar backdrop for installed iOS PWAs", () => {
+    const html = readFileSync(resolve(process.cwd(), "index.html"), "utf8");
+    const document = new DOMParser().parseFromString(html, "text/html");
+    const backdrop = document.querySelector(".pwa-status-bar-backdrop");
+
+    expect(backdrop).not.toBeNull();
+    expect(backdrop?.getAttribute("aria-hidden")).toBe("true");
+
+    // iOS 27 blurs the top band of an installed PWA unless a fixed, opaque element
+    // sits within 4px of the top edge and is at least 6px tall.
+    const backdropRules = html.match(/\.pwa-status-bar-backdrop\s*{[^}]*}/gs) ?? [];
+    expect(
+      backdropRules.some(
+        (rule) =>
+          rule.includes("position: fixed") &&
+          rule.includes("top: 0") &&
+          rule.includes("height: max(6px, env(safe-area-inset-top))"),
+      ),
+    ).toBe(true);
+    expect(html).toContain("@media (display-mode: standalone)");
+    expect(html).toContain("html.dark .pwa-status-bar-backdrop");
   });
 
   it("provides light and dark PWA chrome colors", () => {
