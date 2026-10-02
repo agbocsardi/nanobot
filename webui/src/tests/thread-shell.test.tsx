@@ -870,7 +870,7 @@ describe("ThreadShell", () => {
     }
   });
 
-  it("moves the session handle into the pane only when the workbench is split", () => {
+  it("never renders the session handle in the header or the pane", () => {
     const client = makeClient();
     const portal = document.createElement("div");
     document.body.append(portal);
@@ -893,26 +893,10 @@ describe("ThreadShell", () => {
       />,
     ));
 
+    expect(screen.queryByText("@soro")).not.toBeInTheDocument();
     expect(within(portal).queryByText("@soro")).not.toBeInTheDocument();
-    expect(screen.queryByLabelText("Session @soro")).not.toBeInTheDocument();
 
     unmount();
-    const splitView = render(wrap(
-      client,
-      <ThreadShell
-        session={activeSession}
-        title="Split pane"
-        onToggleSidebar={() => {}}
-        hideHeaderTitle
-        inlineHandle
-        headerPortalTarget={portal}
-      />,
-    ));
-
-    expect(screen.getByLabelText("Session @soro")).toHaveTextContent("@soro");
-    expect(within(portal).queryByText("@soro")).not.toBeInTheDocument();
-
-    splitView.unmount();
     portal.remove();
   });
 

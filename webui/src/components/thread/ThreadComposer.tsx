@@ -63,10 +63,7 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import {
-  WorkspaceAccessMenu,
-  WorkspaceProjectPicker,
-} from "@/components/thread/WorkspaceControls";
+import { WorkspaceProjectPicker } from "@/components/thread/WorkspaceControls";
 import {
   ModelPresetBadge,
   type ModelPresetOption,
@@ -2296,15 +2293,6 @@ export function ThreadComposer({
     observer?.observe(actions);
     return () => observer?.disconnect();
   }, [compactControls, compactWhenIdle, modelLabel, voiceRecorder.isRecording, workspaceScope]);
-  const accessControl = workspaceScope && !workspaceControlsHidden ? (
-    <WorkspaceAccessMenu
-      scope={workspaceScope}
-      disabled={interactionDisabled || workspaceScopeDisabled}
-      canUseFullAccess={workspaceControls?.can_use_full_access !== false}
-      isHero={isHero}
-      onChange={onWorkspaceScopeChange}
-    />
-  ) : null;
   const modelControl = modelLabel && !voiceRecorder.isRecording ? (
     <ModelPresetBadge
       label={modelLabel}
@@ -2606,7 +2594,7 @@ export function ThreadComposer({
                 isHero={isHero}
                 levels={voiceRecorder.levels}
               />
-            ) : compactControls ? modelControl : accessControl}
+            ) : compactControls ? modelControl : null}
           </div>
           <div
             className={cn(
@@ -2722,7 +2710,6 @@ export function ThreadComposer({
       </div>
       {compactControls ? (
         <div className="thread-composer-meta mx-auto flex w-full max-w-[58rem] items-center justify-between gap-2 px-2">
-          {accessControl}
           <div className="ml-auto">{usageControl}</div>
         </div>
       ) : null}

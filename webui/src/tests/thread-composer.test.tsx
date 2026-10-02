@@ -1142,7 +1142,7 @@ describe("ThreadComposer", () => {
     expect(screen.getByDisplayValue("voice text")).toBeInTheDocument();
   });
 
-  it.each(["thread", "hero"] as const)("separates narrow %s actions from access and usage without losing the draft", async (variant) => {
+  it.each(["thread", "hero"] as const)("separates narrow %s actions from usage without losing the draft", async (variant) => {
     let width = 390;
     vi.spyOn(HTMLFormElement.prototype, "getBoundingClientRect").mockImplementation(
       () => rect({ width, height: 160 }),
@@ -1162,11 +1162,12 @@ describe("ThreadComposer", () => {
     );
     const form = container.querySelector("form")!;
     const input = screen.getByRole("textbox");
-    const access = screen.getByRole("button", { name: "Workspace access mode: Full Access" });
     const meta = container.querySelector(".thread-composer-meta")!;
     expect(form).toHaveAttribute("data-compact-controls", "true");
     expect(container.querySelector(".thread-composer-surface")).not.toHaveAttribute("data-compact");
-    expect(meta).toContainElement(access);
+    expect(
+      within(meta as HTMLElement).queryByRole("button", { name: /Workspace access mode/ }),
+    ).toBeNull();
     expect(meta).toContainElement(screen.getByTestId("composer-context-usage"));
     expect(within(meta as HTMLElement).getByText("Context 50%")).toBeVisible();
     expect(container.querySelector(".thread-composer-footer-primary")).toContainElement(screen.getByLabelText("codex"));
@@ -1180,7 +1181,6 @@ describe("ThreadComposer", () => {
     expect(screen.getByRole("textbox")).toBe(input);
     expect(input).toHaveValue("keep this draft");
     expect(container.querySelector(".thread-composer-footer-actions")).toContainElement(screen.getByLabelText("codex"));
-    expect(screen.getAllByRole("button", { name: "Workspace access mode: Full Access" })).toHaveLength(1);
 
     width = 320;
     fireEvent(window, new Event("resize"));
@@ -1250,8 +1250,7 @@ describe("ThreadComposer", () => {
     expect(screen.getByRole("progressbar", { name: "Context 50%" })).toBeVisible();
   });
 
-  it("renders and changes workspace access mode", async () => {
-    const onWorkspaceScopeChange = vi.fn();
+  it("has no workspace access-mode selector in the composer", () => {
     render(
       <ThreadComposer
         onSend={vi.fn()}
@@ -1263,48 +1262,13 @@ describe("ThreadComposer", () => {
           restrict_to_workspace: true,
         }}
         workspaceControls={{ can_change_project: true, can_use_full_access: true }}
-        onWorkspaceScopeChange={onWorkspaceScopeChange}
-      />,
-    );
-
-    fireEvent.pointerDown(screen.getByRole("button", { name: /Workspace access mode/ }));
-    fireEvent.click(await screen.findByRole("menuitem", { name: /Full Access/ }));
-
-    expect(onWorkspaceScopeChange).toHaveBeenCalledWith(
-      expect.objectContaining({
-        project_path: "/tmp/project",
-        access_mode: "full",
-        restrict_to_workspace: false,
-      }),
-    );
-  });
-
-  it("exposes full and compact workspace labels for container-driven compression", () => {
-    render(
-      <ThreadComposer
-        onSend={vi.fn()}
-        placeholder="Type your message..."
-        variant="hero"
-        workspaceScope={{
-          project_path: "/tmp/project",
-          project_name: "project",
-          access_mode: "full",
-          restrict_to_workspace: false,
-        }}
-        workspaceControls={{ can_change_project: true, can_use_full_access: true }}
         onWorkspaceScopeChange={vi.fn()}
       />,
     );
 
-    const accessButton = screen.getByRole("button", {
-      name: "Workspace access mode: Full Access",
-    });
-    const fullLabel = within(accessButton).getByText("Full Access");
-    const shortLabel = within(accessButton).getByText("Full");
-    expect(accessButton).toHaveAttribute("title", "Full Access");
-    expect(fullLabel).toHaveClass("thread-composer-access-label-full");
-    expect(shortLabel).toHaveClass("thread-composer-access-label-short");
-    expect(shortLabel).toHaveClass("hidden");
+    expect(
+      screen.queryByRole("button", { name: /Workspace access mode/ }),
+    ).not.toBeInTheDocument();
   });
 
   it("keeps project selection as a compact composer dropdown", async () => {

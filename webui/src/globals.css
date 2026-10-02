@@ -1094,10 +1094,6 @@
   min-width: 2.75rem;
 }
 
-.thread-composer-meta .thread-composer-access {
-  max-width: 100%;
-  padding-inline: 0.5rem;
-}
 @media (forced-colors: active) {
   [data-workbench-move-handle]:focus-visible {
     outline: 2px solid CanvasText;

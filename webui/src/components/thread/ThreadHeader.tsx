@@ -3,7 +3,6 @@ import { type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 
 import { Button } from "@/components/ui/button";
-import { SessionHandleLabel } from "@/components/SessionHandleLabel";
 import {
   Tooltip,
   TooltipContent,
@@ -11,7 +10,6 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
-import type { SessionHandle } from "@/lib/types";
 
 const controlsClassName = cn(
   "pointer-events-auto flex items-center gap-0.5 rounded-compact bg-background p-px empty:hidden",
@@ -22,7 +20,6 @@ const controlsClassName = cn(
 interface ThreadHeaderProps {
   className?: string;
   title: string;
-  handle?: SessionHandle | null;
   onToggleSidebar: () => void;
   theme: "light" | "dark";
   onToggleTheme: () => void;
@@ -42,7 +39,6 @@ interface ThreadHeaderProps {
 export function ThreadHeader({
   className,
   title,
-  handle = null,
   onToggleSidebar,
   theme,
   onToggleTheme,
@@ -74,7 +70,7 @@ export function ThreadHeader({
         className={cn(
           controlsClassName,
           "relative min-w-0",
-          hideSidebarToggleForHostChrome && (minimal || hideTitle) && !handle && "lg:hidden",
+          hideSidebarToggleForHostChrome && (minimal || hideTitle) && "lg:hidden",
         )}
       >
         {!hideSidebarToggle ? (
@@ -95,15 +91,6 @@ export function ThreadHeader({
           <div className="flex min-w-0 items-center rounded-md px-1.5 py-1 text-[12px] font-medium text-muted-foreground">
             <span className="max-w-[min(60vw,32rem)] truncate">{title}</span>
           </div>
-        ) : null}
-        {handle ? (
-          <span
-            className="flex shrink-0 items-center rounded-md px-1.5 py-1 text-[12px] font-medium"
-          >
-            <SessionHandleLabel id={handle.id}>
-              @{handle.name}
-            </SessionHandleLabel>
-          </span>
         ) : null}
       </div>
 

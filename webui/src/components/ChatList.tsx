@@ -7,7 +7,7 @@ import {
   useRef,
   useState,
 } from "react";
-import type { CSSProperties, MouseEvent as ReactMouseEvent, ReactElement } from "react";
+import type { MouseEvent as ReactMouseEvent, ReactElement } from "react";
 import {
   Archive,
   ArchiveRestore,
@@ -65,7 +65,6 @@ import {
   type ChatGroupLabels,
 } from "@/lib/chat-groups";
 import { deriveTemporaryChatTitle } from "@/lib/temporary-chat";
-import { sessionHandleColor } from "@/lib/session-handle";
 import {
   clearDraggedSession,
   hasDraggedSession,
@@ -101,27 +100,6 @@ function SidebarItemTooltip({
         {label}
       </TooltipContent>
     </Tooltip>
-  );
-}
-
-function SidebarSessionHandle({ handle }: { handle: ChatSummary["handle"] }) {
-  if (!handle) return null;
-  return (
-    <span
-      data-sidebar-session-handle
-      className="flex max-w-20 shrink-0 items-center overflow-hidden whitespace-nowrap font-mono text-[11px] font-medium leading-5"
-    >
-      <span
-        data-sidebar-session-handle-underline
-        className="inline border-b-2 text-sidebar-muted-foreground"
-        style={{
-          "--sidebar-session-handle-color": sessionHandleColor(handle.id),
-          borderBottomColor: "var(--sidebar-session-handle-color)",
-        } as CSSProperties}
-      >
-        @{handle.name}
-      </span>
-    </span>
   );
 }
 
@@ -1003,7 +981,6 @@ export const ChatList = memo(function ChatList({
                                 <span className="min-w-0 flex-1 overflow-hidden">
                                   {projectMode ? (
                                     <span className="relative flex w-full min-w-0 items-center gap-2">
-                                      <SidebarSessionHandle handle={s.handle} />
                                       <span className="min-w-0 flex-1 truncate font-normal leading-5">
                                         {title}
                                       </span>
@@ -1017,7 +994,6 @@ export const ChatList = memo(function ChatList({
                                   </span>
                                 ) : (
                                   <span className="relative flex w-full min-w-0 items-center gap-1.5">
-                                    <SidebarSessionHandle handle={s.handle} />
                                     <span className="min-w-0 flex-1 truncate font-normal leading-5">
                                       {title}
                                     </span>
@@ -1477,7 +1453,6 @@ function ActivePaneRows({
                     <SelectionIndicator checked={selected} partial={false} />
                   ) : null}
                   <span className="relative flex min-w-0 flex-1 items-center gap-2 overflow-hidden">
-                    <SidebarSessionHandle handle={pane.handle} />
                     <span className="min-w-0 flex-1 truncate">{pane.title}</span>
                     {isPinned ? <PinnedChatIndicator /> : null}
 

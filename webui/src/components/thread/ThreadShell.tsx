@@ -11,7 +11,6 @@ import { WebPreviewContext } from "@/components/WebLink";
 import { WebPreviewPanel } from "@/components/WebPreviewPanel";
 import { parseWebLink } from "@/lib/web-preview";
 import { createFilePreviewResource } from "@/lib/file-preview-resource";
-import { SessionHandleLabel } from "@/components/SessionHandleLabel";
 import { PromptNavigator } from "@/components/thread/PromptNavigator";
 import { ModelFallbackNotice } from "@/components/thread/ModelFallbackNotice";
 import { RecoveryNotice } from "@/components/thread/RecoveryNotice";
@@ -433,7 +432,6 @@ interface ThreadShellProps {
   hideSidebarToggle?: boolean;
   hideThemeButton?: boolean;
   hideHeaderTitle?: boolean;
-  inlineHandle?: boolean;
   hideHeader?: boolean;
   headerActions?: ReactNode;
   headerPortalTarget?: HTMLElement | null;
@@ -650,7 +648,6 @@ export function ThreadShell({
   hideSidebarToggle = false,
   hideThemeButton = false,
   hideHeaderTitle = false,
-  inlineHandle = false,
   hideHeader = false,
   headerActions,
   headerPortalTarget,
@@ -1884,20 +1881,6 @@ export function ThreadShell({
         "thread-conversation relative flex min-w-0 flex-1 flex-col overflow-hidden",
         headerPortalTarget === undefined && !hideHeader && "thread-workspace",
       )}>
-        {hideHeaderTitle && inlineHandle && !temporary && session?.handle ? (
-          <div
-            aria-label={`Session @${session.handle.name}`}
-            className="flex h-8 shrink-0 items-center px-3 text-[12px]"
-          >
-            <span
-              className="shrink-0"
-            >
-              <SessionHandleLabel id={session.handle.id}>
-                @{session.handle.name}
-              </SessionHandleLabel>
-            </span>
-          </div>
-        ) : null}
         {headerPortalTarget === undefined ? threadHeader : null}
         <FilePreviewAvailabilityProvider
           resolve={previewSessionKey ? resolveFilePreviewAvailability : undefined}

@@ -2,7 +2,6 @@ import { fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ChatList } from "@/components/ChatList";
-import { sessionHandleColor } from "@/lib/session-handle";
 import { readDraggedSession, SESSION_DRAG_TYPE } from "@/lib/session-drag";
 import type { ChatSummary } from "@/lib/types";
 
@@ -67,7 +66,7 @@ describe("ChatList", () => {
     expect(onTogglePin).toHaveBeenCalledWith("websocket:review");
   });
 
-  it("restores the colored handle underline and animated active track", () => {
+  it("renders conversation rows without a session handle chip", () => {
     render(
       <ChatList
         sessions={[session({
@@ -85,14 +84,10 @@ describe("ChatList", () => {
     );
 
     const conversation = screen.getByRole("button", {
-      name: "@mira Review the patch",
+      name: "Review the patch",
     });
-    const handle = conversation.querySelector("[data-sidebar-session-handle]");
-    expect(handle).toHaveClass("max-w-20", "shrink-0");
-    const underline = handle?.querySelector("[data-sidebar-session-handle-underline]");
-    expect(underline).toHaveClass("border-b-2", "text-sidebar-muted-foreground");
-    expect(underline?.getAttribute("style"))
-      .toContain(sessionHandleColor("handle_1234"));
+    expect(conversation.querySelector("[data-sidebar-session-handle]")).toBeNull();
+    expect(conversation).not.toHaveTextContent("@mira");
 
     expect(conversation.closest("[data-chat-row]"))
       .toHaveClass("rounded-xl");
@@ -117,7 +112,7 @@ describe("ChatList", () => {
       .toBeInTheDocument();
   });
 
-  it("keeps handle columns intact inside grouped panes", () => {
+  it("keeps grouped pane rows free of session handles", () => {
     render(
       <ChatList
         sessions={[session({
@@ -156,13 +151,10 @@ describe("ChatList", () => {
       />,
     );
 
-    expect(screen.getByRole("button", { name: "@mira Short" }))
-      .toHaveTextContent("@mira");
-    expect(screen.getByRole("button", { name: "@nora A much longer conversation title" }))
-      .toHaveTextContent("@nora");
-    for (const handle of document.querySelectorAll("[data-sidebar-session-handle]")) {
-      expect(handle).toHaveClass("max-w-20", "shrink-0");
-    }
+    expect(screen.getByRole("button", { name: "Short" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "A much longer conversation title" }))
+      .toBeInTheDocument();
+    expect(document.querySelectorAll("[data-sidebar-session-handle]")).toHaveLength(0);
   });
 
   it("shows the running indicator while a recovery continuation is active", () => {
@@ -1019,12 +1011,7 @@ describe("ChatList", () => {
     expect(screen.getByRole("region", { name: "nanobot-bench" })).toBeInTheDocument();
     expect(projectSurface).toHaveClass("ms-4");
     expect(within(nanobotSection).getByText("Alpha task")).toBeInTheDocument();
-    expect(
-      within(nanobotSection)
-        .getByText("@mira")
-        .closest("[data-sidebar-session-handle]")
-        ?.parentElement,
-    ).toHaveClass("items-center");
+    expect(within(nanobotSection).queryByText("@mira")).not.toBeInTheDocument();
     expect(within(nanobotSection).getByText("Zeta task")).toBeInTheDocument();
     expect(nanobotText.indexOf("Alpha task")).toBeLessThan(nanobotText.indexOf("Zeta task"));
     expect(within(nanobotSection).getByLabelText("Agent running")).toBeInTheDocument();
