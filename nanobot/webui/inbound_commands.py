@@ -171,7 +171,7 @@ class WebUICommandRouter:
         Rejects ids colliding with either namespace's existing evidence
         (cached or persisted); UUID randomness is not trusted as the boundary.
         """
-        sessions = self._gateway.session_manager
+        sessions = self.gateway.session_manager
         for _ in range(8):
             candidate = str(uuid.uuid4())
             if sessions is None:
@@ -186,7 +186,7 @@ class WebUICommandRouter:
 
     def _legacy_namespace_conflict(self, chat_id: str) -> bool:
         """Whether legacy websocket:<chat_id> evidence exists (cached/persisted)."""
-        sessions = self._gateway.session_manager
+        sessions = self.gateway.session_manager
         if sessions is None:
             return False
         return webui_binding_conflicts_with_legacy(sessions, chat_id)
@@ -428,7 +428,7 @@ class WebUICommandRouter:
             # whose legacy websocket: namespace session exists — outbound
             # fanout is by chat_id, so the audiences cannot be told apart on
             # the wire. Checked here and again inside the transport chokepoint.
-            sessions = self._gateway.session_manager
+            sessions = self.gateway.session_manager
             if sessions is not None and webui_binding_conflicts_with_legacy(
                 sessions, chat_id,
             ):

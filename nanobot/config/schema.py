@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
-from pydantic import AliasChoices, ConfigDict, Field, model_validator
+from pydantic import AliasChoices, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 from nanobot.config_base import Base
@@ -176,6 +176,10 @@ class AgentDefaults(Base):
     )  # Max characters for tool hint display (e.g. "$ cd …/project && npm test")
     reasoning_effort: str | None = None  # low / medium / high / adaptive / none — LLM thinking effort; None preserves the provider default
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
+    # Fork note (WebUI integration): upstream auto-detects the host timezone when this
+    # is "auto"; the fork keeps the explicit `timezone` above and does not detect, so
+    # this field is read/written by the WebUI settings pane but has no runtime effect.
+    timezone_mode: Literal["auto", "manual"] = "auto"
     bot_name: str = "nanobot"  # Display name shown in CLI prompts (e.g. "{name} is thinking...")
     bot_icon: str = "🐈"  # Short icon (emoji or text) shown next to the bot name in CLI; "" to omit
     unified_session: bool = False  # Share one session across all channels (single-user multi-device)
@@ -211,12 +215,41 @@ class AgentsConfig(Base):
 class ProviderConfig(Base):
     """LLM provider configuration."""
 
+    # User-facing name for dynamic custom providers.
+    display_name: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     api_key: str | None = Field(default=None, repr=False)
     api_base: str | None = None
     api_type: Literal["auto", "chat_completions", "responses"] = "auto"  # Request API surface
     extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
     extra_body: dict[str, Any] | None = None  # Extra provider request fields; shape depends on provider/API surface
     extra_query: dict[str, str] | None = None  # Extra query params (e.g. api-version for Azure-style gateways)
+    proxy: str | None = None  # Explicit HTTP proxy; image downloads trust its DNS and egress
+    thinking_style: str | None = None  # Thinking/reasoning style for custom providers
+
+    # Valid values mirror the keys of _THINKING_STYLE_MAP in
+    # nanobot/providers/openai_compat_provider.py. Kept duplicated here to
+    # avoid an import cycle (schema.py must not import from providers/).
+    _VALID_THINKING_STYLES: ClassVar[tuple[str, ...]] = (
+        "thinking_type",
+        "enable_thinking",
+        "reasoning_split",
+    )
+
+    @field_validator("thinking_style")
+    @classmethod
+    def _validate_thinking_style(cls, v: str | None) -> str | None:
+        if not v:  # None or "" -> no injection, valid (backwards compatible)
+            return v
+        if v not in cls._VALID_THINKING_STYLES:
+            raise ValueError(
+                f"Invalid thinking_style {v!r}. "
+                f"Must be one of: {', '.join(repr(s) for s in cls._VALID_THINKING_STYLES)} "
+                f"(or empty/omitted)."
+            )
+        return v
 
 
 class ProvidersConfig(Base):
@@ -288,6 +321,9 @@ class GatewayConfig(Base):
 
     host: str = "127.0.0.1"  # Safer default: local-only bind.
     port: int = 18790
+    # Fork note (WebUI integration): the fork restarts in place (execv) and has no
+    # restart-mode machinery, so this is read/written by the WebUI but inert here.
+    restart_mode: Literal["auto", "exec", "spawn", "exit"] = "auto"
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
 
 
@@ -306,6 +342,21 @@ class MCPServerConfig(Base):
     oauth: bool = False  # HTTP/SSE: use MCP-spec OAuth 2.1 (discovery + DCR + auto-refresh) instead of a static Bearer in `headers`
     oauth_redirect_port: int = 8765  # loopback port in the registered redirect_uri (http://localhost:<port>/callback); no server listens — you relay the callback URL manually on first auth
     oauth_scopes: str = "openid mcp.tools offline_access"  # OAuth scopes; `offline_access` yields a refresh token so the gateway can auto-refresh
+
+    # Fork addition (WebUI integration): upstream replaced the fork's `oauth: bool`
+    # with `auth: Literal["oauth"] | None`. The ported WebUI reads *and constructs*
+    # `auth`, while the fork's MCP runtime still reads `oauth`; the validator below
+    # keeps the two in step so either spelling works.
+    auth: Literal["oauth"] | None = None  # Remote MCP OAuth; tokens are stored outside config
+
+    @model_validator(mode="after")
+    def _sync_oauth_auth(self) -> MCPServerConfig:
+        """Keep the WebUI-facing `auth` flag and the fork's legacy `oauth` flag in step."""
+        if self.auth == "oauth" and not self.oauth:
+            self.oauth = True
+        elif self.oauth and self.auth is None:
+            self.auth = "oauth"
+        return self
 
 
 class ToolPolicyRuleConfig(Base):
@@ -358,7 +409,24 @@ class ToolsConfig(Base):
     memory_search: MemorySearchToolConfig = Field(
         default_factory=lambda: _lazy_default("nanobot.agent.tools.memory_search", "MemorySearchToolConfig"),
     )
+    max_session_messages_per_minute: int = Field(default=6, ge=1)
     restrict_to_workspace: bool = False  # policy intent: keep tool access inside workspace when possible
+    webui_allow_local_service_access: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "webuiAllowLocalServiceAccess",
+            "webui_allow_local_service_access",
+            "allowLocalPreviewAccess",
+            "allow_local_preview_access",
+        ),
+    )  # allow WebUI Full Access shell checks against localhost services; legacy allowLocalPreviewAccess still reads
+    webui_allow_remote_package_install: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "webuiAllowRemotePackageInstall",
+            "webui_allow_remote_package_install",
+        ),
+    )  # allow non-local WebUI clients to install optional packages and agent skills
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
     ssrf_whitelist: list[str] = Field(default_factory=list)  # CIDR ranges to exempt from SSRF blocking (e.g. ["100.64.0.0/10"] for Tailscale)
     policies: list[ToolPolicyRuleConfig] = Field(default_factory=list)
@@ -372,10 +440,35 @@ class ToolsConfig(Base):
     exploration_mode_deny_mutations: bool = False
 
 
+class ApiConfig(Base):
+    """OpenAI-compatible API server configuration.
+
+    Fork note (WebUI integration): the fork removed the API server itself, so
+    nothing here is read at runtime — but the ported WebUI settings pane reads and
+    writes this exact shape, so it is kept typed rather than as a free-form dict.
+    """
+
+    host: str = "127.0.0.1"  # Safer default: local-only bind.
+    port: int = 8900
+    timeout: float = 120.0  # Per-request timeout in seconds.
+    api_key: str = Field(default="", repr=False)
+
+    @model_validator(mode="after")
+    def wildcard_host_requires_auth(self) -> "ApiConfig":
+        if self.host not in ("0.0.0.0", "::"):
+            return self
+        if self.api_key.strip():
+            return self
+        raise ValueError(
+            "host is 0.0.0.0 (all interfaces) but api_key is not set "
+            "- set api.api_key to prevent unauthenticated access"
+        )
+
+
 class Config(BaseSettings):
     """Root configuration for nanobot."""
 
-    api: dict[str, Any] = Field(default_factory=dict, exclude=True)  # Deprecated: ignored after API server removal
+    api: ApiConfig = Field(default_factory=ApiConfig)  # Fork note: vestigial (API server removed); kept typed for the WebUI settings pane
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     transcription: TranscriptionConfig = Field(default_factory=TranscriptionConfig)

@@ -58,6 +58,10 @@ class ExecToolConfig(Base):
     path_prepend: str = ""
     path_append: str = ""
     sandbox: str = ""
+    # Fork note (WebUI integration): accepted and round-tripped for the WebUI, but the
+    # fork's sandbox has no bind-mount support, so these have no runtime effect.
+    sandbox_ro_binds: list[str] = Field(default_factory=list)
+    sandbox_rw_binds: list[str] = Field(default_factory=list)
     allowed_env_keys: list[str] = Field(default_factory=list)
     allow_patterns: list[str] = Field(default_factory=list)
     deny_patterns: list[str] = Field(default_factory=list)

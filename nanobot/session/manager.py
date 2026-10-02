@@ -576,12 +576,44 @@ class SessionManager:
         self._cache: dict[str, Session] = {}
         # Fork addition (WebUI integration): guards direct canonical-file
         # access (locked_session_files) and metadata-line rewrites.
-        self._session_files_lock = threading.Lock()
+        # RLock, not Lock: upstream uses filelock.FileLock (thread-local, so nested
+        # acquisition in one thread is reference-counted). Fork-owned callers nest —
+        # SessionHandleResolver._ensure_all() holds locked_session_files() and then
+        # calls update_session_metadata(), which re-acquires — so a plain Lock
+        # self-deadlocked and hung /api/sessions.
+        self._session_files_lock = threading.RLock()
 
     @staticmethod
     def safe_key(key: str) -> str:
         """Public helper used by HTTP handlers to map an arbitrary key to a stable filename stem."""
         return safe_filename(key.replace(":", "_"))
+
+    @classmethod
+    def _session_key_from_path(cls, path: Path) -> str | None:
+        """Recover the canonical session key from a session file's metadata line.
+
+        Fork addition (WebUI integration): upstream decodes the key back out of a
+        canonical, collision-resistant filename stem. The fork's ``safe_key`` is
+        lossy (``:`` collapses to ``_``), so the stem cannot be decoded. The first
+        record of every session file is a metadata line carrying the original
+        ``key``; read it from there. Returns ``None`` for missing, unreadable, or
+        non-metadata files so callers can skip them.
+        """
+        try:
+            with open(path, encoding="utf-8") as f:
+                first_line = f.readline().strip()
+        except OSError:
+            return None
+        if not first_line:
+            return None
+        try:
+            data = json.loads(first_line)
+        except ValueError:
+            return None
+        if not isinstance(data, dict) or data.get("_type") != "metadata":
+            return None
+        key = data.get("key")
+        return key if isinstance(key, str) and key else None
 
     def _get_session_path(self, key: str) -> Path:
         """Get the file path for a session."""

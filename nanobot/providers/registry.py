@@ -19,6 +19,19 @@ from pydantic.alias_generators import to_snake
 
 
 @dataclass(frozen=True)
+class ProviderModelSpec:
+    """Curated model metadata used for fixed catalogs or online fallback."""
+
+    id: str
+    label: str = ""
+    description: str = ""
+    owned_by: str = ""
+    context_window: int | None = None
+    reasoning_efforts: tuple[str, ...] = ()
+    supports_backend_search: bool = False
+
+
+@dataclass(frozen=True)
 class ProviderSpec:
     """One LLM provider's metadata. See PROVIDERS below for real examples.
 
@@ -32,6 +45,9 @@ class ProviderSpec:
     keywords: tuple[str, ...]  # model-name keywords for matching (lowercase)
     env_key: str  # env var for API key, e.g. "DASHSCOPE_API_KEY"
     display_name: str = ""  # shown in `nanobot status`
+    model_catalog: str = "auto"  # WebUI model-list source, including builtin/hybrid
+    builtin_models: tuple[ProviderModelSpec, ...] = ()
+    settings_alias_for: str = ""  # compatibility alias grouped under this provider in Settings
 
     # which provider implementation to use
     # "openai_compat" | "anthropic" | "openai_codex"
@@ -264,7 +280,12 @@ def find_by_name(name: str) -> ProviderSpec | None:
     return None
 
 
-def create_dynamic_spec(name: str) -> ProviderSpec:
+def create_dynamic_spec(
+    name: str,
+    *,
+    display_name: str = "",
+    thinking_style: str = "",
+) -> ProviderSpec:
     """Create a dynamic ProviderSpec for custom user-defined providers."""
     normalized = to_snake(name.replace("-", "_"))
     strip_prefixes = tuple(dict.fromkeys((name, normalized)))
@@ -272,8 +293,9 @@ def create_dynamic_spec(name: str) -> ProviderSpec:
         name=normalized,
         keywords=(),
         env_key="",
-        display_name=name.title(),
+        display_name=display_name or name.replace("-", " ").replace("_", " ").title(),
         backend="openai_compat",
         is_direct=True,
         strip_model_prefixes=strip_prefixes,
+        thinking_style=thinking_style,
     )
