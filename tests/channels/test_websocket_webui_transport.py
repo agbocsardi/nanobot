@@ -376,6 +376,17 @@ def _gateway_channel(persisted: set[str] | None = None) -> tuple[WebSocketChanne
     return channel, gateway
 
 
+def _register_gateway_connection(channel: WebSocketChannel, connection: FakeConnection) -> None:
+    """Mirror the real gateway-mode handshake registration.
+
+    ``_connection_loop`` registers a connection's outbound queue through
+    ``_attach`` after the ready frame; without it ``_safe_send_to`` drops
+    frames (gateway mode) and ``_conn_chats`` has no entry. Test doubles must
+    take the same path or they assert against an impossible state.
+    """
+    assert channel._register_connection_outbound(connection) is True
+
+
 async def _add_webui_connection(
     channel: WebSocketChannel, gateway: _FakeGateway, connection: FakeConnection
 ) -> str:
@@ -395,6 +406,7 @@ async def test_audience_dispatch_by_connection_not_payload_flag(webui_stack):
 
     legacy_conn = FakeConnection()
     webui_conn = FakeConnection()
+    _register_gateway_connection(channel, legacy_conn)
     await _add_webui_connection(channel, gateway, webui_conn)
 
     # A legacy connection stays on the fork envelope branch even when the
@@ -402,6 +414,7 @@ async def test_audience_dispatch_by_connection_not_payload_flag(webui_stack):
     await channel._dispatch_envelope(legacy_conn, "c", {
         "type": "message", "chat_id": "foreign-id", "content": "hi", "webui": True,
     })
+    await _drain()
     assert router.dispatched == []
     errors = [e for e in legacy_conn.sent if e.get("event") == "error"]
     assert errors and errors[0]["detail"] == "unknown chat_id"
@@ -460,14 +473,14 @@ async def test_legacy_ownership_never_claims_webui_bound_chat(webui_stack):
     channel, gateway = _gateway_channel(persisted={webui_session_key("webui-only")})
     legacy_conn = FakeConnection()
     # Simulate a stale registration; ownership must still refuse.
-    channel._conn_chats[legacy_conn].add("webui-only")
+    channel._conn_chats.setdefault(legacy_conn, set()).add("webui-only")
     assert channel._owns_chat(legacy_conn, "webui-only") is False
 
     # A live webui subscriber also makes the id un-ownable for legacy.
     webui_conn = FakeConnection()
     gateway.endpoint.webui_connections.add(webui_conn)
     channel._attach(webui_conn, "live-webui")
-    channel._conn_chats[legacy_conn].add("live-webui")
+    channel._conn_chats.setdefault(legacy_conn, set()).add("live-webui")
     assert channel._owns_chat(legacy_conn, "live-webui") is False
 
 
@@ -713,3 +726,30 @@ async def test_gateway_mode_webui_stream_persists_canonical_rows(webui_stack):
     assert phases == ["answer", "answer"]
     assert webui_conn.sent[-1]["event"] == "stream_end"
     assert webui_conn.sent[-1]["text"] == "hey"
+
+
+@pytest.mark.asyncio
+async def test_write_side_gating_fails_safe_when_session_probe_breaks(webui_stack):
+    """A broken session_exists probe must not write WebUI transcripts for a
+    legacy chat. Binding/ownership guards stay fail-closed; the write-side
+    gate (enrichment, transcript persistence) defaults to no-write."""
+    channel, gateway = _gateway_channel()
+    legacy_conn = FakeConnection()
+    channel._attach(legacy_conn, "legacy-chat")
+
+    def boom(session_key: str) -> bool:
+        raise RuntimeError("probe down")
+
+    gateway.session_exists = boom  # type: ignore[method-assign]
+
+    result = await channel.send(
+        OutboundMessage(channel="websocket", chat_id="legacy-chat", content="hi")
+    )
+    await _drain()
+
+    assert isinstance(result, DeliveryResult)
+    assert result.status == "delivered"
+    assert legacy_conn.sent[-1]["text"] == "hi"
+    assert gateway.transcripts.events == []
+    # Same broken probe, binding side: fail closed.
+    assert channel._owns_chat(legacy_conn, "legacy-chat") is False

@@ -507,13 +507,20 @@ class WebSocketChannel(BaseChannel):
             self.logger.warning("session_exists lookup failed for {}: {}", session_key, exc)
             return default
 
-    def _chat_is_webui_bound(self, chat_id: str) -> bool:
-        """True when *chat_id* belongs to the WebUI audience (live or persisted)."""
+    def _chat_is_webui_bound(self, chat_id: str, *, default: bool = True) -> bool:
+        """True when *chat_id* belongs to the WebUI audience (live or persisted).
+
+        *default* is the answer when the side-effect-free ``session_exists``
+        probe is absent or fails. Binding/mint/ownership guards pass the
+        fail-closed ``True``; write-side gates (enrichment, transcript
+        persistence) pass ``False`` so a broken probe can never write WebUI
+        history for a legacy chat.
+        """
         if self.gateway is None:
             return False
         if any(conn in self._webui_connections for conn in self._subs.get(chat_id, ())):
             return True
-        return self._session_exists_strict(self._webui_session_key(chat_id), default=True)
+        return self._session_exists_strict(self._webui_session_key(chat_id), default=default)
 
     def _chat_is_legacy_bound(self, chat_id: str) -> bool:
         """True when *chat_id* shows any legacy-audience evidence.
@@ -1597,7 +1604,7 @@ class WebSocketChannel(BaseChannel):
             payload["kind"] = "tool_hint"
         elif msg.metadata.get("_progress"):
             payload["kind"] = "progress"
-        if self._chat_is_webui_bound(msg.chat_id):
+        if self._chat_is_webui_bound(msg.chat_id, default=False):
             # WebUI-audience chat only: enrichment and transcript persistence
             # must never touch legacy chats sharing the gateway listener.
             self._enrich_and_persist_message(msg, payload)
@@ -1674,7 +1681,7 @@ class WebSocketChannel(BaseChannel):
         # WebUI-audience chats get upstream stream_end/persistence behavior;
         # legacy chats (including on a shared gateway listener) keep the
         # fork's buffered text rule and write no WebUI transcript rows.
-        webui_chat = self._chat_is_webui_bound(chat_id)
+        webui_chat = self._chat_is_webui_bound(chat_id, default=False)
         stream_key = (chat_id, str(stream_id or ""))
         completed_text: str | None = None
         if stream_end:
@@ -1749,7 +1756,7 @@ class WebSocketChannel(BaseChannel):
         if stream_id is not None:
             body["stream_id"] = stream_id
         stream_key = (chat_id, str(stream_id or ""))
-        if self._chat_is_webui_bound(chat_id):
+        if self._chat_is_webui_bound(chat_id, default=False):
             self._reasoning_text_buffers.setdefault(stream_key, []).append(delta)
             self._persist_turn_stream_event(
                 chat_id,
@@ -1783,7 +1790,7 @@ class WebSocketChannel(BaseChannel):
         if stream_id is not None:
             body["stream_id"] = stream_id
         stream_key = (chat_id, str(stream_id or ""))
-        if self._chat_is_webui_bound(chat_id):
+        if self._chat_is_webui_bound(chat_id, default=False):
             reasoning_text = "".join(self._reasoning_text_buffers.pop(stream_key, []))
             self._persist_turn_stream_event(
                 chat_id,
@@ -1810,7 +1817,7 @@ class WebSocketChannel(BaseChannel):
             "chat_id": chat_id,
             "edits": edits,
         }
-        if self._chat_is_webui_bound(chat_id):
+        if self._chat_is_webui_bound(chat_id, default=False):
             self._persist_turn_transcript_event(
                 chat_id,
                 payload,
