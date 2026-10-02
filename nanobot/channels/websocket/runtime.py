@@ -19,6 +19,10 @@ fork compatibility grafts (issue #38):
   token, ``token_issue_path`` audience-``client`` tokens, tokenless
   localhost) uses the legacy envelope branch. The envelope's ``webui: true``
   flag is never trusted for audience.
+- WebUI-only enrichment (media rewrite, turn ids, transcript persistence)
+  applies only to chats bound to the WebUI audience; legacy chats on the
+  same gateway listener keep fork frames, delivery results, and history —
+  no WebUI transcript writes.
 - Single-audience chat binding: in gateway mode legacy mints avoid ids bound
   to the WebUI audience (live registry + persisted ``webui:`` sessions via
   ``gateway.session_exists``), ``webui_attach`` refuses legacy-bound ids, and
@@ -512,18 +516,19 @@ class WebSocketChannel(BaseChannel):
         return self._session_exists_strict(self._webui_session_key(chat_id), default=True)
 
     def _chat_is_legacy_bound(self, chat_id: str) -> bool:
-        """True when *chat_id* belongs to the legacy audience (live or persisted-only)."""
+        """True when *chat_id* shows any legacy-audience evidence.
+
+        Strict: a persisted ``websocket:`` session counts even when a
+        ``webui:`` session also exists — pending legacy replies/deltas fan
+        out solely by chat_id, so an opposite-namespace collision must
+        never open a WebUI bind, live socket or not. WebUI-only persisted
+        history resumes normally.
+        """
         if self.gateway is None:
             return False
         if any(conn not in self._webui_connections for conn in self._subs.get(chat_id, ())):
             return True
-        legacy_persisted = self._session_exists_strict(
-            self._legacy_session_key(chat_id), default=True
-        )
-        webui_persisted = self._session_exists_strict(
-            self._webui_session_key(chat_id), default=False
-        )
-        return legacy_persisted and not webui_persisted
+        return self._session_exists_strict(self._legacy_session_key(chat_id), default=True)
 
     def _mint_chat_id(self) -> str:
         """Mint a chat id for the legacy audience.
@@ -1592,7 +1597,9 @@ class WebSocketChannel(BaseChannel):
             payload["kind"] = "tool_hint"
         elif msg.metadata.get("_progress"):
             payload["kind"] = "progress"
-        if self.gateway is not None:
+        if self._chat_is_webui_bound(msg.chat_id):
+            # WebUI-audience chat only: enrichment and transcript persistence
+            # must never touch legacy chats sharing the gateway listener.
             self._enrich_and_persist_message(msg, payload)
         raw = json.dumps(payload, ensure_ascii=False)
         if not conns:
@@ -1620,7 +1627,7 @@ class WebSocketChannel(BaseChannel):
         return DeliveryResult("delivered")
 
     def _enrich_and_persist_message(self, msg: OutboundMessage, payload: dict[str, Any]) -> None:
-        """Gateway-mode enrichment of a fork-shaped message: turn id, signed
+        """WebUI-audience enrichment of a fork-shaped message: turn id, signed
         media URLs, and canonical transcript persistence for WebUI threads."""
         from nanobot.webui.metadata import WEBUI_TURN_METADATA_KEY
 
@@ -1664,6 +1671,10 @@ class WebSocketChannel(BaseChannel):
         if stream_id is None and meta.get("_stream_id") is not None:
             stream_id = meta["_stream_id"]
         stream_end = stream_end or bool(meta.get("_stream_end"))
+        # WebUI-audience chats get upstream stream_end/persistence behavior;
+        # legacy chats (including on a shared gateway listener) keep the
+        # fork's buffered text rule and write no WebUI transcript rows.
+        webui_chat = self._chat_is_webui_bound(chat_id)
         stream_key = (chat_id, str(stream_id or ""))
         completed_text: str | None = None
         if stream_end:
@@ -1676,7 +1687,7 @@ class WebSocketChannel(BaseChannel):
             if delta:
                 buffered.append(delta)
             full_text = "".join(buffered)
-            if self.gateway is not None:
+            if webui_chat:
                 rewritten = self._media.rewrite_local_markdown_images(full_text)
                 completed_text = rewritten
                 if delta or rewritten != full_text:
@@ -1696,7 +1707,7 @@ class WebSocketChannel(BaseChannel):
             body["resuming"] = True
         if stream_end and merge_next:
             body["merge_next"] = True
-        if self.gateway is not None:
+        if webui_chat:
             self._persist_turn_stream_event(
                 chat_id,
                 body,
@@ -1738,7 +1749,7 @@ class WebSocketChannel(BaseChannel):
         if stream_id is not None:
             body["stream_id"] = stream_id
         stream_key = (chat_id, str(stream_id or ""))
-        if self.gateway is not None:
+        if self._chat_is_webui_bound(chat_id):
             self._reasoning_text_buffers.setdefault(stream_key, []).append(delta)
             self._persist_turn_stream_event(
                 chat_id,
@@ -1772,7 +1783,7 @@ class WebSocketChannel(BaseChannel):
         if stream_id is not None:
             body["stream_id"] = stream_id
         stream_key = (chat_id, str(stream_id or ""))
-        if self.gateway is not None:
+        if self._chat_is_webui_bound(chat_id):
             reasoning_text = "".join(self._reasoning_text_buffers.pop(stream_key, []))
             self._persist_turn_stream_event(
                 chat_id,
@@ -1799,7 +1810,7 @@ class WebSocketChannel(BaseChannel):
             "chat_id": chat_id,
             "edits": edits,
         }
-        if self.gateway is not None:
+        if self._chat_is_webui_bound(chat_id):
             self._persist_turn_transcript_event(
                 chat_id,
                 payload,

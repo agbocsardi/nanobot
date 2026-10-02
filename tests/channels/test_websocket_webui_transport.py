@@ -270,6 +270,16 @@ async def test_legacy_listener_round_trip_on_ephemeral_port():
 # ---------------------------------------------------------------------------
 
 
+class _FakeMedia:
+    """No-op media gateway: identity rewrite, no signed URLs."""
+
+    def rewrite_local_markdown_images(self, text: str) -> str:
+        return text
+
+    def sign_or_stage_media_path(self, path) -> dict[str, str] | None:
+        return None
+
+
 class _FakeTranscripts:
     """Records canonical turn events like the real WebUITranscriptRecorder."""
 
@@ -313,7 +323,7 @@ class _FakeGateway:
     def __init__(self, persisted: set[str] | None = None) -> None:
         self.endpoint = _FakeEndpoint()
         self.http = None
-        self.media = None
+        self.media = _FakeMedia()
         self.ingress = None
         self.transcripts = _FakeTranscripts()
         self.workspaces = None
@@ -417,7 +427,7 @@ async def test_webui_attach_refuses_live_legacy_bound_chat(webui_stack):
 
 
 @pytest.mark.asyncio
-async def test_webui_attach_rejects_legacy_persisted_but_allows_resume(webui_stack):
+async def test_webui_attach_rejects_legacy_collision_and_resumes_webui_only(webui_stack):
     from nanobot.webui.session_identity import webui_session_key
 
     # websocket:X persisted without webui:X: a webui bind must be refused
@@ -429,11 +439,18 @@ async def test_webui_attach_rejects_legacy_persisted_but_allows_resume(webui_sta
         channel.webui_attach(webui_conn, "seeded")
     assert "seeded" not in channel._subs
 
-    # Both namespaces persisted and no live legacy holder: resume is allowed,
-    # and the fan-out set stays purely webui (no legacy leakage).
+    # Both namespaces persisted is still a collision: pending legacy
+    # replies fan out solely by chat_id, so opposite-namespace evidence
+    # rejects the bind even with no legacy socket alive.
     gateway._persisted.add(webui_session_key("seeded"))
-    channel.webui_attach(webui_conn, "seeded")
-    assert channel._subs["seeded"] == {webui_conn}
+    with pytest.raises(websocket_runtime._CrossAudienceBindError):
+        channel.webui_attach(webui_conn, "seeded")
+    assert "seeded" not in channel._subs
+
+    # WebUI-only persisted history resumes normally.
+    gateway._persisted.add(webui_session_key("webui-only"))
+    channel.webui_attach(webui_conn, "webui-only")
+    assert channel._subs["webui-only"] == {webui_conn}
 
 
 @pytest.mark.asyncio
@@ -545,10 +562,12 @@ async def test_require_existing_session_is_refused_not_ignored(webui_stack):
 
 @pytest.mark.asyncio
 async def test_pending_legacy_reply_isolation_across_disconnect_and_restart(webui_stack):
-    """The parent-mandated collision scenario, at binding level: a live
-    legacy client owns X; a webui message to X must never join that fan-out;
-    after the legacy disconnect, a webui bind is only allowed once the webui
-    namespace actually holds X (resume), never on the legacy evidence."""
+    """The parent-mandated collision scenario with real pending frames: a
+    legacy client owns X and disconnects mid-turn; the pending delta/final
+    fan out solely by chat_id. A webui bind to X is refused on any legacy
+    evidence (live, persisted, or both-persisted), the webui connection
+    receives neither pending frame, nothing is subscribed, and nothing is
+    published (no session writes)."""
     from nanobot.webui.session_identity import webui_session_key
 
     channel, gateway = _gateway_channel()
@@ -561,20 +580,32 @@ async def test_pending_legacy_reply_isolation_across_disconnect_and_restart(webu
     with pytest.raises(websocket_runtime._CrossAudienceBindError):
         channel.webui_attach(webui_conn, "seeded")
 
-    # Legacy disconnect: fan-out set empties.
+    # Legacy disconnects with an outbound turn still pending.
     channel._cleanup_connection(legacy_conn)
     assert "seeded" not in channel._subs
 
-    # Persisted websocket:X alone is still not webui evidence.
+    # The pending legacy frames fan out by chat_id — to no one now.
+    await channel.send_delta("seeded", "pending", {"_stream_id": "p1"})
+    await channel.send_delta("seeded", "", {"_stream_id": "p1", "_stream_end": True})
+    result = await channel.send(OutboundMessage(
+        channel="websocket", chat_id="seeded", content="pending final",
+    ))
+    assert result.status == "failed"
+
+    # Persisted legacy evidence refuses the bind — with or without a
+    # matching webui: session — even with no legacy socket alive.
     gateway._persisted.add("websocket:seeded")
     with pytest.raises(websocket_runtime._CrossAudienceBindError):
         channel.webui_attach(webui_conn, "seeded")
-
-    # webui:X persisted: resume allowed; the legacy connection is gone from
-    # the fan-out, so pending or future legacy replies cannot reach it.
     gateway._persisted.add(webui_session_key("seeded"))
-    channel.webui_attach(webui_conn, "seeded")
-    assert channel._subs["seeded"] == {webui_conn}
+    with pytest.raises(websocket_runtime._CrossAudienceBindError):
+        channel.webui_attach(webui_conn, "seeded")
+
+    # The webui connection got neither pending frame, never subscribed,
+    # and nothing reached the bus (no webui:X session writes).
+    assert webui_conn.sent == []
+    assert webui_conn not in channel._subs.get("seeded", set())
+    assert channel.bus.inbound.qsize() == 0
 
 
 @pytest.mark.asyncio
@@ -612,10 +643,11 @@ async def test_gateway_mode_send_keeps_legacy_direct_and_webui_queued(webui_stac
     assert result.status == "delivered"
     assert legacy_conn.sent[-1]["text"] == "hello legacy"
 
-    # Gateway mode persists fork-shaped messages into the WebUI transcript
-    # (canonical rows for /webui-thread reads), for both audiences' chats.
-    persisted = {event["event"] for _, event, _ in gateway.transcripts.events}
-    assert persisted == {"message"}
+    # Transcript persistence is WebUI-audience only: the legacy chat's
+    # message wrote no WebUI transcript row.
+    persisted_chats = {chat for chat, _, _ in gateway.transcripts.events}
+    assert persisted_chats == {"webui-chat"}
+    assert gateway.transcripts.events[0][2] == "answer"
 
 
 @pytest.mark.asyncio
@@ -626,3 +658,58 @@ async def test_gateway_mode_hydrate_seam_replays_via_projector(webui_stack):
 
     await channel._hydrate_after_subscribe("some-chat")
     assert projector.hydrated == ["some-chat"]
+
+
+@pytest.mark.asyncio
+async def test_gateway_mode_legacy_stream_end_keeps_fork_frames_and_skips_transcript(webui_stack):
+    """On a gateway-backed listener, legacy chats keep the fork's buffered
+    stream_end text and write no WebUI transcript rows for answers,
+    progress, reasoning, or deltas."""
+    channel, gateway = _gateway_channel()
+    legacy_conn = FakeConnection()
+    channel._attach(legacy_conn, "legacy-chat")
+
+    await channel.send_delta("legacy-chat", "he", {"_stream_id": "s1"})
+    await channel.send_delta("legacy-chat", "y", {"_stream_id": "s1", "_stream_end": True})
+
+    assert legacy_conn.sent[0] == {
+        "event": "delta", "chat_id": "legacy-chat", "text": "he", "stream_id": "s1",
+    }
+    assert legacy_conn.sent[1] == {
+        "event": "stream_end", "chat_id": "legacy-chat", "text": "hey", "stream_id": "s1",
+    }
+    assert not channel._stream_text_buffers
+
+    await channel.send_reasoning_delta("legacy-chat", "th", {"_stream_id": "r1"})
+    await channel.send_reasoning_end("legacy-chat", {"_stream_id": "r1"})
+    await channel.send_file_edit_events("legacy-chat", [{"path": "x"}])
+    result = await channel.send(OutboundMessage(
+        channel="websocket", chat_id="legacy-chat", content="working",
+        metadata={"_progress": True},
+    ))
+    assert result.status == "delivered"
+    assert legacy_conn.sent[-1] == {
+        "event": "message", "chat_id": "legacy-chat", "text": "working", "kind": "progress",
+    }
+
+    assert gateway.transcripts.events == []
+
+
+@pytest.mark.asyncio
+async def test_gateway_mode_webui_stream_persists_canonical_rows(webui_stack):
+    """WebUI-audience chats get upstream stream behavior: canonical answer
+    rows land in the WebUI transcript and the stream_end frame follows the
+    upstream text rule."""
+    channel, gateway = _gateway_channel()
+    webui_conn = FakeConnection()
+    gateway.endpoint.webui_connections.add(webui_conn)
+    channel._attach(webui_conn, "webui-chat")
+
+    await channel.send_delta("webui-chat", "he", {"_stream_id": "s1"})
+    await channel.send_delta("webui-chat", "y", {"_stream_id": "s1", "_stream_end": True})
+    await _drain()
+
+    phases = [phase for _, _, phase in gateway.transcripts.events]
+    assert phases == ["answer", "answer"]
+    assert webui_conn.sent[-1]["event"] == "stream_end"
+    assert webui_conn.sent[-1]["text"] == "hey"
