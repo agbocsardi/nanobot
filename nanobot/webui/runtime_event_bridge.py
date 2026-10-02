@@ -59,22 +59,6 @@ def _context(ctx: Any) -> RuntimeEventContext:
     )
 
 
-def _runtime_fields(runtime: Any) -> dict[str, Any]:
-    """Forward only the runtime fields that actually exist on the fork shape.
-
-    The fork ``LLMRuntime`` carries ``provider``/``model``; upstream builds add
-    ``model_preset``/``context_window_tokens``. Read both defensively so the
-    bridge works with either shape without inventing values.
-    """
-    if runtime is None:
-        return {"runtime": None}
-    return {
-        "runtime": runtime,
-        "model_preset": getattr(runtime, "model_preset", None),
-        "context_window_tokens": getattr(runtime, "context_window_tokens", None),
-    }
-
-
 class RuntimeEventBridge:
     """Republish fork runtime events as WebUI-local AgentEvents on the bus."""
 
@@ -109,10 +93,13 @@ class RuntimeEventBridge:
         ))
 
     async def _on_turn_completed(self, event: ForkTurnCompleted) -> None:
+        # The fork LLMRuntime carries only provider/model; the coordinator reads
+        # optional model_preset/context_window_tokens off the runtime itself via
+        # getattr, so nothing is flattened onto the event here.
         await self._bus.publish(TurnCompleted(
             context=_context(event.context),
             latency_ms=event.latency_ms,
-            **_runtime_fields(event.runtime),
+            runtime=event.runtime,
         ))
 
     async def _on_goal_state(self, event: ForkGoalStateChanged) -> None:

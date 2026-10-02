@@ -95,6 +95,29 @@ async def test_bridge_translates_fork_turn_lifecycle(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_bridge_translates_a_real_turn_runtime(tmp_path) -> None:
+    """Regression: a live turn always carries a runtime object.
+
+    The bridge must translate it as-is; flattening upstream-only fields the fork
+    runtime does not have (model_preset/context_window_tokens) raised TypeError
+    and killed every turn_end frame.
+    """
+    runtime_bus, bus = _wire(tmp_path)
+
+    fork_runtime = LLMRuntime(provider=object(), model="fork-model")  # type: ignore[arg-type]
+    # metadata without webui=True keeps the title-generation path dormant.
+    await runtime_bus.publish(
+        TurnCompleted(context=_ctx(metadata={}), latency_ms=11, runtime=fork_runtime)
+    )
+
+    events = [m.event for m in await _drain_outbound(bus)]
+    turn_ends = [e for e in events if isinstance(e, TurnEndEvent)]
+    assert len(turn_ends) == 1
+    assert turn_ends[0].latency_ms == 11
+    assert turn_ends[0].context_window_tokens is None
+
+
+@pytest.mark.asyncio
 async def test_bridge_goal_state_and_model_changed(tmp_path) -> None:
     runtime_bus, bus = _wire(tmp_path)
 
