@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from contextlib import suppress
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
@@ -17,6 +18,21 @@ from nanobot.utils.restart import consume_restart_notice_from_env, format_restar
 
 if TYPE_CHECKING:
     from nanobot.session.manager import SessionManager
+
+
+def _default_webui_dist() -> Path | None:
+    """Return the bundled WebUI dist directory when it has been built.
+
+    Fork addition (WebUI integration): the built frontend is gitignored and
+    ships inside the ``nanobot.web`` marker package; absence simply means no
+    static serving.
+    """
+    try:
+        import nanobot.web as web_pkg
+    except ImportError:
+        return None
+    candidate = Path(web_pkg.__file__).resolve().parent / "dist"
+    return candidate if candidate.is_dir() else None
 
 
 # Retry delays for message sending (exponential backoff: 1s, 2s, 4s)
@@ -86,7 +102,15 @@ class ChannelManager:
             if section is None:
                 continue
             try:
-                channel = cls(section, self.bus)
+                kwargs: dict[str, Any] = {}
+                if name == "websocket":
+                    # Fork: one foreground listener serves HTTP + WS + assets
+                    # when the WebUI composition succeeds; on any failure the
+                    # channel falls back to legacy gateway-less behavior.
+                    gateway = self._build_webui_gateway(section)
+                    if gateway is not None:
+                        kwargs["gateway"] = gateway
+                channel = cls(section, self.bus, **kwargs)
                 channel.workspace = getattr(self.config, "workspace_path", None)
                 channel.send_progress = self._resolve_bool_override(
                     section, "send_progress", self.config.channels.send_progress,
@@ -103,6 +127,43 @@ class ChannelManager:
                 logger.warning("{} channel not available: {}", name, e)
 
         self._validate_allow_from()
+
+    def _build_webui_gateway(self, section: Any) -> Any | None:
+        """Compose GatewayServices for the websocket channel.
+
+        Fork addition (WebUI integration): ordinary foreground gateway only.
+        The removed API-process/remote-instance chains are absent, so the
+        only optional services here are the static dist and the cron handle.
+        """
+        try:
+            from nanobot.channels.websocket.runtime import WebSocketConfig
+            from nanobot.config.loader import get_config_path
+            from nanobot.webui.gateway_services import build_gateway_services
+
+            parsed = WebSocketConfig.model_validate(section)
+            return build_gateway_services(
+                config=parsed,
+                bus=self.bus,
+                session_manager=self._session_manager,
+                static_dist_path=_default_webui_dist(),
+                workspace_path=Path(self.config.workspace_path),
+                default_restrict_to_workspace=self.config.tools.restrict_to_workspace,
+                config_path=get_config_path(),
+                disabled_skills=set(self.config.agents.defaults.disabled_skills),
+                runtime_model_name=None,
+                refresh_runtime_config=None,
+                runtime_surface="browser",
+                runtime_capabilities_overrides=None,
+                cron_service=self._cron_service,
+                channel_runtime_status=self.get_status,
+                logger=logger,
+            )
+        except Exception:
+            logger.exception(
+                "WebUI gateway composition failed; websocket channel starts in "
+                "legacy gateway-less mode",
+            )
+            return None
 
     def _validate_allow_from(self) -> None:
         for name, ch in self.channels.items():

@@ -10,7 +10,10 @@ from loguru import logger
 if TYPE_CHECKING:
     from nanobot.channels.base import BaseChannel
 
-_INTERNAL = frozenset({"base", "manager", "registry"})
+_INTERNAL = frozenset({"base", "manager", "registry", "notification_routes"})
+# Built-in channels shipped as packages (the WebSocket channel package
+# re-exports its channel class); discovery must not import them to list names.
+_CHANNEL_PACKAGES = frozenset({"websocket"})
 
 
 def discover_channel_names() -> list[str]:
@@ -20,7 +23,7 @@ def discover_channel_names() -> list[str]:
     return [
         name
         for _, name, ispkg in pkgutil.iter_modules(pkg.__path__)
-        if name not in _INTERNAL and not ispkg
+        if name not in _INTERNAL and (not ispkg or name in _CHANNEL_PACKAGES)
     ]
 
 

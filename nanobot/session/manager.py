@@ -1048,6 +1048,46 @@ class SessionManager:
             cached.metadata.update(deepcopy(updates))
         return True
 
+    def rename_model_preset(self, old_name: str, new_name: str) -> int:
+        """Rename a session-scoped model preset across cached and persisted sessions.
+
+        Fork addition (WebUI integration, pinned upstream session/manager.py
+        d0d0a44e): returns the number of sessions changed, rolling back on any
+        failure so a partial rename never survives.
+        """
+        from nanobot.session.model_selection import SESSION_MODEL_PRESET_METADATA_KEY
+
+        if old_name == new_name:
+            return 0
+
+        cached = dict(self._cache)
+        keys = set(cached)
+        keys.update(
+            str(item["key"])
+            for item in self.list_sessions()
+            if isinstance(item.get("key"), str)
+        )
+
+        changed: list[Session] = []
+        try:
+            for key in sorted(keys):
+                session = cached.get(key) or self._load(key)
+                if (
+                    session is None
+                    or session.metadata.get(SESSION_MODEL_PRESET_METADATA_KEY) != old_name
+                ):
+                    continue
+                session.metadata[SESSION_MODEL_PRESET_METADATA_KEY] = new_name
+                changed.append(session)
+                self.save(session, fsync=True)
+        except BaseException:
+            for session in reversed(changed):
+                session.metadata[SESSION_MODEL_PRESET_METADATA_KEY] = old_name
+                with suppress(Exception):
+                    self.save(session, fsync=True)
+            raise
+        return len(changed)
+
     def list_sessions(self) -> list[dict[str, Any]]:
         """
         List all sessions.
