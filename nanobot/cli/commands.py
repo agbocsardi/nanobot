@@ -1108,9 +1108,21 @@ def _run_gateway(
             payload=CronPayload(kind="system_event"),
         ))
 
+    # The fork's WebUI turn lifecycle spans two buses: the agent loop publishes
+    # on the dedicated RuntimeEventBus, the bridge republishes those as
+    # AgentEvents on the MessageBus, and the turn coordinator turns them into
+    # the typed outbound frames the WebUI consumes (turn_end, goal_status,
+    # session/model updates). Neither half installs itself, so the gateway
+    # composes them here and keeps them alive for its lifetime.
+    from nanobot.webui.turn_lifecycle import attach_webui_turn_lifecycle
+
     async def run():
+        detach_webui_lifecycle = None
         try:
             await cron.start()
+            detach_webui_lifecycle = attach_webui_turn_lifecycle(
+                bus, runtime_events, session_manager
+            )
             # Watch the config file for changes. Only the active model preset
             # is hot-applied via build_config_change_handler; provider, channel,
             # cron, and workspace settings are constructed once at gateway
@@ -1140,6 +1152,8 @@ def _run_gateway(
             console.print("\n[red]Error: Gateway crashed unexpectedly[/red]")
             console.print(traceback.format_exc())
         finally:
+            if detach_webui_lifecycle is not None:
+                detach_webui_lifecycle()
             await agent.close_mcp()
             cron.stop()
             agent.stop()
