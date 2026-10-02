@@ -139,6 +139,26 @@ async def test_coordinator_accepts_fork_shaped_runtime(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_legacy_websocket_turns_do_not_emit_webui_frames(tmp_path) -> None:
+    """Legacy websocket: turns share the channel but must stay out of WebUI state."""
+    runtime_bus, bus = _wire(tmp_path)
+
+    legacy_ctx = RuntimeEventContext(
+        channel="websocket",
+        chat_id="legacy-1",
+        session_key="websocket:legacy-1",
+        metadata={},
+    )
+    await runtime_bus.publish(SessionTurnStarted(context=legacy_ctx))
+    await runtime_bus.publish(
+        TurnRunStatusChanged(context=legacy_ctx, status="running", started_at=1.0)
+    )
+    await runtime_bus.publish(TurnCompleted(context=legacy_ctx, latency_ms=9, runtime=None))
+
+    assert await _drain_outbound(bus) == []
+
+
+@pytest.mark.asyncio
 async def test_bridge_detach_stops_translation(tmp_path) -> None:
     runtime_bus, bus = _wire(tmp_path)
     # Re-attach to get the detach handle (the _wire attach is anonymous).

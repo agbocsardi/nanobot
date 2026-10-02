@@ -616,7 +616,11 @@ class WebuiTurnCoordinator:
 
     @staticmethod
     def _is_websocket_event(ctx: RuntimeEventContext) -> bool:
-        return ctx.channel == "websocket"
+        # Fork adaptation: one "websocket" channel serves both audiences in
+        # this fork. Only literal webui: session turns may drive WebUI wire
+        # state; legacy websocket: turns keep their existing dialect and must
+        # never mutate the WebUI turn registry or emit typed frames.
+        return ctx.channel == "websocket" and is_webui_session_key(ctx.session_key)
 
     async def _handle_user_input_accepted(self, event: UserInputAccepted) -> None:
         envelope = session_message_envelope(event.context.metadata)
@@ -771,7 +775,9 @@ class WebuiTurnCoordinator:
         failure_error_kind: str | None = None,
         failure_attempts: int | None = None,
     ) -> None:
-        if msg.channel != "websocket":
+        # Fork adaptation: only webui: turns produce typed turn_end frames;
+        # legacy websocket: sessions keep the fork delivery dialect.
+        if msg.channel != "websocket" or not is_webui_session_key(session_key):
             return
 
         session = self.sessions.get_or_create(session_key)
