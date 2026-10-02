@@ -54,6 +54,7 @@ dependencies = [
     "filelock>=3.25.2",
     "watchfiles>=1.1.1,<2.0.0",
     "pillow>=11.0.0,<13.0.0",
+    "packaging>=26.0,<27.0",
 ]
 
 [project.optional-dependencies]
