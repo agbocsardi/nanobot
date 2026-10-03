@@ -68,7 +68,6 @@ import {
   saveSecret,
 } from "@/lib/bootstrap";
 import { displayTitle, sortSessions } from "@/lib/chat-groups";
-import { deriveTitle } from "@/lib/format";
 import { NanobotClient } from "@/lib/nanobot-client";
 import { ThreadMessageCache } from "@/lib/thread-message-cache";
 import { FilePreviewStore } from "@/hooks/useFilePreviewState";
@@ -1704,7 +1703,7 @@ function Shell({
     try {
       const scope = workspaceScope ?? activeWorkspaceScope;
       const chatId = await createChat(scope, modelPreset);
-      const key = `websocket:${chatId}`;
+      const key = `webui:${chatId}`;
       pendingCreatedSessionKeyRef.current = key;
       navigate({
         view: "chat",
@@ -1811,7 +1810,7 @@ function Shell({
       );
       navigate({
         view: "chat",
-        activeKey: `websocket:${chatId}`,
+        activeKey: `webui:${chatId}`,
         settingsSection: "overview",
       });
       setMobileSidebarOpen(false);
@@ -2083,7 +2082,7 @@ function Shell({
     try {
       const scope = activeWorkspaceScope;
       const chatId = await createChat(scope);
-      const paneKey = `websocket:${chatId}`;
+      const paneKey = `webui:${chatId}`;
       pendingCreatedSessionKeyRef.current = paneKey;
       updateWorkbenchState((current) => addWorkbenchPane(current, activeKey, paneKey));
       navigate({
@@ -2452,9 +2451,7 @@ function Shell({
   }, []);
 
   const titleForSession = useCallback((session: ChatSummary) => (
-    sidebarState.title_overrides[session.key]
-    || session.title
-    || deriveTitle(session.preview, t("chat.newChat"))
+    displayTitle(session, sidebarState.title_overrides, t("chat.newChat"))
   ), [sidebarState.title_overrides, t]);
 
   const automaticSidebarSort = sidebarState.view.sort === "manual"

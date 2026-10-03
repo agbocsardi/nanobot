@@ -3388,6 +3388,19 @@ describe("ThreadComposer", () => {
     expect(screen.queryByText("follow-up for A")).not.toBeInTheDocument();
   });
 
+  it.each(["webui", "websocket"])("restores %s session references in queued guidance", (namespace) => {
+    const onSend = vi.fn();
+    const mention = { name: "other", title: "Other topic", session_key: `${namespace}:other` };
+    localStorage.setItem("nanobot.webui.composerQueuedGuidance.v1:chat-mentions", JSON.stringify([
+      { id: "queued", text: "Use @other", sessionMentions: [mention] },
+    ]));
+    render(<ThreadComposer onSend={onSend} isStreaming pendingQueueKey="chat-mentions" placeholder="Type your message..." />);
+    fireEvent.click(screen.getByRole("button", { name: "Send now" }));
+    expect(onSend).toHaveBeenCalledWith("Use @other", undefined, {
+      continueActiveTurn: true, sessionMentions: [mention],
+    });
+  });
+
   it("persists queued guidance per chat across remounts", async () => {
     const onSend = vi.fn();
     const { rerender, unmount } = render(

@@ -178,8 +178,8 @@ vi.mock("@/hooks/useSessions", async (importOriginal) => {
           const now = new Date().toISOString();
           setSessions((prev: ChatSummary[]) => [
             {
-              key: `websocket:${chatId}`,
-              channel: "websocket",
+              key: `webui:${chatId}`,
+              channel: "webui",
               chatId,
               createdAt: now,
               updatedAt: now,
@@ -191,7 +191,13 @@ vi.mock("@/hooks/useSessions", async (importOriginal) => {
           ]);
           return chatId;
         },
-        forkChat: async () => "fork-chat",
+        forkChat: async () => {
+          setSessions((prev: ChatSummary[]) => [{
+            key: "webui:fork-chat", channel: "webui", chatId: "fork-chat",
+            createdAt: null, updatedAt: null, title: "Fork", preview: "",
+          }, ...prev]);
+          return "fork-chat";
+        },
         getSessionAutomations: getSessionAutomationsSpy,
         deleteChat: async (key: string, options?: { deleteAutomations?: boolean }) => {
           if (options === undefined) await deleteChatSpy(key);
@@ -292,6 +298,7 @@ import {
 } from "@/lib/bootstrap";
 import App from "@/App";
 import { mockBrowserFocus } from "./browser-focus";
+import { canonicalThreadPayload } from "./thread-test-payload";
 
 describe("App layout", () => {
   let restoreBrowserFocus: (() => void) | undefined;
@@ -826,7 +833,7 @@ describe("App layout", () => {
 
     await waitFor(() => expect(connectSpy).toHaveBeenCalled());
     const firstMessage = "keep this first turn visible";
-    fireEvent.change(screen.getByRole("textbox", { name: "Message input" }), {
+    fireEvent.change(await screen.findByRole("textbox", { name: "Message input" }, { timeout: 10_000 }), {
       target: { value: firstMessage },
     });
     fireEvent.click(screen.getByRole("button", { name: "Send message" }));
@@ -834,10 +841,31 @@ describe("App layout", () => {
     await waitFor(() => expect(createChatSpy).toHaveBeenCalledTimes(1));
     await waitFor(() =>
       expect(window.location.hash).toBe(
-        `#/chat/${encodeURIComponent("websocket:chat-1")}`,
+        `#/chat/${encodeURIComponent("webui:chat-1")}`,
       ),
     );
     expect(await screen.findByText(firstMessage)).toBeInTheDocument();
+  });
+
+  it("navigates forks to the permanent WebUI namespace", async () => {
+    mockSessions = [{
+      key: "webui:source", channel: "webui", chatId: "source", title: "Source",
+      preview: "", createdAt: null, updatedAt: null,
+    }];
+    window.history.replaceState(null, "", "/#/chat/webui%3Asource");
+    vi.mocked(fetch).mockImplementation(async (input) => String(input).includes("/webui-thread")
+      ? Response.json(canonicalThreadPayload({ schemaVersion: 3, messages: [
+          { id: "u", role: "user", content: "Fork question", createdAt: 1 },
+          { id: "a", role: "assistant", content: "Fork answer", createdAt: 2 },
+        ] }))
+      : new Response(null, { status: 404 }));
+    render(<App />);
+    const answer = await screen.findByText("Fork answer");
+    const block = answer.closest<HTMLElement>("[data-thread-display-unit]")!;
+    fireEvent.click(within(block).getByRole("button", { name: "Message actions" }));
+    const menu = await screen.findByRole("dialog", { name: "Message actions" });
+    fireEvent.click(within(menu).getByRole("button", { name: "Fork" }));
+    await waitFor(() => expect(window.location.hash).toBe("#/chat/webui%3Afork-chat"));
   });
 
   it("creates a new temporary chat from the hero each time", async () => {
@@ -2630,7 +2658,7 @@ describe("App layout", () => {
       .map((button) => button.textContent?.trim())
       .filter(Boolean);
 
-    expect(labels).toEqual(["Alpha plan", "New topic", "Zulu work"]);
+    expect(labels).toEqual(["Alpha plan", "New topic · new", "Zulu work"]);
   });
 
   it("shows running and completed session indicators in the sidebar", async () => {
@@ -3582,13 +3610,13 @@ describe("App layout", () => {
 
     await waitFor(() => expect(grid.children).toHaveLength(2));
     expect(screen.getByRole("button", { name: "Pane layout" })).toBeInTheDocument();
-    expect(window.location.hash).toBe("#/chat/websocket%3Achat-pane");
+    expect(window.location.hash).toBe("#/chat/webui%3Achat-pane");
     expect(Array.from(grid.children).map((pane) => pane.getAttribute("aria-label")))
-      .toEqual(["Alpha", "New topic"]);
+      .toEqual(["Alpha", "New topic · chat-pane"]);
 
     const activeComposer = screen.getByTestId("active-pane-composer");
     const paneInput = within(activeComposer).getByRole("textbox", {
-      name: "Message New topic",
+      name: "Message New topic · chat-pane",
     });
     expect(paneInput).toHaveClass("min-h-[50px]");
     fireEvent.change(paneInput, { target: { value: "route this to the new pane" } });
@@ -3605,11 +3633,11 @@ describe("App layout", () => {
 
     const sidebar = screen.getByRole("navigation", { name: "Sidebar navigation" });
     const paneTopicButton = within(sidebar)
-      .getAllByRole("button", { name: "New topic" })
+      .getAllByRole("button", { name: "New topic · chat-pane" })
       .find((button) => button.closest("[data-sidebar-pane]"));
     expect(paneTopicButton).toBeDefined();
     expect(paneTopicButton?.closest("[data-sidebar-pane]"))
-      .toHaveAttribute("data-sidebar-pane", "websocket:chat-pane");
+      .toHaveAttribute("data-sidebar-pane", "webui:chat-pane");
     fireEvent.click(within(sidebar).getByRole("button", { name: "Beta" }));
     await waitFor(() => {
       const nextGrid = screen.getByTestId("pane-grid");
@@ -3622,7 +3650,7 @@ describe("App layout", () => {
     await waitFor(() => {
       const restoredGrid = screen.getByTestId("pane-grid");
       expect(Array.from(restoredGrid.children).map((pane) => pane.getAttribute("aria-label")))
-        .toEqual(["Alpha", "New topic"]);
+        .toEqual(["Alpha", "New topic · chat-pane"]);
       expect(restoredGrid).toHaveAttribute("data-layout", "rows");
     });
 
@@ -3644,7 +3672,7 @@ describe("App layout", () => {
       .toBeInTheDocument();
 
     fireEvent.pointerDown(within(sidebar).getByRole("button", {
-      name: "New topic pane actions",
+      name: "New topic · chat-pane pane actions",
     }), { button: 0, ctrlKey: false });
     fireEvent.click(screen.getByRole("menuitem", {
       name: "Remove",
@@ -3657,7 +3685,8 @@ describe("App layout", () => {
       .toBeInTheDocument();
     expect(within(researchGroup).getByRole("button", { name: "Alpha" }))
       .toBeInTheDocument();
-    expect(within(sidebar).getAllByRole("button", { name: "New topic" })).toHaveLength(2);
+    expect(within(sidebar).getByRole("button", { name: "New topic" })).toBeInTheDocument();
+    expect(within(sidebar).getByRole("button", { name: "New topic · chat-pane" })).toBeInTheDocument();
   });
 
   it("keeps a named group and its remaining pane active after deleting a pane", async () => {

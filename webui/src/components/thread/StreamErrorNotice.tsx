@@ -69,9 +69,16 @@ function resolveCopy(
         body: t("errors.workspaceScopeRejected.body"),
       };
     case "turn_rejected":
+      if (error.detail === "chat_id_unavailable") {
+        return {
+          title: t("errors.chatUnavailable.title"),
+          body: t("errors.chatUnavailable.body"),
+        };
+      }
       return {
-        title: t("errors.turnRejected.title"),
-        body: t("errors.turnRejected.body"),
+        title: t(error.turnId ? "errors.turnRejected.title" : "errors.requestRejected.title"),
+        body: [error.detail, error.reason].filter(Boolean).join(": ")
+          || t("errors.turnRejected.body"),
       };
     case "model_request_failed":
       return resolveModelRequestFailureCopy(error, t);

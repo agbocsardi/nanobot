@@ -450,7 +450,7 @@ function normalizeQueuedSessionMentions(value: unknown): SessionMention[] {
     const sessionKey = candidate.session_key?.trim().slice(0, 512);
     if (
       !name
-      || !sessionKey?.startsWith("websocket:")
+      || !sessionKey || !/^(webui|websocket):/.test(sessionKey)
       || !/^[\p{L}\p{N}_-]+$/u.test(name)
     ) return [];
     return [{

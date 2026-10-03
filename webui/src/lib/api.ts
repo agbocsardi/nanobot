@@ -205,7 +205,8 @@ export async function listSessions(
     undefined,
     API_READ_TIMEOUT_MS,
   );
-  return body.sessions.map((s) => {
+  // Legacy transport sessions cannot bind to the WebUI's chat-id fanout.
+  return body.sessions.filter((s) => !s.key.startsWith("websocket:")).map((s) => {
     const handle = normalizeSessionHandle(s.handle);
     return {
       key: s.key,

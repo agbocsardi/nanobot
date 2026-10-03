@@ -71,6 +71,29 @@ afterEach(() => {
 });
 
 describe("NanobotClient", () => {
+  it("surfaces attach and unscoped protocol refusals without rejecting unrelated pending sends", () => {
+    const client = new NanobotClient({
+      url: "ws://test", reconnect: false,
+      socketFactory: (url) => new FakeSocket(url) as unknown as WebSocket,
+    });
+    const onError = vi.fn();
+    const onChat = vi.fn();
+    client.onError(onError);
+    client.onChat("unavailable", onChat);
+    client.connect();
+    const socket = lastSocket();
+    socket.fakeOpen();
+    client.sendMessage("other", "pending", undefined, { turnId: "pending-turn" });
+    socket.fakeMessage({ event: "error", chat_id: "unavailable", detail: "chat_id_unavailable" });
+    expect(onError).toHaveBeenLastCalledWith({ kind: "turn_rejected", chatId: "unavailable", detail: "chat_id_unavailable", reason: undefined });
+    expect(onChat).toHaveBeenCalledWith({ event: "error", chat_id: "unavailable", detail: "chat_id_unavailable" });
+    socket.fakeMessage({ event: "error", detail: "future_refusal", reason: "explanation" });
+    expect(onError).toHaveBeenLastCalledWith({ kind: "turn_rejected", chatId: undefined, detail: "future_refusal", reason: "explanation" });
+    expect(client.hasUnsettledRun("other")).toBe(true);
+    expect(client.getRunTurnId("other")).toBe("pending-turn");
+    client.close();
+  });
+
   it("bounds regular replay tails but retains temporary events until discard", async () => {
     const client = new NanobotClient({
       url: "ws://test", reconnect: false,

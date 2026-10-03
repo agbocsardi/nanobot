@@ -298,14 +298,14 @@ export function useSessions(): {
     modelPreset?: string | null,
   ): Promise<string> => {
     const chatId = await client.newChat(CHAT_CREATE_TIMEOUT_MS, workspaceScope);
-    const key = `websocket:${chatId}`;
+    const key = `webui:${chatId}`;
     optimisticKeysRef.current.add(key);
     // Optimistic insert; a subsequent refresh will replace it with the
     // authoritative row once the server persists the session.
     setSessions((prev) => [
       {
         key,
-        channel: "websocket",
+        channel: "webui",
         chatId,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
@@ -330,12 +330,12 @@ export function useSessions(): {
       title,
       CHAT_CREATE_TIMEOUT_MS,
     );
-    const key = `websocket:${chatId}`;
+    const key = `webui:${chatId}`;
     optimisticKeysRef.current.add(key);
     setSessions((prev) => [
       {
         key,
-        channel: "websocket",
+        channel: "webui",
         chatId,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),

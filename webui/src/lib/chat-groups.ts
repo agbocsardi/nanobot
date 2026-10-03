@@ -223,7 +223,7 @@ export function displayTitle(
   return (
     titleOverrides[session.key]?.trim()
     || session.title?.trim()
-    || deriveTitle(session.preview, fallbackTitle)
+    || deriveTitle(session.preview, `${fallbackTitle} · ${session.key.slice(session.key.indexOf(":") + 1)}`)
   );
 }
 

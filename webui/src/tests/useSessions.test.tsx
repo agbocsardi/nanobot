@@ -76,14 +76,14 @@ describe("useSessions", () => {
   it("shows tab-cached sessions while revalidating and removes server-deleted rows", async () => {
     activateReloadCache("ws://localhost:8765/");
     writeReloadCache("sessions", [{
-      key: "websocket:cached", channel: "websocket", chatId: "cached", preview: "Saved answer",
+      key: "webui:cached", channel: "webui", chatId: "cached", preview: "Saved answer",
       createdAt: null, updatedAt: null,
     }]);
     let finish!: (rows: Awaited<ReturnType<typeof api.listSessions>>) => void;
     vi.mocked(api.listSessions).mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
     const { result, unmount } = renderHook(() => useSessions(), { wrapper: wrap(fakeClient()) });
     try {
-      expect(result.current.sessions[0]?.key).toBe("websocket:cached");
+      expect(result.current.sessions[0]?.key).toBe("webui:cached");
       expect(result.current.loading).toBe(true);
       await act(async () => finish([]));
       expect(result.current.sessions).toEqual([]);
@@ -180,11 +180,11 @@ describe("useSessions", () => {
     await act(async () => {
       await result.current.createChat();
     });
-    expect(result.current.sessions.map((s) => s.key)).toEqual(["websocket:chat-empty"]);
+    expect(result.current.sessions.map((s) => s.key)).toEqual(["webui:chat-empty"]);
 
     let deleteResult: Awaited<ReturnType<typeof result.current.deleteChat>> | undefined;
     await act(async () => {
-      deleteResult = await result.current.deleteChat("websocket:chat-empty");
+      deleteResult = await result.current.deleteChat("webui:chat-empty");
     });
 
     expect(deleteResult?.deleted).toBe(true);
@@ -212,11 +212,11 @@ describe("useSessions", () => {
 
     let deleteResult: Awaited<ReturnType<typeof result.current.deleteChat>> | undefined;
     await act(async () => {
-      deleteResult = await result.current.deleteChat("websocket:chat-empty");
+      deleteResult = await result.current.deleteChat("webui:chat-empty");
     });
 
     expect(deleteResult?.blocked_by_automations).toBe(true);
-    expect(result.current.sessions.map((s) => s.key)).toEqual(["websocket:chat-empty"]);
+    expect(result.current.sessions.map((s) => s.key)).toEqual(["webui:chat-empty"]);
   });
 
   it("keeps a session when delete is blocked by bound automations", async () => {
@@ -366,8 +366,8 @@ describe("useSessions", () => {
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([
         {
-          key: "websocket:chat-new",
-          channel: "websocket",
+          key: "webui:chat-new",
+          channel: "webui",
           chatId: "chat-new",
           createdAt: "2026-05-20T10:00:00Z",
           updatedAt: "2026-05-20T10:01:00Z",
@@ -390,22 +390,33 @@ describe("useSessions", () => {
     });
 
     expect(client.newChat).toHaveBeenCalledWith(60_000, undefined);
-    expect(result.current.sessions.map((s) => s.key)).toEqual(["websocket:chat-new"]);
+    expect(result.current.sessions.map((s) => s.key)).toEqual(["webui:chat-new"]);
 
     await act(async () => {
       await result.current.refresh();
     });
 
-    expect(result.current.sessions.map((s) => s.key)).toEqual(["websocket:chat-new"]);
+    expect(result.current.sessions.map((s) => s.key)).toEqual(["webui:chat-new"]);
     expect(result.current.sessions[0]?.preview).toBe("");
 
     await act(async () => {
       await result.current.refresh();
     });
 
-    expect(result.current.sessions.map((s) => s.key)).toEqual(["websocket:chat-new"]);
+    expect(result.current.sessions.map((s) => s.key)).toEqual(["webui:chat-new"]);
     expect(result.current.sessions[0]?.preview).toBe("First message");
     expect(result.current.sessions[0]?.title).toBe("Generated title");
+  });
+
+  it("constructs a permanent WebUI key when forking a chat", async () => {
+    vi.mocked(api.listSessions).mockResolvedValue([]);
+    const client = fakeClient();
+    client.forkChat.mockResolvedValue("forked");
+    const { result } = renderHook(() => useSessions(), { wrapper: wrap(client) });
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    await act(async () => { await result.current.forkChat("source", 2, "Fork title"); });
+    expect(client.forkChat).toHaveBeenCalledWith("source", 2, "Fork title", 60_000);
+    expect(result.current.sessions[0]).toMatchObject({ key: "webui:forked", channel: "webui", chatId: "forked" });
   });
 
   it("stores optimistic workspace scope when creating a chat", async () => {

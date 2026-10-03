@@ -202,6 +202,44 @@ async function flushStreamFrame() {
 }
 
 describe("useNanobotStream", () => {
+  it.each([false, true])("surfaces an unavailable chat (dispatch=%s) until attach succeeds or the chat changes", (dispatch) => {
+    const fake = fakeClient();
+    const { result, rerender } = renderHook(
+      ({ chatId }) => useNanobotStream(chatId, EMPTY_MESSAGES),
+      { wrapper: wrap(fake.client), initialProps: { chatId: "unavailable" } },
+    );
+    let turnId: string | undefined;
+    if (dispatch) act(() => { turnId = result.current.send("keep this message")?.turnId; });
+    act(() => fake.emit("unavailable", {
+      event: "error", chat_id: "unavailable", detail: "chat_id_unavailable", turn_id: turnId,
+    }));
+    expect(result.current.streamError).toMatchObject({ kind: "turn_rejected", detail: "chat_id_unavailable" });
+    expect(result.current.chatUnavailable).toBe(true);
+    if (dispatch) expect(result.current.messages[0]).toMatchObject({ content: "keep this message", deliveryStatus: "failed" });
+    act(() => result.current.dismissStreamError());
+    expect(result.current.chatUnavailable).toBe(true);
+    act(() => { expect(result.current.send("must not send")).toBeNull(); });
+    expect(fake.client.sendMessage).toHaveBeenCalledTimes(dispatch ? 1 : 0);
+    act(() => fake.emit("unavailable", { event: "attached", chat_id: "unavailable" }));
+    expect(result.current.chatUnavailable).toBe(false);
+    act(() => fake.emitError({ kind: "turn_rejected", chatId: "other", detail: "chat_id_unavailable" }));
+    expect(result.current.chatUnavailable).toBe(false);
+    act(() => fake.emit("unavailable", { event: "error", chat_id: "unavailable", detail: "chat_id_unavailable" }));
+    rerender({ chatId: "another" });
+    expect(result.current.streamError).toBeNull();
+    expect(result.current.chatUnavailable).toBe(false);
+  });
+
+  it("surfaces unknown details without rolling back an uncorrelated turn", () => {
+    const fake = fakeClient();
+    const { result } = renderHook(() => useNanobotStream("chat", EMPTY_MESSAGES), { wrapper: wrap(fake.client) });
+    act(() => { result.current.send("pending"); });
+    act(() => fake.emit("chat", { event: "error", chat_id: "chat", detail: "future_refusal", reason: "explanation" }));
+    expect(result.current.streamError).toMatchObject({ detail: "future_refusal", reason: "explanation" });
+    expect(result.current.messages[0].deliveryStatus).toBe("sending");
+    expect(result.current.chatUnavailable).toBe(false);
+  });
+
   it("keeps invocation snapshots across streaming, recovery segments, completion and reload", async () => {
     const fake = fakeClient();
     const a = { provider: "openai_codex", model: "gpt", preset: "writer", fallback: false };

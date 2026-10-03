@@ -2401,6 +2401,13 @@
       "title": "Workspace was not changed",
       "body": "The gateway rejected this project or access mode. Choose an existing project or a different access mode, then try again."
     },
+    "chatUnavailable": {
+      "title": "Chat unavailable",
+      "body": "This chat cannot be opened here. Start a new topic or select another chat."
+    },
+    "requestRejected": {
+      "title": "Chat request refused"
+    },
     "turnRejected": {
       "title": "Message was not sent",
       "body": "The gateway rejected this message. Review its text or attachments, then try again."

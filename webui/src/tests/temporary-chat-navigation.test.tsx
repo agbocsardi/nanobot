@@ -107,7 +107,7 @@ describe("temporary chat navigation", () => {
       const path = String(input);
       if (path === "/api/sessions") {
         return Response.json({ sessions: ["regular", ...(groupedTopics ? ["child"] : [])].map((id) => ({
-          key: `websocket:${id}`,
+          key: `webui:${id}`,
           title: id === "regular" ? "Regular topic" : "Second pane",
           created_at: "2026-09-01T00:00:00Z",
           updated_at: "2026-09-01T00:00:00Z",
@@ -115,9 +115,9 @@ describe("temporary chat navigation", () => {
       }
       if (path === "/api/webui/sidebar-state" && groupedTopics) {
         return Response.json({ workbench: { version: 1, tabs: {
-          "tab:websocket:regular": {
+          "tab:webui:regular": {
             explicit: true, title: "Regular topic",
-            paneKeys: ["websocket:regular", "websocket:child"], layout: "columns",
+            paneKeys: ["webui:regular", "webui:child"], layout: "columns",
           },
         } } });
       }
@@ -150,12 +150,12 @@ describe("temporary chat navigation", () => {
   it.each(["settings", "apps", "automations", "skills", "channels"])(
     "opens %s directly without mounting chat or retaining a chat query",
     async (view) => {
-      window.history.replaceState(null, "", `/#/${view}?chat=websocket%3Aregular`);
+      window.history.replaceState(null, "", `/#/${view}?chat=webui%3Aregular`);
       render(<App />);
       await screen.findByRole("button", { name: "Back to chat" });
       act(() => TestSocket.current.open());
       await waitFor(() => expect(window.location.hash).toBe(`#/${view}`));
-      expect(window.history.state.nanobotReturnChat.key).toBe("websocket:regular");
+      expect(window.history.state.nanobotReturnChat.key).toBe("webui:regular");
       expect(screen.queryByTestId("thread-message-region")).not.toBeInTheDocument();
       const requests = vi.mocked(fetch).mock.calls.map(([url]) => String(url));
       expect(requests.filter((url) => url.includes("/webui-thread") || url === "/api/commands")).toEqual([]);
@@ -177,7 +177,7 @@ describe("temporary chat navigation", () => {
     act(() => TestSocket.current.open());
     expect(vi.mocked(fetch).mock.calls.filter(([url]) => String(url).includes("/webui-thread"))).toEqual([]);
     fireEvent.click(screen.getByRole("button", { name: "Back to chat" }));
-    await waitFor(() => expect(window.location.hash).toBe("#/chat/websocket%3Aregular"));
+    await waitFor(() => expect(window.location.hash).toBe("#/chat/webui%3Aregular"));
     await waitFor(() => expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).includes("/webui-thread"))).toBe(true));
   });
 
@@ -402,10 +402,10 @@ describe("temporary chat navigation", () => {
     expect(store.get(`websocket:${chatId}`).activeId).toBe("file:notes.txt");
     await selectTopic("Close temporary chat: Show example files");
     expect(store.get(`websocket:${chatId}`).tabs).toEqual([]);
-    act(() => store.open("websocket:regular", "file", "notes.txt"));
+    act(() => store.open("webui:regular", "file", "notes.txt"));
     vi.useFakeTimers();
     act(() => TestSocket.current.close());
-    expect(store.get("websocket:regular").tabs).toEqual([]);
+    expect(store.get("webui:regular").tabs).toEqual([]);
   });
 
   it("keeps messages when navigating to a regular workbench and back", async () => {
@@ -415,7 +415,7 @@ describe("temporary chat navigation", () => {
     const chatId = await startTemporaryChat("Count from one to three");
 
     await selectTopic("Regular topic");
-    await waitFor(() => expect(window.location.hash).toBe("#/chat/websocket%3Aregular"));
+    await waitFor(() => expect(window.location.hash).toBe("#/chat/webui%3Aregular"));
     await selectTopic("Count from one to three");
     await waitFor(() => expect(window.location.hash).toBe(`#/temporary/${chatId}`));
 
@@ -471,7 +471,7 @@ describe("temporary chat navigation", () => {
     act(() => TestSocket.current.open());
     await startTemporaryChat("Count from one to three");
     await selectTopic("Second pane");
-    expect(screen.queryByTestId("workbench-pane-websocket:regular")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("workbench-pane-webui:regular")).not.toBeInTheDocument();
     await selectTopic("Count from one to three");
     expect(within(screen.getByTestId("thread-message-region"))
       .getByText("Count from one to three")).toBeInTheDocument();
@@ -514,7 +514,7 @@ describe("temporary chat navigation", () => {
         const sidebar = screen.getByRole("navigation", { name: "Sidebar navigation" });
         fireEvent.click(within(sidebar).getByRole("button", { name: "Second pane" }));
       });
-      expect(screen.queryByTestId("workbench-pane-websocket:regular")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("workbench-pane-webui:regular")).not.toBeInTheDocument();
       await selectTopic("Count from one to three");
       const region = screen.getByTestId("thread-message-region");
       expect(region.textContent).toContain("one two three");

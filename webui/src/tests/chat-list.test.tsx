@@ -66,6 +66,23 @@ describe("ChatList", () => {
     expect(onTogglePin).toHaveBeenCalledWith("websocket:review");
   });
 
+  it("distinguishes untitled WebUI rows while retaining titles and useful previews", () => {
+    render(<ChatList
+      sessions={[
+        session({ key: "webui:first", chatId: "first", channel: "webui", title: "  " }),
+        session({ key: "webui:second", chatId: "second", channel: "webui", preview: "/new" }),
+        session({ key: "webui:preview", chatId: "preview", channel: "webui", preview: "Useful first message" }),
+        session({ key: "webui:titled", chatId: "titled", channel: "webui", title: "Saved title" }),
+      ]}
+      activeKey={null} onSelect={vi.fn()} onRequestDelete={vi.fn()} onTogglePin={vi.fn()}
+      onRequestRename={vi.fn()} onToggleArchive={vi.fn()}
+    />);
+    expect(screen.getByRole("button", { name: "New topic · first" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "New topic · second" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Useful first message" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Saved title" })).toBeInTheDocument();
+  });
+
   it("renders conversation rows without a session handle chip", () => {
     render(
       <ChatList

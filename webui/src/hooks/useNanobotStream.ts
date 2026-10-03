@@ -164,6 +164,8 @@ export function useNanobotStream(
   /** Latest transport-level fault raised since the last ``dismissStreamError``.
    * ``null`` when there is nothing to show. */
   streamError: StreamError | null;
+  /** Binding refusal persists independently of the dismissible error banner. */
+  chatUnavailable: boolean;
   /** Clear the current ``streamError`` (e.g. after the user dismisses the
    * notification or starts a fresh action). */
   dismissStreamError: () => void;
@@ -195,6 +197,7 @@ export function useNanobotStream(
   const [goalState, setGoalState] = useState<GoalStateWsPayload | undefined>(undefined);
   const [recoveryState, setRecoveryState] = useState<RecoveryState | null>(null);
   const [streamError, setStreamError] = useState<StreamError | null>(null);
+  const [chatUnavailable, setChatUnavailable] = useState(false);
   const projectionRef = useRef<ThreadProjectionState>(
     createThreadProjectionState(initialMessages),
   );
@@ -250,6 +253,9 @@ export function useNanobotStream(
     // still be shown in the mounted thread, but cannot roll back any turn.
     if (!chatId || (err.chatId && err.chatId !== chatId)) return;
     setStreamError(err);
+    if (err.kind === "turn_rejected" && err.detail === "chat_id_unavailable" && err.chatId === chatId) {
+      setChatUnavailable(true);
+    }
     if (err.kind === "model_request_failed") return;
     if (!err.turnId) return;
 
@@ -522,6 +528,7 @@ export function useNanobotStream(
       || restoredRunStartedAt !== null,
     );
     setStreamError(null);
+    setChatUnavailable(false);
     setRunStartedAt(restoredRunStartedAt);
     setRetryStatus(null);
     setGoalState(chatId ? client.getGoalState(chatId) : undefined);
@@ -573,7 +580,7 @@ export function useNanobotStream(
             chatId,
             turnId: ev.turn_id,
           });
-        } else if (ev.turn_id) {
+        } else {
           applyStreamError({
             kind: "turn_rejected",
             detail: ev.detail,
@@ -861,6 +868,9 @@ export function useNanobotStream(
       }
 
       if (ev.event === "attached") {
+        setChatUnavailable(false);
+        setStreamError((current) => current?.kind === "turn_rejected"
+          && current.detail === "chat_id_unavailable" ? null : current);
         setRecoveryState(ev.recovery_state ?? null);
         if (ev.recovery_state?.status === "resuming") {
           setRunStartedAt((current) => current ?? Date.now() / 1000);
@@ -927,7 +937,7 @@ export function useNanobotStream(
 
   const send = useCallback(
     (content: string, images?: SendAttachment[], options?: SendOptions) => {
-      if (!chatId) return null;
+      if (!chatId || chatUnavailable) return null;
       const hasAttachments = !!images && images.length > 0;
       // Text is optional when files are attached — the agent will still see
       // them via ``media`` paths.
@@ -996,7 +1006,7 @@ export function useNanobotStream(
       client.sendMessage(chatId, outboundContent, wireMedia, clientOptions);
       return { turnId, userMessageId, sideChannel };
     },
-    [chatId, clearActivitySegment, client, flushPendingStreamEvents, setMessages],
+    [chatId, chatUnavailable, clearActivitySegment, client, flushPendingStreamEvents, setMessages],
   );
 
   const stop = useCallback(() => {
@@ -1061,6 +1071,7 @@ export function useNanobotStream(
     reconcileTurnComplete,
     setMessages,
     streamError,
+    chatUnavailable,
     dismissStreamError,
   };
 }
