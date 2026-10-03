@@ -1922,6 +1922,7 @@ export function ThreadComposer({
 
   const sendQueuedPrompt = useCallback(
     (prompt: QueuedPrompt) => {
+      if (interactionDisabled) return;
       secondEnterPromptIdRef.current = null;
       const text = prompt.text.trim();
       const queuedImages = queuedImagesToSendImages(prompt.images);
@@ -1944,11 +1945,11 @@ export function ThreadComposer({
       }
       requestAnimationFrame(() => textareaRef.current?.focus());
     },
-    [isStreaming, onSend],
+    [interactionDisabled, isStreaming, onSend],
   );
 
   const sendNextQueuedPrompt = useCallback(() => {
-    if (queuedPrompts.length === 0) return;
+    if (interactionDisabled || queuedPrompts.length === 0) return;
     const nextPrompt = queuedPrompts.find((prompt) => prompt.text.trim());
     if (!nextPrompt) {
       setQueuedPrompts([]);
@@ -1971,7 +1972,7 @@ export function ThreadComposer({
     else if (options) onSend(nextPrompt.text.trim(), undefined, options);
     else onSend(nextPrompt.text.trim());
     requestAnimationFrame(() => textareaRef.current?.focus());
-  }, [onSend, queuedPrompts]);
+  }, [interactionDisabled, onSend, queuedPrompts]);
 
   useEffect(() => {
     const previous = previousQueueRunRef.current;
@@ -2410,6 +2411,7 @@ export function ThreadComposer({
       >
         {queuedPrompts.length > 0 ? (
           <QueuedPromptStack
+            sendDisabled={interactionDisabled}
             prompts={queuedPrompts}
             isHero={isHero}
             label={t("thread.composer.queued.label")}
@@ -2719,6 +2721,7 @@ export function ThreadComposer({
 
 function QueuedPromptStack({
   prompts,
+  sendDisabled,
   isHero,
   label,
   guideLabel,
@@ -2733,6 +2736,7 @@ function QueuedPromptStack({
   onDrop,
 }: {
   prompts: QueuedPrompt[];
+  sendDisabled: boolean;
   isHero: boolean;
   label: string;
   guideLabel: string;
@@ -2773,6 +2777,7 @@ function QueuedPromptStack({
           <QueuedPromptRow
             key={prompt.id}
             prompt={prompt}
+            sendDisabled={sendDisabled}
             isHero={isHero}
             guideLabel={guideLabel}
             deleteLabel={deleteLabel}
@@ -2793,6 +2798,7 @@ function QueuedPromptStack({
 
 function QueuedPromptRow({
   prompt,
+  sendDisabled,
   isHero,
   guideLabel,
   deleteLabel,
@@ -2806,6 +2812,7 @@ function QueuedPromptRow({
   onDrop,
 }: {
   prompt: QueuedPrompt;
+  sendDisabled: boolean;
   isHero: boolean;
   guideLabel: string;
   deleteLabel: string;
@@ -2879,6 +2886,7 @@ function QueuedPromptRow({
         size="sm"
         className="h-7 shrink-0 rounded-full px-2 text-[11.5px] font-medium text-muted-foreground hover:bg-muted/70 hover:text-foreground dark:hover:bg-white/[0.07]"
         onClick={() => onGuide(prompt)}
+        disabled={sendDisabled}
       >
         <CornerDownRight className="mr-1 h-3 w-3" aria-hidden />
         {guideLabel}
