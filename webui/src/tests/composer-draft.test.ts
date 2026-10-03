@@ -26,6 +26,15 @@ describe("composer draft storage", () => {
     expect(localStorage.getItem(storageKey)).not.toContain("files");
   });
 
+  it("retains permanent WebUI mentions without dropping legacy references", () => {
+    const mixed = { ...draft, sessionMentions: [
+      ...draft.sessionMentions,
+      { name: "current", title: "Current topic", session_key: "webui:current" },
+    ] };
+    new ComposerDraftStore().set("webui:draft", mixed, true);
+    expect(new ComposerDraftStore().get("webui:draft", true)?.sessionMentions).toEqual(mixed.sessionMentions);
+  });
+
   it("keeps the identity of an unchanged restored draft but advances it for edits", () => {
     const store = new ComposerDraftStore();
     store.set(key, draft, true);

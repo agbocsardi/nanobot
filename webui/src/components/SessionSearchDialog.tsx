@@ -8,7 +8,8 @@ import {
   DialogDescription,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { deriveTitle, visibleSessionPreview } from "@/lib/format";
+import { visibleSessionPreview } from "@/lib/format";
+import { displayTitle } from "@/lib/chat-groups";
 import { cn } from "@/lib/utils";
 import type { ChatSummary } from "@/lib/types";
 
@@ -44,9 +45,9 @@ export function SessionSearchDialog({
   const normalizedQuery = query.trim().toLowerCase();
   const searchableSessions = useMemo(() => sessions.map((session) => ({
     session,
-    text: [titleOverrides[session.key], session.title, visibleSessionPreview(session.preview)]
+    text: [displayTitle(session, titleOverrides, t("chat.newChat")), visibleSessionPreview(session.preview)]
       .filter(Boolean).join(" ").toLowerCase(),
-  })), [sessions, titleOverrides]);
+  })), [sessions, titleOverrides, t]);
   const sessionResults = useMemo(() => {
     if (!open) return [];
     if (!normalizedQuery) return sessions;
@@ -187,9 +188,7 @@ export function SessionSearchDialog({
                 <li aria-hidden style={{ height: windowStart * rowHeight }} />
                 {sessionResults.slice(windowStart, windowEnd).map((session, offset) => {
                   const index = windowStart + offset;
-                  const title = titleOverrides[session.key]?.trim() ||
-                    session.title?.trim() ||
-                    deriveTitle(session.preview, t("chat.newChat"));
+                  const title = displayTitle(session, titleOverrides, t("chat.newChat"));
                   const preview = visibleSessionPreview(session.preview);
                   const showPreview =
                     preview.length > 0 &&

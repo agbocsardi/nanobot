@@ -52,10 +52,12 @@ describe("tab reload cache", () => {
     writeReloadCache("thread", { key: "large", body: "x".repeat(600_000) });
     expect(sessionStorage.getItem("nanobot.reload.v1.thread")).toBeNull();
     writeReloadCache("sessions", [{ key: "bad" }, {
-      key: "websocket:a", channel: "websocket", chatId: "a", preview: "Answer", title: "Topic",
+      key: "websocket:legacy", channel: "websocket", chatId: "legacy", preview: "Legacy",
+    }, {
+      key: "webui:a", channel: "webui", chatId: "a", preview: "Answer", title: "Topic",
     }]);
     expect(readReloadSessions()).toEqual([{
-      key: "websocket:a", channel: "websocket", chatId: "a", preview: "Answer", title: "Topic",
+      key: "webui:a", channel: "webui", chatId: "a", preview: "Answer", title: "Topic",
       createdAt: null, updatedAt: null,
     }]);
   });

@@ -3031,6 +3031,25 @@ describe("ThreadComposer", () => {
     expect(screen.queryByText("guide this one now")).not.toBeInTheDocument();
   });
 
+  it("guards the queued second-Enter shortcut while disabled and resumes after re-enabling", () => {
+    const onSend = vi.fn();
+    const { rerender } = render(<ThreadComposer onSend={onSend} isStreaming />);
+    const input = screen.getByLabelText("Message input");
+    fireEvent.change(input, { target: { value: "keep queued guidance" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    rerender(<ThreadComposer onSend={onSend} isStreaming disabled />);
+    // Guard the handler as well as the native disabled controls.
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onSend).not.toHaveBeenCalled();
+    expect(screen.getByText("keep queued guidance")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Send now" })).toBeDisabled();
+    rerender(<ThreadComposer onSend={onSend} isStreaming />);
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onSend).toHaveBeenCalledOnce();
+    expect(onSend).toHaveBeenCalledWith("keep queued guidance", undefined, { continueActiveTurn: true });
+    expect(screen.queryByRole("group", { name: "Waiting to send" })).not.toBeInTheDocument();
+  });
+
   it("keeps queued guidance attached to the composer and sends it one item at a time", async () => {
     const onSend = vi.fn();
     const { rerender } = render(
@@ -3386,6 +3405,19 @@ describe("ThreadComposer", () => {
     expect(sendA).toHaveBeenCalledWith("follow-up for A");
     expect(sendB).not.toHaveBeenCalled();
     expect(screen.queryByText("follow-up for A")).not.toBeInTheDocument();
+  });
+
+  it.each(["webui", "websocket"])("restores %s session references in queued guidance", (namespace) => {
+    const onSend = vi.fn();
+    const mention = { name: "other", title: "Other topic", session_key: `${namespace}:other` };
+    localStorage.setItem("nanobot.webui.composerQueuedGuidance.v1:chat-mentions", JSON.stringify([
+      { id: "queued", text: "Use @other", sessionMentions: [mention] },
+    ]));
+    render(<ThreadComposer onSend={onSend} isStreaming pendingQueueKey="chat-mentions" placeholder="Type your message..." />);
+    fireEvent.click(screen.getByRole("button", { name: "Send now" }));
+    expect(onSend).toHaveBeenCalledWith("Use @other", undefined, {
+      continueActiveTurn: true, sessionMentions: [mention],
+    });
   });
 
   it("persists queued guidance per chat across remounts", async () => {

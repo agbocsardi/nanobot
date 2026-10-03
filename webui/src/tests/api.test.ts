@@ -1219,13 +1219,14 @@ describe("webui API helpers", () => {
     );
   });
 
-  it("maps generated session titles from the sessions list", async () => {
+  it("maps WebUI session titles and hides legacy websocket sessions", async () => {
     vi.mocked(fetch).mockResolvedValueOnce({
       ok: true,
       json: async () => ({
         sessions: [
+          { key: "websocket:legacy", created_at: null, updated_at: null, title: "Legacy" },
           {
-            key: "websocket:chat-1",
+            key: "webui:chat-1",
             created_at: "2026-05-01T10:00:00",
             updated_at: "2026-05-01T10:01:00",
             title: "优化 WebUI 标题",
@@ -1242,7 +1243,8 @@ describe("webui API helpers", () => {
 
     await expect(listSessions("tok")).resolves.toMatchObject([
       {
-        key: "websocket:chat-1",
+        key: "webui:chat-1",
+        channel: "webui",
         title: "优化 WebUI 标题",
         preview: "",
         modelPreset: "fast",

@@ -98,8 +98,8 @@ export type StreamError =
       kind: "turn_rejected";
       detail?: string;
       reason?: string;
-      chatId: string;
-      turnId: string;
+      chatId?: string;
+      turnId?: string;
     }
   | {
       kind: "model_request_failed";
@@ -1221,6 +1221,15 @@ export class NanobotClient {
           turnId,
         });
       }
+    } else if (parsed.event === "error" && parsed.detail !== "workspace_scope_rejected") {
+      // Attach and other protocol refusals have no turn to roll back, but must
+      // remain visible even when the gateway cannot correlate them to a chat.
+      this.emitError({
+        kind: "turn_rejected",
+        detail: parsed.detail,
+        reason: parsed.reason,
+        chatId: correlatedChatId,
+      });
     } else if (parsed.event !== "error" && correlatedChatId && turnId) {
       // Lifecycle traffic is also an implicit acceptance signal for clients
       // connected to an older gateway that doesn't emit message_accepted.

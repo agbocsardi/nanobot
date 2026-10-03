@@ -4483,6 +4483,111 @@ describe("ThreadShell", () => {
     );
   });
 
+  it.each([false, true])("preserves queued guidance after a chat refusal (correlated=%s) and sends it only after recovery", async (correlated) => {
+    const client = makeClient();
+    render(wrap(client, <ThreadShell
+      session={{ ...session("unavailable-queue"), key: "webui:unavailable-queue", channel: "webui" }}
+      title="Unavailable queue" onToggleSidebar={() => {}} onGoHome={() => {}} onNewChat={() => {}}
+    />));
+    const input = screen.getByLabelText("Message input");
+    fireEvent.change(input, { target: { value: "first refused message" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(client.sendMessage).toHaveBeenCalledTimes(1));
+    const turnId = client.sendMessage.mock.calls[0][3]?.turnId;
+    for (const text of ["queued guidance to preserve", "second queued guidance"]) {
+      fireEvent.change(input, { target: { value: text } });
+      fireEvent.keyDown(input, { key: "Enter" });
+    }
+    act(() => client._emitChat("unavailable-queue", {
+      event: "error", chat_id: "unavailable-queue", detail: "chat_id_unavailable", turn_id: correlated ? turnId : undefined,
+    }));
+    expect(input).toBeDisabled();
+    expect(client.sendMessage).toHaveBeenCalledTimes(1);
+    const queue = screen.getByRole("group", { name: "Waiting to send" });
+    expect(within(queue).getByText("queued guidance to preserve")).toBeInTheDocument();
+    expect(within(queue).getByText("second queued guidance")).toBeInTheDocument();
+    expect(within(queue).getAllByRole("button", { name: "Send now" })).toHaveLength(2);
+    for (const button of within(queue).getAllByRole("button", { name: "Send now" })) {
+      expect(button).toBeDisabled();
+      fireEvent.click(button);
+    }
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    expect(client.sendMessage).toHaveBeenCalledTimes(1);
+    expect(localStorage.getItem("nanobot.webui.composerQueuedGuidance.v1:unavailable-queue"))
+      .toContain("queued guidance to preserve");
+    act(() => client._emitChat("unavailable-queue", { event: "attached", chat_id: "unavailable-queue" }));
+    expect(input).not.toBeDisabled();
+    expect(client.sendMessage).toHaveBeenCalledTimes(1);
+    fireEvent.click(within(queue).getAllByRole("button", { name: "Send now" })[0]);
+    await waitFor(() => expect(client.sendMessage).toHaveBeenCalledTimes(2));
+    expect(client.sendMessage.mock.calls[1][1]).toBe("queued guidance to preserve");
+    expect(within(queue).queryByText("queued guidance to preserve")).not.toBeInTheDocument();
+    expect(within(queue).getByText("second queued guidance")).toBeInTheDocument();
+    act(() => client._emitChat("unavailable-queue", {
+      event: "turn_end", chat_id: "unavailable-queue", turn_id: client.sendMessage.mock.calls[1][3]?.turnId,
+    }));
+    await waitFor(() => expect(client.sendMessage).toHaveBeenCalledTimes(3));
+    expect(client.sendMessage.mock.calls[2][1]).toBe("second queued guidance");
+    expect(screen.queryByRole("group", { name: "Waiting to send" })).not.toBeInTheDocument();
+  });
+
+  it.each([false, true])("explains a disabled composer after a chat refusal (dispatch=%s), even after dismissal", async (dispatch) => {
+    const client = makeClient();
+    render(wrap(client, <ThreadShell
+      session={{ ...session("unavailable"), key: "webui:unavailable", channel: "webui" }}
+      title="Unavailable" onToggleSidebar={() => {}} onGoHome={() => {}} onNewChat={() => {}}
+    />));
+    const input = screen.getByLabelText("Message input");
+    let turnId: string | undefined;
+    if (dispatch) {
+      fireEvent.change(input, { target: { value: "refused message" } });
+      fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+      await waitFor(() => expect(client.sendMessage).toHaveBeenCalledTimes(1));
+      turnId = client.sendMessage.mock.calls[0][3]?.turnId;
+    }
+    act(() => client._emitChat("unavailable", {
+      event: "error", chat_id: "unavailable", detail: "chat_id_unavailable", turn_id: turnId,
+    }));
+    expect((await screen.findByText("Chat unavailable")).closest("[role=alert]"))
+      .toHaveTextContent("This chat cannot be opened here");
+    expect(input).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent("This chat cannot be opened here");
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    expect(input).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent("This chat cannot be opened here");
+    act(() => client._emitChat("unavailable", { event: "attached", chat_id: "unavailable" }));
+    expect(input).not.toBeDisabled();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  });
+
+  it("shows a reason when a session has no chat id", () => {
+    render(wrap(makeClient(), <ThreadShell
+      session={{ ...session("missing"), chatId: "" }} title="Missing chat"
+      onToggleSidebar={() => {}} onGoHome={() => {}} onNewChat={() => {}}
+    />));
+    expect(screen.getByLabelText("Message input")).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent("This chat cannot be opened here");
+  });
+
+  it.each([false, true])("shows unknown refusal details (dispatch=%s)", async (dispatch) => {
+    const client = makeClient();
+    render(wrap(client, <ThreadShell session={session("unknown-error")} title="Unknown"
+      onToggleSidebar={() => {}} onGoHome={() => {}} onNewChat={() => {}}
+    />));
+    let turnId: string | undefined;
+    if (dispatch) {
+      fireEvent.change(screen.getByLabelText("Message input"), { target: { value: "refused message" } });
+      fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+      await waitFor(() => expect(client.sendMessage).toHaveBeenCalledTimes(1));
+      turnId = client.sendMessage.mock.calls[0][3]?.turnId;
+    }
+    act(() => client._emitChat("unknown-error", {
+      event: "error", chat_id: "unknown-error", detail: "future_refusal", reason: "explanation", turn_id: turnId,
+    }));
+    expect(await screen.findByText("future_refusal: explanation")).toBeInTheDocument();
+    expect(screen.getByLabelText("Message input")).not.toBeDisabled();
+  });
+
   it("clears the stream error banner when the user switches to another chat", async () => {
     const client = makeClient();
     const onNewChat = vi.fn().mockResolvedValue("chat-a");

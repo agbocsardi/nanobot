@@ -48,7 +48,8 @@ export function readReloadSessions(): ChatSummary[] {
   if (!Array.isArray(value)) return [];
   return value.flatMap((row): ChatSummary[] => {
     if (!isRecord(row) || typeof row.key !== "string" || typeof row.channel !== "string"
-      || typeof row.chatId !== "string" || typeof row.preview !== "string") return [];
+      || typeof row.chatId !== "string" || typeof row.preview !== "string"
+      || row.key.startsWith("websocket:")) return [];
     const workspaceScope = readWorkspaceScope(row.workspaceScope);
     return [{
       key: row.key, channel: row.channel, chatId: row.chatId, preview: row.preview,

@@ -344,7 +344,8 @@ function hasInlineDeliveryError(
   messages: UIMessage[],
   error: StreamError | null,
 ): boolean {
-  if (!error?.turnId) return false;
+  // Generic refusals carry server details that the delivery tooltip cannot show.
+  if (!error?.turnId || error.kind === "turn_rejected") return false;
   return messages.some((message) => (
     message.role === "user"
     && message.turnId === error.turnId
@@ -814,6 +815,7 @@ export function ThreadShell({
     reconcileTurnComplete,
     setMessages,
     streamError,
+    chatUnavailable,
     dismissStreamError,
   } = useNanobotStream(chatId, initial, hasPendingToolCalls, handleTurnEnd, handleStreamDetach);
 
@@ -1723,6 +1725,11 @@ export function ThreadShell({
           onDismiss={dismissStreamError}
         />
       ) : null}
+      {session && (!chatId || chatUnavailable) ? (
+        <p role="status" className="mb-2 text-sm text-muted-foreground">
+          {t("errors.chatUnavailable.body")}
+        </p>
+      ) : null}
       {session ? (
         <ThreadComposer
           key={draftKey}
@@ -1730,7 +1737,7 @@ export function ThreadShell({
           draftStore={draftStore}
           persistDraft={persistDraft}
           onSend={handleThreadSend}
-          disabled={!chatId}
+          disabled={!chatId || chatUnavailable}
           inputAriaLabel={composerInputAriaLabel}
           isStreaming={turnActive}
           placeholder={
