@@ -1,10 +1,13 @@
 """Tests for ChannelManager delta coalescing to reduce streaming latency."""
 import asyncio
+from contextlib import suppress
 from unittest.mock import AsyncMock
 
 import pytest
 
-from nanobot.bus.events import OutboundMessage
+from nanobot.bus.events import DeliveryResult, InboundMessage, OutboundMessage
+from nanobot.bus.outbound_events import TurnEndEvent
+from nanobot.bus.progress import build_bus_progress_callback
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.channels.manager import ChannelManager
@@ -20,6 +23,8 @@ class MockChannel(BaseChannel):
     def __init__(self, config, bus):
         super().__init__(config, bus)
         self._send_delta_mock = AsyncMock()
+        self._send_reasoning_delta_mock = AsyncMock()
+        self._send_reasoning_end_mock = AsyncMock()
         self._send_mock = AsyncMock()
 
     async def start(self):
@@ -35,6 +40,12 @@ class MockChannel(BaseChannel):
     async def send_delta(self, chat_id, delta, metadata=None):
         """Override send_delta for testing."""
         return await self._send_delta_mock(chat_id, delta, metadata)
+
+    async def send_reasoning_delta(self, chat_id, delta, metadata=None):
+        await self._send_reasoning_delta_mock(chat_id, delta, metadata)
+
+    async def send_reasoning_end(self, chat_id, metadata=None):
+        await self._send_reasoning_end_mock(chat_id, metadata)
 
 
 @pytest.fixture
@@ -296,6 +307,166 @@ class TestDispatchOutboundWithCoalescing:
         # Should have pending regular message
         assert len(pending) == 1
         assert pending[0].content == "Final"
+
+
+class TestReasoningDispatch:
+    """Reasoning shares delta batching, not ordinary progress filtering."""
+
+    @pytest.mark.asyncio
+    async def test_long_reasoning_is_sent_once_and_flushed_in_order(self, manager, bus):
+        channel = manager.channels["mock"]
+        channel.send_progress = False
+        channel.send_tool_hints = True
+        sent = []
+        channel._send_reasoning_delta_mock.side_effect = (
+            lambda chat, text, meta: sent.append(("reasoning_delta", text, meta))
+        )
+        channel._send_reasoning_end_mock.side_effect = (
+            lambda chat, meta: sent.append(("reasoning_end", "", meta))
+        )
+        channel._send_delta_mock.side_effect = (
+            lambda chat, text, meta: sent.append(("assistant", text, meta))
+        )
+
+        def send(msg):
+            kind = "turn_end" if isinstance(msg.event, TurnEndEvent) else "message"
+            sent.append((kind, msg.content, msg.metadata))
+            return DeliveryResult("delivered")
+
+        channel._send_mock.side_effect = send
+        metadata = {"webui_turn_id": "turn-1", "message_id": "source-1"}
+        progress = build_bus_progress_callback(
+            bus, InboundMessage("mock", "user", "chat1", "question", metadata=metadata),
+        )
+        for _ in range(1000):
+            await progress("think ", reasoning=True)
+        await progress("", reasoning_end=True)
+        await progress("tool", tool_hint=True)
+        await progress("next", reasoning=True)
+        await progress("", reasoning_end=True)
+        for text in ("An", "swer"):
+            await bus.publish_outbound(OutboundMessage(
+                "mock", "chat1", text,
+                metadata={"_stream_delta": True, "_stream_id": "answer-1"},
+            ))
+        await bus.publish_outbound(OutboundMessage(
+            "mock", "chat1", "", metadata={"_stream_end": True, "_stream_id": "answer-1"},
+        ))
+        await bus.publish_outbound(OutboundMessage("mock", "chat1", "", event=TurnEndEvent()))
+        barrier = await bus.publish_outbound_tracked(OutboundMessage("mock", "chat1", "done"))
+
+        task = asyncio.create_task(manager._dispatch_outbound())
+        try:
+            assert (await asyncio.wait_for(barrier, 1)).status == "delivered"
+        finally:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+        assert [(kind, text) for kind, text, _ in sent] == [
+            ("reasoning_delta", "think " * 1000),
+            ("reasoning_end", ""),
+            ("message", "tool"),
+            ("reasoning_delta", "next"),
+            ("reasoning_end", ""),
+            ("assistant", "Answer"),
+            ("assistant", ""),
+            ("turn_end", ""),
+            ("message", "done"),
+        ]
+        assert sent[0][2] == {**metadata, "_progress": True, "_tool_hint": False,
+                              "_reasoning_delta": True}
+        assert sent[-3][2]["_stream_end"] is True
+        assert bus.outbound.empty()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("delta_flag", ["_stream_delta", "_reasoning_delta"])
+    @pytest.mark.parametrize("boundary", ["chat", "channel", "stream", "turn", "kind", "end", "tool"])
+    async def test_coalescing_preserves_boundaries(self, manager, bus, delta_flag, boundary):
+        first = OutboundMessage("mock", "chat1", "A", metadata={delta_flag: True, "_stream_id": "s1"})
+        next_msg = OutboundMessage("mock", "chat1", "B", metadata=dict(first.metadata))
+        if boundary == "chat":
+            next_msg.chat_id = "chat2"
+        elif boundary == "channel":
+            next_msg.channel = "other"
+        elif boundary == "stream":
+            next_msg.metadata["_stream_id"] = "s2"
+        elif boundary == "turn":
+            next_msg.metadata["webui_turn_id"] = "turn-2"
+        elif boundary == "kind":
+            other_flag = "_reasoning_delta" if delta_flag == "_stream_delta" else "_stream_delta"
+            next_msg.metadata = {other_flag: True}
+        elif boundary == "end":
+            end_flag = "_reasoning_end" if delta_flag == "_reasoning_delta" else "_stream_end"
+            next_msg.metadata = {end_flag: True}
+        else:
+            next_msg.metadata = {"_progress": True, "_tool_hint": True}
+        later = OutboundMessage("mock", "chat1", "C", metadata=dict(first.metadata))
+        await bus.publish_outbound(next_msg)
+        await bus.publish_outbound(later)
+
+        merged, pending = manager._coalesce_stream_deltas(first)
+
+        assert merged.content == "A"
+        assert pending == [next_msg]
+        assert await bus.consume_outbound() is later
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("delta_flag", ["_stream_delta", "_reasoning_delta"])
+    @pytest.mark.parametrize("fails", [False, True])
+    async def test_tracked_deltas_keep_acknowledgements(self, manager, bus, delta_flag, fails):
+        channel = manager.channels["mock"]
+        manager.config.channels.send_max_retries = 1
+        send_mock = (channel._send_reasoning_delta_mock if delta_flag == "_reasoning_delta"
+                     else channel._send_delta_mock)
+        if fails:
+            send_mock.side_effect = RuntimeError("transport failed")
+        futures = []
+        for text, tracked in [("A", False), ("B", True), ("C", True), ("D", False)]:
+            msg = OutboundMessage("mock", "chat1", text, metadata={delta_flag: True})
+            if tracked:
+                futures.append(await bus.publish_outbound_tracked(msg))
+            else:
+                await bus.publish_outbound(msg)
+        barrier = await bus.publish_outbound_tracked(OutboundMessage("mock", "chat1", "done"))
+
+        task = asyncio.create_task(manager._dispatch_outbound())
+        try:
+            await asyncio.wait_for(barrier, 1)
+            assert all(future.done() for future in futures)
+            assert [future.result().status for future in futures] == [
+                "failed" if fails else "unknown",
+            ] * 2
+        finally:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+        assert [call.args[1] for call in send_mock.await_args_list] == ["A", "B", "C", "D"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("flag", ["_reasoning_delta", "_reasoning_end", "_reasoning"])
+    @pytest.mark.parametrize("enabled", [False, True])
+    async def test_reasoning_visibility_and_tracked_ack(self, manager, bus, flag, enabled):
+        channel = manager.channels["mock"]
+        channel.show_reasoning = enabled
+        future = await bus.publish_outbound_tracked(OutboundMessage(
+            "mock", "chat1", "think", metadata={"_progress": True, flag: True},
+        ))
+        barrier = await bus.publish_outbound_tracked(OutboundMessage("mock", "chat1", "done"))
+        task = asyncio.create_task(manager._dispatch_outbound())
+        try:
+            await asyncio.wait_for(barrier, 1)
+            assert future.done()
+            assert future.result().status == ("unknown" if enabled else "suppressed")
+        finally:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+        assert channel._send_reasoning_delta_mock.await_count == int(enabled and flag != "_reasoning_end")
+        assert channel._send_reasoning_end_mock.await_count == int(enabled and flag != "_reasoning_delta")
+        channel._send_mock.assert_awaited_once()
 
 
 class TestProgressFiltering:

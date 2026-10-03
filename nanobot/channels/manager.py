@@ -340,9 +340,16 @@ class ChannelManager:
                     # haven't migrated to delta/end yet.
                     channel = self.channels.get(msg.channel)
                     if channel is not None and channel.show_reasoning:
-                        await self._send_with_retry(channel, msg)
+                        if msg.metadata.get("_reasoning_delta") and not msg.metadata.get("_reasoning_end"):
+                            msg, extra_pending = self._coalesce_stream_deltas(msg)
+                            pending.extend(extra_pending)
+                        result = await self._send_with_retry(channel, msg)
+                        self._acknowledge(
+                            msg, result or DeliveryResult("unknown", "Channel returned no acknowledgement")
+                        )
                     else:
                         self._acknowledge_skipped(msg)
+                    continue
 
                 if msg.metadata.get("_progress"):
                     if msg.metadata.get("_tool_hint") and not self._should_send_progress(
@@ -388,8 +395,9 @@ class ChannelManager:
                             self._acknowledge_skipped(msg)
                             continue
                     result = await self._send_with_retry(channel, msg)
-                    if msg.delivery is not None and result is not None:
-                        self._acknowledge(msg, result)
+                    self._acknowledge(
+                        msg, result or DeliveryResult("unknown", "Channel returned no acknowledgement")
+                    )
                 else:
                     logger.warning("Unknown channel: {}", msg.channel)
                     self._acknowledge(
@@ -436,7 +444,7 @@ class ChannelManager:
     def _coalesce_stream_deltas(
         self, first_msg: OutboundMessage
     ) -> tuple[OutboundMessage, list[OutboundMessage]]:
-        """Merge consecutive _stream_delta messages for the same (channel, chat_id).
+        """Merge consecutive assistant or reasoning deltas for the same stream.
 
         This reduces the number of API calls when the queue has accumulated multiple
         deltas, which happens when LLM generates faster than the channel can process.
@@ -444,7 +452,14 @@ class ChannelManager:
         Returns:
             tuple of (merged_message, list_of_non_matching_messages)
         """
-        target_key = (first_msg.channel, first_msg.chat_id)
+        # ponytail: tracked deltas bypass batching; aggregate futures if tracked streaming is common.
+        if first_msg.delivery is not None:
+            return first_msg, []
+
+        reasoning = bool(first_msg.metadata.get("_reasoning_delta"))
+        delta_flag = "_reasoning_delta" if reasoning else "_stream_delta"
+        end_flag = "_reasoning_end" if reasoning else "_stream_end"
+        target_key = (first_msg.channel, first_msg.chat_id, first_msg.metadata.get("_stream_id"))
         combined_content = first_msg.content
         final_metadata = dict(first_msg.metadata or {})
         non_matching: list[OutboundMessage] = []
@@ -458,16 +473,22 @@ class ChannelManager:
                 break
 
             # Check if this message belongs to the same stream
-            same_target = (next_msg.channel, next_msg.chat_id) == target_key
-            is_delta = next_msg.metadata and next_msg.metadata.get("_stream_delta")
-            is_end = next_msg.metadata and next_msg.metadata.get("_stream_end")
+            same_target = (
+                next_msg.channel, next_msg.chat_id, next_msg.metadata.get("_stream_id")
+            ) == target_key
+            is_delta = next_msg.metadata.get(delta_flag)
+            is_end = next_msg.metadata.get(end_flag)
 
-            if same_target and is_delta and not final_metadata.get("_stream_end"):
+            if (
+                same_target and is_delta and next_msg.delivery is None
+                and not (reasoning and is_end)
+                and (is_end or next_msg.metadata == final_metadata)
+            ):
                 # Accumulate content
                 combined_content += next_msg.content
-                # If we see _stream_end, remember it and stop coalescing this stream
+                # Assistant ends can carry text; reasoning ends are separate flushes.
                 if is_end:
-                    final_metadata["_stream_end"] = True
+                    final_metadata[end_flag] = True
                     # Stream ended - stop coalescing this stream
                     break
             else:
