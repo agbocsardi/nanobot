@@ -1607,6 +1607,8 @@ class WebSocketChannel(BaseChannel):
         if self._chat_is_webui_bound(msg.chat_id, default=False):
             # WebUI-audience chat only: enrichment and transcript persistence
             # must never touch legacy chats sharing the gateway listener.
+            if not conns:
+                payload["delivery_status"] = "no_subscriber"
             self._enrich_and_persist_message(msg, payload)
         raw = json.dumps(payload, ensure_ascii=False)
         if not conns:
@@ -1714,6 +1716,8 @@ class WebSocketChannel(BaseChannel):
             body["resuming"] = True
         if stream_end and merge_next:
             body["merge_next"] = True
+        if stream_end and webui_chat and not conns:
+            body["delivery_status"] = "no_subscriber"
         if webui_chat:
             self._persist_turn_stream_event(
                 chat_id,
@@ -1877,6 +1881,8 @@ class WebSocketChannel(BaseChannel):
         elif progress_event:
             payload["kind"] = "progress"
         phase = "activity" if payload.get("kind") in ("tool_hint", "progress") else "answer"
+        if not conns:
+            payload["delivery_status"] = "no_subscriber"
         self._persist_turn_transcript_event(
             msg.chat_id,
             payload,

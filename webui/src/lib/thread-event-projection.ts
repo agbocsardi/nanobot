@@ -838,6 +838,7 @@ export function projectThreadEvent(
             ...turn,
             ...(event.source ? { source: event.source } : {}),
             ...(event.response_sources !== undefined ? { responseSources: event.response_sources } : {}),
+            ...(event.delivery_status === "no_subscriber" ? { recoveredOutput: true } : {}),
             createdAt: projectionCreatedAt(event, options),
           },
         ];
@@ -851,14 +852,19 @@ export function projectThreadEvent(
           ...turn,
           ...(event.source ? { source: event.source } : {}),
           ...(event.response_sources !== undefined ? { responseSources: event.response_sources } : {}),
+          ...(event.delivery_status === "no_subscriber" ? { recoveredOutput: true } : {}),
         });
       }
-    } else if ((event.source || event.response_sources !== undefined) && targetIndex !== null) {
+    } else if (
+      (event.source || event.response_sources !== undefined || event.delivery_status)
+      && targetIndex !== null
+    ) {
       state.messages = replaceMessageAt(state.messages, targetIndex, {
         ...state.messages[targetIndex],
         ...turn,
         ...(event.source ? { source: event.source } : {}),
         ...(event.response_sources !== undefined ? { responseSources: event.response_sources } : {}),
+        ...(event.delivery_status === "no_subscriber" ? { recoveredOutput: true } : {}),
       });
     }
     if (targetIndex !== null) state.activeAssistantId = state.messages[targetIndex].id;
@@ -945,6 +951,7 @@ export function projectThreadEvent(
       ...(latencyMs !== undefined ? { latencyMs } : {}),
       ...(event.source ? { source: event.source } : {}),
       ...(event.response_sources !== undefined ? { responseSources: event.response_sources } : {}),
+      ...(event.delivery_status === "no_subscriber" ? { recoveredOutput: true } : {}),
       ...turnFieldsForProjection(state, event, "answer"),
     };
     if (options.sideChannel) {
