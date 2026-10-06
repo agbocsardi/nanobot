@@ -8,7 +8,7 @@ import { ThreadShell } from "@/components/thread/ThreadShell";
 import i18n from "@/i18n";
 import { ComposerDraftStore, clearStoredComposerDrafts } from "@/lib/composer-draft";
 import { CLI_APPS_CHANGED_EVENT } from "@/lib/cli-app-events";
-import type { CanonicalRunSnapshot, StreamError } from "@/lib/nanobot-client";
+import { NanobotClient, type CanonicalRunSnapshot, type StreamError } from "@/lib/nanobot-client";
 import { webuiThreadCache } from "@/lib/webui-thread-cache";
 import { ClientProvider } from "@/providers/ClientProvider";
 import type {
@@ -2454,6 +2454,102 @@ describe("ThreadShell", () => {
     expect(screen.getByText("first fork question")).toBeInTheDocument();
     expect(screen.getByText("first fork answer")).toBeInTheDocument();
     expect(screen.getByText("second fork question")).toBeInTheDocument();
+  });
+
+  it("recovers the canonical final answer through the real client reconnect lifecycle", async () => {
+    const sockets: Array<{
+      readyState: number;
+      sent: string[];
+      onopen: (() => void) | null;
+      onmessage: ((event: MessageEvent) => void) | null;
+      onerror: (() => void) | null;
+      onclose: ((event?: { code?: number }) => void) | null;
+      open: () => void;
+      drop: () => void;
+      message: (payload: unknown) => void;
+    }> = [];
+    const client = new NanobotClient({
+      url: "ws://test",
+      maxBackoffMs: 1,
+      socketFactory: () => {
+        const socket = {
+          readyState: 0,
+          sent: [],
+          onopen: null,
+          onmessage: null,
+          onerror: null,
+          onclose: null,
+          open() {
+            this.readyState = 1;
+            this.onopen?.();
+          },
+          drop() {
+            this.readyState = 3;
+            this.onclose?.({ code: 1006 });
+          },
+          message(payload: unknown) {
+            this.onmessage?.({ data: JSON.stringify(payload) } as MessageEvent);
+          },
+          send(data: string) {
+            this.sent.push(data);
+          },
+          close() {
+            this.readyState = 3;
+            this.onclose?.();
+          },
+        };
+        sockets.push(socket);
+        return socket as unknown as WebSocket;
+      },
+    });
+    client.connect();
+    act(() => sockets[0].open());
+
+    let historyCalls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        if (String(input).includes("websocket%3Areal-reconnect/webui-thread")) {
+          historyCalls += 1;
+          return httpJson(transcriptFromSimpleMessages(
+            historyCalls === 1
+              ? [
+                  { role: "user", content: "question" },
+                  { role: "assistant", content: "partial answer before disconnect" },
+                ]
+              : [
+                  { role: "user", content: "question" },
+                  { role: "assistant", content: "complete answer from stream_end" },
+                ],
+          ));
+        }
+        return { ok: false, status: 404, json: async () => ({}) };
+      }),
+    );
+    render(
+      wrap(
+        client as unknown as ReturnType<typeof makeClient>,
+        <ThreadShell
+          session={session("real-reconnect")}
+          title="Reconnect"
+          onToggleSidebar={() => {}}
+          onNewChat={() => {}}
+        />,
+      ),
+    );
+
+    await waitFor(() => expect(screen.getByText("question")).toBeInTheDocument());
+    expect(sockets[0].sent).toContain(JSON.stringify({ type: "attach", chat_id: "real-reconnect" }));
+    expect(screen.getByText("partial answer before disconnect")).toBeInTheDocument();
+
+    act(() => sockets[0].drop());
+    await waitFor(() => expect(sockets).toHaveLength(2));
+    act(() => sockets[1].open());
+    expect(sockets[1].sent).toContain(JSON.stringify({ type: "attach", chat_id: "real-reconnect" }));
+    await waitFor(() => expect(historyCalls).toBe(2));
+    expect(await screen.findByText("complete answer from stream_end")).toBeInTheDocument();
+    expect(screen.queryByText("partial answer before disconnect")).not.toBeInTheDocument();
+    client.close();
   });
 
   it("recovers a truncated streamed answer after reconnecting", async () => {
