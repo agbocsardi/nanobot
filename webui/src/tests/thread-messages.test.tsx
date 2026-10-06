@@ -1207,6 +1207,21 @@ describe("ThreadMessages", () => {
     ]);
   });
 
+  it("preserves recovered output in the middle of merged assistant answers", () => {
+    const units = buildDisplayUnits(["first", "middle", "last"].map((content, index) => ({
+      id: content,
+      role: "assistant" as const,
+      content,
+      createdAt: index,
+      ...(index === 1 ? { recoveredOutput: true } : {}),
+    })));
+    expect(units).toHaveLength(1);
+    expect(units[0]).toMatchObject({
+      type: "message",
+      message: { content: "first\n\nmiddle\n\nlast", recoveredOutput: true },
+    });
+  });
+
   it("keeps trailing activity after the completed assistant answer", () => {
     const messages: UIMessage[] = [
       {

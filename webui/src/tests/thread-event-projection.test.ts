@@ -31,6 +31,7 @@ const SEMANTIC_MESSAGE_FIELDS = [
   "latencyMs",
   "source",
   "responseSources",
+  "recoveredOutput",
   "turnId",
   "turnPhase",
   "turnSeq",
@@ -83,6 +84,14 @@ describe("canonical thread event projection", () => {
     ]);
     expect(messages[0].responseSources).toEqual([source]);
     expect(messages[1].responseSources).toBeUndefined();
+  });
+
+  it.each(["message", "stream_end"] as const)("marks offline %s replay as recovered output", (event) => {
+    const messages = projectThreadEvents([
+      { event, chat_id: "chat", text: "Saved answer", delivery_status: "no_subscriber" },
+      { event: "turn_end", chat_id: "chat" },
+    ]);
+    expect(messages[0]).toMatchObject({ content: "Saved answer", recoveredOutput: true });
   });
 
   it("clears unknown source metadata on a textless stream end", () => {

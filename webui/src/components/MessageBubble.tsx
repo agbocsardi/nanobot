@@ -590,6 +590,11 @@ export function MessageBubble({
           {media.length > 0 ? <MessageMedia media={media} align="left" /> : null}
         </InlineImageProvider>
       )}
+      {message.recoveredOutput ? (
+        <p className="mt-2 text-xs text-muted-foreground" data-recovered-output>
+          {t("message.recoveredOutput")}
+        </p>
+      ) : null}
     </div>
   );
 }

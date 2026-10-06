@@ -104,6 +104,17 @@ function menuActions(root: ParentNode = document): HTMLElement {
 }
 
 describe("MessageBubble", () => {
+  it("labels assistant output recovered from the transcript", async () => {
+    await setAppLanguage("en");
+    const { container } = render(<MessageBubble message={{
+      id: "recovered", role: "assistant", content: "Saved answer", createdAt: 1,
+      recoveredOutput: true,
+    }} />);
+    expect(container.querySelector("[data-recovered-output]")).toHaveTextContent(
+      "Recovered from transcript — no live subscriber at send time.",
+    );
+  });
+
   it.each([false, undefined])("keeps normal sources out of the block menu (fallback: %s)", (fallback) => {
     const message: UIMessage = { id: "primary", role: "assistant", content: "Hello", createdAt: 0,
       responseSources: [{ provider: "openai_codex", model: "gpt", preset: "codex", fallback }] };

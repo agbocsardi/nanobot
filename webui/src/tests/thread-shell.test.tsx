@@ -8,7 +8,7 @@ import { ThreadShell } from "@/components/thread/ThreadShell";
 import i18n from "@/i18n";
 import { ComposerDraftStore, clearStoredComposerDrafts } from "@/lib/composer-draft";
 import { CLI_APPS_CHANGED_EVENT } from "@/lib/cli-app-events";
-import type { CanonicalRunSnapshot, StreamError } from "@/lib/nanobot-client";
+import { NanobotClient, type CanonicalRunSnapshot, type StreamError } from "@/lib/nanobot-client";
 import { webuiThreadCache } from "@/lib/webui-thread-cache";
 import { ClientProvider } from "@/providers/ClientProvider";
 import type {
@@ -2454,6 +2454,180 @@ describe("ThreadShell", () => {
     expect(screen.getByText("first fork question")).toBeInTheDocument();
     expect(screen.getByText("first fork answer")).toBeInTheDocument();
     expect(screen.getByText("second fork question")).toBeInTheDocument();
+  });
+
+  it("recovers the canonical final answer through the real client reconnect lifecycle", async () => {
+    const sockets: Array<{
+      readyState: number;
+      sent: string[];
+      onopen: (() => void) | null;
+      onmessage: ((event: MessageEvent) => void) | null;
+      onerror: (() => void) | null;
+      onclose: ((event?: { code?: number }) => void) | null;
+      open: () => void;
+      drop: () => void;
+      message: (payload: unknown) => void;
+      send: (data: string) => void;
+      close: () => void;
+    }> = [];
+    const client = new NanobotClient({
+      url: "ws://test",
+      maxBackoffMs: 1,
+      socketFactory: () => {
+        const socket: (typeof sockets)[number] = {
+          readyState: 0,
+          sent: [],
+          onopen: null,
+          onmessage: null,
+          onerror: null,
+          onclose: null,
+          open() {
+            this.readyState = 1;
+            this.onopen?.();
+          },
+          drop() {
+            this.readyState = 3;
+            this.onclose?.({ code: 1006 });
+          },
+          message(payload: unknown) {
+            this.onmessage?.({ data: JSON.stringify(payload) } as MessageEvent);
+          },
+          send(data: string) {
+            this.sent.push(data);
+          },
+          close() {
+            this.readyState = 3;
+            this.onclose?.();
+          },
+        };
+        sockets.push(socket);
+        return socket as unknown as WebSocket;
+      },
+    });
+    client.connect();
+    act(() => sockets[0].open());
+
+    const turnId = "turn-real-reconnect";
+    let historyCalls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        if (String(input).includes("websocket%3Areal-reconnect/webui-thread")) {
+          historyCalls += 1;
+          const initial = transcriptFromSimpleMessages([
+            { role: "user", content: "question", turnId },
+          ]);
+          const initialEvents = initial.events.map((event) => ({
+            ...event,
+            chat_id: "real-reconnect",
+          }));
+          if (historyCalls === 1) return httpJson({ ...initial, events: initialEvents });
+          return httpJson({
+            ...initial,
+            events: [
+              ...initialEvents,
+              {
+                event: "message",
+                chat_id: "real-reconnect",
+                turn_id: turnId,
+                projection_id: "missed-row-1",
+                delivery_status: "no_subscriber",
+                created_at_ms: 1_701,
+                text: "missed message row one",
+              },
+              {
+                event: "message",
+                chat_id: "real-reconnect",
+                turn_id: turnId,
+                projection_id: "missed-row-2",
+                delivery_status: "no_subscriber",
+                created_at_ms: 1_702,
+                text: "missed message row two",
+              },
+              {
+                event: "stream_end",
+                chat_id: "real-reconnect",
+                turn_id: turnId,
+                projection_id: "final-answer",
+                delivery_status: "no_subscriber",
+                created_at_ms: 1_703,
+                text: "complete answer recovered from stream_end",
+              },
+              {
+                event: "turn_end",
+                chat_id: "real-reconnect",
+                turn_id: turnId,
+                projection_id: "turn-complete",
+                created_at_ms: 1_704,
+              },
+            ],
+            completed_turn_ids: [turnId],
+            has_pending_tool_calls: false,
+          });
+        }
+        return { ok: false, status: 404, json: async () => ({}) };
+      }),
+    );
+    render(
+      wrap(
+        client as unknown as ReturnType<typeof makeClient>,
+        <ThreadShell
+          session={session("real-reconnect")}
+          title="Reconnect"
+          onToggleSidebar={() => {}}
+          onNewChat={() => {}}
+        />,
+      ),
+    );
+
+    await waitFor(() => expect(screen.getByText("question")).toBeInTheDocument());
+    expect(sockets[0].sent).toContain(JSON.stringify({ type: "attach", chat_id: "real-reconnect" }));
+    const observedLiveEvents = vi.fn();
+    client.onChat("real-reconnect", observedLiveEvents);
+    act(() => {
+      sockets[0].message({
+        event: "goal_status",
+        chat_id: "real-reconnect",
+        status: "running",
+        started_at: 1_700,
+        turn_id: turnId,
+      });
+      sockets[0].message({
+        event: "delta",
+        chat_id: "real-reconnect",
+        text: "live partial answer",
+        turn_id: turnId,
+      });
+    });
+    expect(observedLiveEvents.mock.calls.map(([event]) => event.event)).toEqual([
+      "goal_status",
+      "delta",
+    ]);
+    expect(await screen.findByText("live partial answer")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Stop response" })).toBeInTheDocument();
+
+    observedLiveEvents.mockClear();
+    act(() => sockets[0].drop());
+    await waitFor(() => expect(sockets).toHaveLength(2));
+    act(() => {
+      sockets[1].open();
+      sockets[1].message({ event: "attached", chat_id: "real-reconnect" });
+    });
+    expect(observedLiveEvents).toHaveBeenCalledWith({
+      event: "attached",
+      chat_id: "real-reconnect",
+    });
+    expect(sockets[1].sent).toContain(JSON.stringify({ type: "attach", chat_id: "real-reconnect" }));
+    await waitFor(() => expect(historyCalls).toBe(2));
+    expect(await screen.findByText("missed message row one")).toBeInTheDocument();
+    expect(screen.getAllByText("missed message row one")).toHaveLength(1);
+    expect(screen.getAllByText("missed message row two")).toHaveLength(1);
+    expect(screen.getAllByText("complete answer recovered from stream_end")).toHaveLength(1);
+    // Adjacent answers from one turn render as one combined bubble.
+    expect(screen.getAllByText("Recovered from transcript — no live subscriber at send time.")).toHaveLength(1);
+    expect(screen.queryByText("live partial answer")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Stop response" })).not.toBeInTheDocument();
+    client.close();
   });
 
   it("recovers a truncated streamed answer after reconnecting", async () => {

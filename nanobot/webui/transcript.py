@@ -2160,6 +2160,8 @@ def _client_projection_common_fields(record: dict[str, Any]) -> dict[str, Any]:
     created_at_ms = _valid_created_at_ms(record.get("created_at_ms"))
     if created_at_ms is not None:
         fields["created_at_ms"] = created_at_ms
+    if record.get("delivery_status") == "no_subscriber":
+        fields["delivery_status"] = "no_subscriber"
     return fields
 
 

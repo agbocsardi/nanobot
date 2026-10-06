@@ -288,6 +288,7 @@ function mergeAssistantAnswers(answers: UIMessage[]): UIMessage {
     content: answers.map((message) => message.content.trim()).filter(Boolean).join("\n\n"),
     createdAt: first.createdAt,
     isStreaming: answers.some((message) => message.isStreaming),
+    ...(answers.some((message) => message.recoveredOutput) ? { recoveredOutput: true } : {}),
   };
   if (media.length) merged.media = media;
   else delete merged.media;

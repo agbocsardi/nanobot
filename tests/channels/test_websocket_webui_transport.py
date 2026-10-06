@@ -293,12 +293,18 @@ class _FakeTranscripts:
 
     def prepare_and_append(self, chat_id, event, *, metadata=None, phase="", include_source=False,
                            transcript_overrides=None) -> bool:
-        self.events.append((chat_id, event, phase))
+        record = dict(event)
+        if transcript_overrides:
+            record.update(transcript_overrides)
+        self.events.append((chat_id, record, phase))
         return True
 
     def prepare_and_append_stream_event(self, chat_id, event, *, completed_text=None, metadata=None,
                                         phase="", include_source=False) -> bool:
-        self.events.append((chat_id, event, phase))
+        record = dict(event)
+        if completed_text is not None:
+            record["text"] = completed_text
+        self.events.append((chat_id, record, phase))
         return True
 
 
@@ -706,6 +712,42 @@ async def test_gateway_mode_legacy_stream_end_keeps_fork_frames_and_skips_transc
     }
 
     assert gateway.transcripts.events == []
+
+
+@pytest.mark.asyncio
+async def test_offline_webui_messages_and_final_stream_are_marked_not_live(webui_stack):
+    from nanobot.webui.session_identity import webui_session_key
+
+    chat_id = "offline-chat"
+    channel, gateway = _gateway_channel(persisted={webui_session_key(chat_id)})
+    await channel.send(OutboundMessage(
+        channel="websocket", chat_id=chat_id, content="fork-shaped",
+    ))
+    await channel.send_projected_message(OutboundMessage(
+        channel="websocket", chat_id=chat_id, content="projected",
+    ), None)
+    await channel.send_delta(chat_id, "canonical final", {"_stream_id": "offline-stream"})
+    await channel.send_delta(
+        chat_id, "", {"_stream_id": "offline-stream", "_stream_end": True},
+    )
+
+    rows = [event for _, event, _ in gateway.transcripts.events]
+    marked = [row for row in rows if row.get("delivery_status") == "no_subscriber"]
+    assert [row["event"] for row in marked] == ["message", "message", "stream_end"]
+    assert marked[-1]["text"] == "canonical final"
+
+    from nanobot.webui.transcript import _client_projection_event
+
+    projected = [
+        _client_projection_event(
+            row,
+            augment_user_media=None,
+            augment_assistant_media=None,
+            augment_assistant_text=None,
+        )
+        for row in marked
+    ]
+    assert all(row["delivery_status"] == "no_subscriber" for row in projected)
 
 
 @pytest.mark.asyncio

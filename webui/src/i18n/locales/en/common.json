@@ -2279,6 +2279,7 @@
     "openAttachment": "Open {{name}}",
     "skill": "Skill: {{name}}",
     "automationSourceFallback": "Automation",
+    "recoveredOutput": "Recovered from transcript — no live subscriber at send time.",
     "automationTriggered": "Triggered automatically",
     "askAboutSelection": "Ask about this",
     "forkFromHere": "Fork",

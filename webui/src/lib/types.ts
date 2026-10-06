@@ -146,6 +146,8 @@ export interface UIMessage {
   turnSeq?: number;
   /** Ephemeral delivery lifecycle for optimistic user messages. */
   deliveryStatus?: MessageDeliveryStatus;
+  /** Assistant output persisted while no live WebSocket subscriber existed. */
+  recoveredOutput?: boolean;
   /** Structured rejection reason shown with a failed optimistic message. */
   deliveryErrorKind?: MessageDeliveryErrorKind;
 }
@@ -1402,6 +1404,7 @@ export type InboundEvent =
       /** Lightweight provenance for proactive assistant messages. */
       source?: UIMessageSource;
       response_sources?: ResponseSource[];
+      delivery_status?: "no_subscriber";
       /** Optional structured payload on progress frames (channel-specific). */
       agent_ui?: AgentUIBlob;
     } & InboundTurnMetadata)
@@ -1428,6 +1431,7 @@ export type InboundEvent =
       /** Lightweight provenance for proactive streamed assistant messages. */
       source?: UIMessageSource;
       response_sources?: ResponseSource[];
+      delivery_status?: "no_subscriber";
       /** This answer segment ended, but the active agent turn will continue. */
       resuming?: boolean;
       /** The next answer segment continues this same assistant message. */
