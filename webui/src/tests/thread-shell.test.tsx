@@ -2467,12 +2467,14 @@ describe("ThreadShell", () => {
       open: () => void;
       drop: () => void;
       message: (payload: unknown) => void;
+      send: (data: string) => void;
+      close: () => void;
     }> = [];
     const client = new NanobotClient({
       url: "ws://test",
       maxBackoffMs: 1,
       socketFactory: () => {
-        const socket = {
+        const socket: (typeof sockets)[number] = {
           readyState: 0,
           sent: [],
           onopen: null,
@@ -2529,6 +2531,7 @@ describe("ThreadShell", () => {
                 chat_id: "real-reconnect",
                 turn_id: turnId,
                 projection_id: "missed-row-1",
+                delivery_status: "no_subscriber",
                 created_at_ms: 1_701,
                 text: "missed message row one",
               },
@@ -2537,6 +2540,7 @@ describe("ThreadShell", () => {
                 chat_id: "real-reconnect",
                 turn_id: turnId,
                 projection_id: "missed-row-2",
+                delivery_status: "no_subscriber",
                 created_at_ms: 1_702,
                 text: "missed message row two",
               },
@@ -2545,6 +2549,7 @@ describe("ThreadShell", () => {
                 chat_id: "real-reconnect",
                 turn_id: turnId,
                 projection_id: "final-answer",
+                delivery_status: "no_subscriber",
                 created_at_ms: 1_703,
                 text: "complete answer recovered from stream_end",
               },
@@ -2615,8 +2620,11 @@ describe("ThreadShell", () => {
     expect(sockets[1].sent).toContain(JSON.stringify({ type: "attach", chat_id: "real-reconnect" }));
     await waitFor(() => expect(historyCalls).toBe(2));
     expect(await screen.findByText("missed message row one")).toBeInTheDocument();
-    expect(screen.getByText("missed message row two")).toBeInTheDocument();
+    expect(screen.getAllByText("missed message row one")).toHaveLength(1);
+    expect(screen.getAllByText("missed message row two")).toHaveLength(1);
     expect(screen.getAllByText("complete answer recovered from stream_end")).toHaveLength(1);
+    // Adjacent answers from one turn render as one combined bubble.
+    expect(screen.getAllByText("Recovered from transcript — no live subscriber at send time.")).toHaveLength(1);
     expect(screen.queryByText("live partial answer")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Stop response" })).not.toBeInTheDocument();
     client.close();
