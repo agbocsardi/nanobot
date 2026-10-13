@@ -111,6 +111,10 @@ class PendingQuestion:
         return (now_ms if now_ms is not None else _now_ms()) > self.expires_at_ms
 
 
+class QuestionAlreadyPendingError(ValueError):
+    """A session already has an outstanding user decision."""
+
+
 class PendingQuestionStore:
     """Durable, atomic question log under ``workspace/pending_questions.json``.
 
@@ -180,6 +184,20 @@ class PendingQuestionStore:
         )
         with self._store.lock:
             questions = self._load()
+            for existing in questions:
+                if existing.status != "pending":
+                    continue
+                if existing.expired(now):
+                    existing.status = "expired"
+                elif (
+                    existing.channel == channel
+                    and existing.chat_id == str(chat_id)
+                    and existing.session_key == session_key
+                ):
+                    raise QuestionAlreadyPendingError(
+                        f"Question {existing.question_id} is already pending in this session. "
+                        "Wait for its answer or expiry before asking another question."
+                    )
             questions.append(question)
             self._write(questions)
         return question
@@ -359,15 +377,18 @@ class AskUserTool(Tool, ContextAware):
 
         ttl_s = expires_in_s if expires_in_s is not None else DEFAULT_QUESTION_TTL_S
         store = self._store()
-        pending = store.create(
-            prompt=question,
-            option_labels=option_labels,
-            channel=self._channel,
-            chat_id=self._chat_id,
-            session_key=self._session_key,
-            sender_id=self._sender_id,
-            expires_at_ms=_now_ms() + ttl_s * 1000,
-        )
+        try:
+            pending = store.create(
+                prompt=question,
+                option_labels=option_labels,
+                channel=self._channel,
+                chat_id=self._chat_id,
+                session_key=self._session_key,
+                sender_id=self._sender_id,
+                expires_at_ms=_now_ms() + ttl_s * 1000,
+            )
+        except QuestionAlreadyPendingError as exc:
+            return ToolResult.policy_block(str(exc))
 
         # Durable wait-and-resume (issue #29): persist the envelope closure
         # for this question BEFORE rendering anything, so a crash in either
