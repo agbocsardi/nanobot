@@ -650,7 +650,11 @@ class SubagentManager:
                 )
             else:
                 status.phase = "completed"
-                record_result = result.final_content or "Task completed but no final response was generated."
+                record_result = result.final_content or (
+                    "Task reply delivered via message tool."
+                    if result.stop_reason == "delivered_via_tool"
+                    else "Task completed but no final response was generated."
+                )
                 logger.info("Subagent [{}] completed successfully", task_id)
                 await self._announce_result(
                     task_id, label, task, record_result, origin, "ok", origin_message_id,
@@ -721,7 +725,7 @@ class SubagentManager:
         stop_reason = str(record.get("stop_reason") or "")
         if phase == "cancelled" or stop_reason == "cancelled":
             return "cancelled"
-        if stop_reason == "completed" or phase == "completed":
+        if stop_reason in ("completed", "delivered_via_tool") or phase == "completed":
             return "completed"
         if stop_reason in ("partial_completion", "empty_final_response", "max_iterations"):
             return "incomplete"

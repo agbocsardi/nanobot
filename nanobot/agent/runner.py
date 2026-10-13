@@ -691,10 +691,17 @@ class AgentRunner:
                     continue
                 break
             if is_blank_text(clean):
-                final_content = EMPTY_FINAL_RESPONSE_MESSAGE
-                stop_reason = "empty_final_response"
-                error = final_content
-                self._append_final_message(messages, final_content)
+                if already_delivered:
+                    # The tool reply is the final answer. Tool results may end
+                    # the history; no synthetic assistant message is needed.
+                    final_content = None
+                    stop_reason = "delivered_via_tool"
+                    error = None
+                else:
+                    final_content = EMPTY_FINAL_RESPONSE_MESSAGE
+                    stop_reason = "empty_final_response"
+                    error = final_content
+                    self._append_final_message(messages, final_content)
                 context.final_content = final_content
                 context.error = error
                 context.stop_reason = stop_reason

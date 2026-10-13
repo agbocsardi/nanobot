@@ -380,9 +380,24 @@ async def test_subagent_max_iterations_announces_incomplete_fallback(tmp_path, m
 @pytest.mark.asyncio
 @pytest.mark.parametrize("final_text", ["", "duplicate reply"])
 async def test_message_tool_delivery_suppresses_retry_and_stream(tmp_path, final_text):
+    from nanobot.agent.hook import AgentHook
+    from nanobot.agent.loop import TurnContext, TurnState
+    from nanobot.agent.turn_delivery import _turn_outcome
     from nanobot.bus.events import DeliveryResult, InboundMessage
+    from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
 
     loop = _make_loop(tmp_path)
+    contexts = []
+    run_contexts = []
+
+    class CaptureHook(AgentHook):
+        async def after_iteration(self, context):
+            contexts.append(context)
+
+        async def after_run(self, context):
+            run_contexts.append(context)
+
+    loop._extra_hooks = [CaptureHook()]
     message_tool = loop.tools.get("message")
     sent = AsyncMock(return_value=DeliveryResult(status="delivered"))
     message_tool.set_send_callback(sent)
@@ -413,11 +428,38 @@ async def test_message_tool_delivery_suppresses_retry_and_stream(tmp_path, final
     sent.assert_awaited_once()
     assert stream_calls == 1
     loop.provider.chat_with_retry.assert_awaited_once()
-    assert reason == ("empty_final_response" if not final_text else "completed")
+    assert reason == ("delivered_via_tool" if not final_text else "completed")
+    assert contexts[-1].error is None
+    assert run_contexts[-1].error is None
+    assert all(m.get("content") != EMPTY_FINAL_RESPONSE_MESSAGE for m in messages)
+    if not final_text:
+        assert final is None
+        assert messages[-1]["role"] == "tool"
+        assert _turn_outcome(reason) == ("completed", None)
+        session = Session(key="webui:tool-delivery")
+        ctx = TurnContext(
+            msg=InboundMessage(channel="websocket", sender_id="user", chat_id="chat", content="hi"),
+            session_key=session.key,
+            state=TurnState.SAVE,
+            turn_id="tool-delivery",
+            session=session,
+            all_messages=[{"role": "system", "content": "system"}, *messages],
+            stop_reason=reason,
+            ephemeral=True,
+        )
+        await loop._state_save(ctx)
+        assert ctx.final_content is None
+        assert session.messages[-1]["role"] == "tool"
+        assert all(m.get("content") != EMPTY_FINAL_RESPONSE_MESSAGE for m in session.messages)
     assert loop._assemble_outbound(
         InboundMessage(channel="telegram", sender_id="user", chat_id="chat", content="hi"),
         final, messages, reason, injected, on_stream,
     ) is None
+    if not final_text:
+        assert loop._assemble_outbound(
+            InboundMessage(channel="telegram", sender_id="user", chat_id="chat", content="hi"),
+            final, messages, reason, True, on_stream,
+        ) is None
     published.assert_not_awaited()
 
 
