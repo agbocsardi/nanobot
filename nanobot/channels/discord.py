@@ -512,9 +512,9 @@ class DiscordChannel(BaseChannel):
         try:
             result = await client.send_outbound(msg)
             return result if isinstance(result, DeliveryResult) else DeliveryResult("unknown")
-        except Exception as exc:
+        except Exception:
             self.logger.exception("Error sending message")
-            return _send_failure(exc)
+            raise
         finally:
             if not is_progress:
                 await self._stop_typing(msg.chat_id)
