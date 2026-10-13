@@ -1030,6 +1030,20 @@ class TelegramChannel(BaseChannel):
             self.logger.debug("editMessageText rich_message failed: {}", exc)
             return False
 
+    def _reply_parameters(self, metadata: dict[str, Any]) -> ReplyParameters | None:
+        """Resolve outbound overrides without treating inbound reply context as a flag."""
+        target = metadata.get("outbound_reply_to_message_id")
+        override = metadata.get("reply_to")
+        enabled = (
+            override if isinstance(override, bool)
+            else target is not None or self.config.reply_to_message
+        )
+        if enabled:
+            target = target if target is not None else metadata.get("message_id")
+            if target:
+                return ReplyParameters(message_id=int(target), allow_sending_without_reply=True)
+        return None
+
     async def send(self, msg: OutboundMessage) -> DeliveryResult:
         """Send each part once and report acknowledgement of the entire message."""
         if not self._app:
@@ -1066,13 +1080,7 @@ class TelegramChannel(BaseChannel):
         if message_thread_id is not None:
             thread_kwargs["message_thread_id"] = message_thread_id
 
-        reply_params = None
-        if self.config.reply_to_message:
-            if reply_to_message_id:
-                reply_params = ReplyParameters(
-                    message_id=reply_to_message_id,
-                    allow_sending_without_reply=True
-                )
+        reply_params = self._reply_parameters(msg.metadata)
 
         # Send media files
         delivered = False
@@ -1353,12 +1361,7 @@ class TelegramChannel(BaseChannel):
         thread_kwargs = {}
         if message_thread_id := meta.get("message_thread_id"):
             thread_kwargs["message_thread_id"] = message_thread_id
-        reply_params = None
-        if self.config.reply_to_message and (reply_to_message_id := meta.get("message_id")):
-            reply_params = ReplyParameters(
-                message_id=int(reply_to_message_id),
-                allow_sending_without_reply=True,
-            )
+        reply_params = self._reply_parameters(meta)
         if buf.message_id is None:
             preview = _strip_md_block(buf.text)
             try:

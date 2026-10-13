@@ -9,7 +9,12 @@ from loguru import logger
 from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
 from nanobot.agent.tools.context import ContextAware, RequestContext
 from nanobot.agent.tools.path_utils import resolve_workspace_path
-from nanobot.agent.tools.schema import ArraySchema, StringSchema, tool_parameters_schema
+from nanobot.agent.tools.schema import (
+    ArraySchema,
+    BooleanSchema,
+    StringSchema,
+    tool_parameters_schema,
+)
 from nanobot.bus.events import DeliveryResult, OutboundMessage
 from nanobot.config.paths import get_workspace_path
 from nanobot.security.workspace_access import current_tool_workspace
@@ -30,6 +35,14 @@ from nanobot.security.workspace_access import current_tool_workspace
             "On WebSocket/WebUI turns: omit chat_id to use the server's conversation id "
             "(never pass client_id values like anon-…). "
             "Do not set this to the current runtime chat for a normal reply."
+        ),
+        reply_to=BooleanSchema(
+            description="Optional per-call reply threading override: true quotes the triggering message, "
+            "false disables quoting; omitted uses the channel default."
+        ),
+        reply_to_message_id=StringSchema(
+            "Optional ID of a specific message in the destination chat to quote. "
+            "Enables quoting unless reply_to is false."
         ),
         media=ArraySchema(
             StringSchema(""),
@@ -193,6 +206,8 @@ class MessageTool(Tool, ContextAware):
         message_id: str | None = None,
         media: list[str] | None = None,
         buttons: list[list[str]] | None = None,
+        reply_to: bool | None = None,
+        reply_to_message_id: str | None = None,
         **kwargs: Any,
     ) -> str:
         from nanobot.utils.helpers import strip_think
@@ -249,6 +264,10 @@ class MessageTool(Tool, ContextAware):
         metadata = dict(self._default_metadata.get()) if same_target else {}
         if message_id:
             metadata["message_id"] = message_id
+        if reply_to is not None:
+            metadata["reply_to"] = reply_to
+        if reply_to_message_id is not None:
+            metadata["outbound_reply_to_message_id"] = reply_to_message_id
         if self._record_channel_delivery_var.get() or media:
             metadata["_record_channel_delivery"] = True
 
