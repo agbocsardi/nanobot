@@ -1368,6 +1368,10 @@ class AgentLoop:
         # progress hooks, and session bookkeeping all agree on the run kind.
         effective_metadata = self._effective_turn_metadata(metadata)
 
+        def reply_delivered() -> bool:
+            message_tool = (tools or self.tools).get("message")
+            return isinstance(message_tool, MessageTool) and message_tool._sent_in_turn
+
         loop_hook = AgentProgressHook(
             on_progress=on_progress,
             on_stream=on_stream,
@@ -1380,6 +1384,7 @@ class AgentLoop:
             tool_hint_max_length=self.tool_hint_max_length,
             set_tool_context=self._set_tool_context,
             on_iteration=lambda iteration: setattr(self, "_current_iteration", iteration),
+            reply_delivered=reply_delivered,
         )
         hook: AgentHook = loop_hook
         if not ephemeral and self._extra_hooks:

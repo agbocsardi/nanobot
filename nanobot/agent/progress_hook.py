@@ -36,6 +36,7 @@ class AgentProgressHook(AgentHook):
         tool_hint_max_length: int = 40,
         set_tool_context: Callable[..., None] | None = None,
         on_iteration: Callable[[int], None] | None = None,
+        reply_delivered: Callable[[], bool] | None = None,
     ) -> None:
         super().__init__(reraise=True)
         self._on_progress = on_progress
@@ -49,12 +50,15 @@ class AgentProgressHook(AgentHook):
         self._tool_hint_max_length = tool_hint_max_length
         self._set_tool_context = set_tool_context
         self._on_iteration = on_iteration
+        self._reply_delivered = reply_delivered
         self._stream_buf = ""
         self._think_extractor = IncrementalThinkExtractor()
         self._reasoning_open = False
 
     def wants_streaming(self) -> bool:
-        return self._on_stream is not None
+        return self._on_stream is not None and not (
+            self._reply_delivered and self._reply_delivered()
+        )
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -76,6 +80,8 @@ class AgentProgressHook(AgentHook):
         return name in sig.parameters
 
     async def on_stream(self, context: AgentHookContext, delta: str) -> None:
+        if self._reply_delivered and self._reply_delivered():
+            return
         prev_clean = strip_think(self._stream_buf)
         self._stream_buf += delta
         new_clean = strip_think(self._stream_buf)
