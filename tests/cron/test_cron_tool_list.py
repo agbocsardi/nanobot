@@ -1,7 +1,7 @@
 """Tests for CronTool._list_jobs() output formatting."""
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -267,13 +267,14 @@ def test_list_every_job_milliseconds(tmp_path) -> None:
 
 def test_list_at_job_shows_iso_timestamp(tmp_path) -> None:
     tool = _make_tool_with_tz(tmp_path, "Asia/Shanghai")
+    future = datetime.now(timezone(timedelta(hours=8))).replace(microsecond=0) + timedelta(days=1)
     tool._cron.add_job(
         name="One-shot",
-        schedule=CronSchedule(kind="at", at_ms=1790000000000),
+        schedule=CronSchedule(kind="at", at_ms=int(future.timestamp() * 1000)),
         message="fire",
     )
     result = tool._list_jobs()
-    assert "at 2026-" in result
+    assert f"at {future.isoformat()}" in result
     assert "Asia/Shanghai" in result
 
 
