@@ -3666,6 +3666,12 @@ async def test_duplicate_tap_acks_without_second_turn(tmp_path) -> None:
     await channel._on_callback_query(_callback(channel, query, _user()), None)
 
     assert len(bus.inbound) == 1
+    # Exact redelivery is dropped before the answer handler.
+    assert query.answer.await_count == 1
+    # A distinct user re-tap still gets the durable store's acknowledgement.
+    query.id = "cq2"
+    await channel._on_callback_query(_callback(channel, query, _user()), None)
+    assert len(bus.inbound) == 1
     assert query.answer.await_count == 2
     assert query.answer.call_args.kwargs.get("text") == "Already answered."
 

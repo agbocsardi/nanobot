@@ -56,6 +56,7 @@ TELEGRAM_REPLY_CONTEXT_MAX_LEN = TELEGRAM_MAX_MESSAGE_LEN  # Max length for repl
 # Records only flags/lengths/ids — never raw message content.
 TELEGRAM_REPLY_OBSERVATION_LIMIT = 100
 TELEGRAM_INGRESS_IDENTITY_LIMIT = 4096
+TELEGRAM_INGRESS_IDENTITY_TTL_S = 30 * 60
 # Long-poll liveness: a healthy getUpdates long poll completes one round trip
 # every ~10s even when idle (Updater.start_polling uses a 10s timeout by
 # default). The watchdog bot stamps each completed round trip; when none lands
@@ -515,7 +516,7 @@ class TelegramChannel(BaseChannel):
         self._rich_send_disabled: bool = False  # Latch off if Bot API < 10.1
         # Identities of updates already claimed for processing; bounded so a
         # long-lived bot cannot grow this without limit (see _claim_update).
-        self._seen_update_identities: dict[tuple, None] = {}
+        self._seen_update_identities: dict[tuple, float] = {}
         self._reply_observations: deque[dict[str, Any]] = deque(
             maxlen=TELEGRAM_REPLY_OBSERVATION_LIMIT
         )
@@ -2093,23 +2094,24 @@ class TelegramChannel(BaseChannel):
 
         Telegram may redeliver an update (same ``update_id``) after a poll
         restart, and redelivery replays the same ``(chat_id, message_id)``
-        body. Edits of a message carry that same body pair but are a distinct
-        update, so they get their own tag; reactions may legitimately repeat
-        for one message and are identified by ``update_id`` only.
+        body. Edits and reactions may legitimately repeat for one message
+        and are identified by ``update_id`` only. Callback query ids also
+        suppress replay when the enclosing update identity differs.
         """
         identities: list[tuple] = []
         update_id = getattr(update, "update_id", None)
         if update_id is not None:
             identities.append(("update", int(update_id)))
-        message = getattr(update, "message", None)
-        edited = getattr(update, "edited_message", None)
-        body = message if message is not None else edited
+        callback = getattr(update, "callback_query", None)
+        if callback is not None and getattr(callback, "id", None) is not None:
+            identities.append(("callback", str(callback.id)))
+        # An edited message can be edited again: only its update id is unique.
+        body = getattr(update, "message", None)
         if body is not None:
             chat_id = getattr(body, "chat_id", None)
             message_id = getattr(body, "message_id", None)
             if chat_id is not None and message_id is not None:
-                tag = "message" if message is not None else "edited"
-                identities.append((tag, str(chat_id), int(message_id)))
+                identities.append(("message", str(chat_id), int(message_id)))
         return tuple(identities)
 
     def _claim_update(self, update: Update) -> bool:
@@ -2121,11 +2123,17 @@ class TelegramChannel(BaseChannel):
         identities = self._identities_for_update(update)
         if not identities:
             return True
+        now = time.monotonic()
+        while self._seen_update_identities:
+            oldest = next(iter(self._seen_update_identities))
+            if now - self._seen_update_identities[oldest] < TELEGRAM_INGRESS_IDENTITY_TTL_S:
+                break
+            self._seen_update_identities.pop(oldest)
         if any(identity in self._seen_update_identities for identity in identities):
             self.logger.info("Dropping duplicate Telegram update {}", identities)
             return False
         for identity in identities:
-            self._seen_update_identities[identity] = None
+            self._seen_update_identities[identity] = now
         while len(self._seen_update_identities) > TELEGRAM_INGRESS_IDENTITY_LIMIT:
             self._seen_update_identities.pop(next(iter(self._seen_update_identities)))
         return True
@@ -2370,6 +2378,7 @@ class TelegramChannel(BaseChannel):
 
     def _remember_sent_message(self, chat_id: str | int, message_id: int, content: str) -> None:
         """Cache recent bot messages so reaction events can identify their target."""
+        self.logger.info("Telegram message acknowledged chat_id={} message_id={}", chat_id, message_id)
         key = (str(chat_id), int(message_id))
         self._sent_messages[key] = (
             content[:TELEGRAM_REPLY_CONTEXT_MAX_LEN] + "..."
