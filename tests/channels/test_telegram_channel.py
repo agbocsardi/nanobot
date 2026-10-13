@@ -1206,6 +1206,42 @@ async def test_send_delta_incremental_edit_splits_oversized_buffer() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("global_reply", [False, True])
+@pytest.mark.parametrize(
+    "overrides,expected",
+    [({}, "default"), ({"reply_to": True}, 42), ({"reply_to": False}, None),
+     ({"outbound_reply_to_message_id": "17"}, 17),
+     ({"reply_to": True, "outbound_reply_to_message_id": "17"}, 17),
+     ({"reply_to": False, "outbound_reply_to_message_id": "17"}, None),
+     ({"reply_to": {"message_id": 9}, "reply_to_message_id": 9}, "default")],
+)
+async def test_reply_threading_overrides(global_reply, streaming, overrides, expected) -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"],
+                       reply_to_message=global_reply),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    metadata = {"message_id": "42", "message_thread_id": 7, **overrides}
+    if streaming:
+        await channel.send_delta("123", "hello", metadata)
+    else:
+        await channel.send(OutboundMessage(
+            channel="telegram", chat_id="123", content="hello", metadata=metadata,
+        ))
+    sent = channel._app.bot.sent_messages[0]
+    reply = sent["reply_parameters"]
+    if expected == "default":
+        expected = 42 if global_reply else None
+    assert (reply.message_id if reply else None) == expected
+    if reply:
+        assert reply.allow_sending_without_reply is True
+    assert sent["message_thread_id"] == 7
+    assert channel.config.reply_to_message is global_reply
+
+
+@pytest.mark.asyncio
 async def test_send_delta_initial_send_keeps_message_in_thread() -> None:
     channel = TelegramChannel(
         TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),

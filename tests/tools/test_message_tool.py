@@ -9,6 +9,37 @@ from nanobot.config.paths import get_workspace_path
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reply_to", [None, True, False])
+@pytest.mark.parametrize("cross_chat", [False, True])
+async def test_message_tool_reply_overrides_are_per_call(reply_to, cross_chat) -> None:
+    sent = []
+
+    async def send(msg):
+        sent.append(msg)
+
+    tool = MessageTool(
+        send_callback=send, default_channel="telegram", default_chat_id="1",
+        default_message_id="42",
+    )
+    await tool.execute(
+        content="quote", chat_id="2" if cross_chat else None,
+        reply_to=reply_to, reply_to_message_id="17",
+    )
+    assert sent[0].metadata["outbound_reply_to_message_id"] == "17"
+    if reply_to is None:
+        assert "reply_to" not in sent[0].metadata
+    else:
+        assert sent[0].metadata["reply_to"] is reply_to
+    assert sent[0].metadata.get("message_id") == (None if cross_chat else "42")
+    await tool.execute(content="default")
+    assert "reply_to" not in sent[1].metadata
+    assert "outbound_reply_to_message_id" not in sent[1].metadata
+    properties = tool.parameters["properties"]
+    assert properties["reply_to"]["type"] == "boolean"
+    assert properties["reply_to_message_id"]["type"] == "string"
+
+
+@pytest.mark.asyncio
 async def test_message_tool_returns_error_when_no_target_context() -> None:
     tool = MessageTool()
     result = await tool.execute(content="test")
