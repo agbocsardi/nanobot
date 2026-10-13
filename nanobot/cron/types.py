@@ -116,6 +116,10 @@ class CronJob:
     # coalesce runs one current occurrence; skip records the missed occurrence.
     misfire_policy: Literal["skip", "coalesce"] = "coalesce"
     misfire_grace_ms: int = 60_000
+    # Wall-clock cap for one execution of this job, in seconds. ``None`` means
+    # "use the service default" (CronService.job_timeout_s, 300s). Set it only
+    # for jobs that legitimately need a longer single run.
+    timeout_s: float | None = None
 
     @classmethod
     def from_dict(cls, kwargs: dict):

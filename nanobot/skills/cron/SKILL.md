@@ -41,6 +41,16 @@ cron(action="list")
 cron(action="remove", job_id="abc123")
 ```
 
+## Execution Timeout
+
+Every run is capped at 300s. A job that legitimately needs a longer single run can raise its own cap:
+
+```
+cron(action="add", message="Run the workshop slot", cron_expr="30 0 * * *", timeout_s=900)
+```
+
+`timeout_s` is per job, seconds, maximum 3600, and leaves every other job on the default. A run that hits its cap produces nothing and records `job timed out after Ns`.
+
 ## Time Expressions
 
 | User says | Parameters |

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from contextvars import ContextVar
 from datetime import datetime
 from typing import Any
@@ -12,6 +13,7 @@ from nanobot.agent.tools.context import ContextAware, RequestContext
 from nanobot.agent.tools.schema import (
     BooleanSchema,
     IntegerSchema,
+    NumberSchema,
     StringSchema,
     tool_parameters_schema,
 )
@@ -63,6 +65,15 @@ _CRON_PARAMETERS = tool_parameters_schema(
     misfire_grace_seconds=IntegerSchema(
         0, minimum=0,
         description="Nonnegative seconds a late run may start within before misfire handling. Defaults to 60.",
+    ),
+    timeout_s=NumberSchema(
+        description=
+        "Optional wall-clock cap in seconds for ONE execution of this job. Omit "
+        "to use the service default (300s). Raise it only for a job that "
+        "legitimately needs a longer single run (e.g. a workshop/experiment "
+        "slot); the guardrail stays in place for every other job.",
+        minimum=1,
+        maximum=CronService.MAX_JOB_TIMEOUT_S,
     ),
     isolated=BooleanSchema(
         description=
@@ -196,6 +207,7 @@ class CronTool(Tool, ContextAware):
         isolated: bool = True,
         misfire_policy: str = "coalesce",
         misfire_grace_seconds: int = 60,
+        timeout_s: float | None = None,
         **kwargs: Any,
     ) -> str:
         if action == "add":
@@ -203,7 +215,7 @@ class CronTool(Tool, ContextAware):
                 return "Error: cannot schedule new jobs from within a cron job execution"
             return self._add_job(
                 name, message, every_seconds, cron_expr, tz, at, silent, model_preset, isolated,
-                misfire_policy, misfire_grace_seconds
+                misfire_policy, misfire_grace_seconds, timeout_s
             )
         elif action == "list":
             return self._list_jobs()
@@ -224,11 +236,23 @@ class CronTool(Tool, ContextAware):
         isolated: bool = True,
         misfire_policy: str = "coalesce",
         misfire_grace_seconds: int = 60,
+        timeout_s: float | None = None,
     ) -> str:
         if misfire_policy not in ("skip", "coalesce"):
             return "Error: misfire_policy must be 'skip' or 'coalesce'"
         if misfire_grace_seconds < 0:
             return "Error: misfire_grace_seconds must be nonnegative"
+        if timeout_s is not None:
+            if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)):
+                return "Error: timeout_s must be a number of seconds, or omitted for the default"
+            timeout_s = float(timeout_s)
+            if not math.isfinite(timeout_s) or timeout_s <= 0:
+                return "Error: timeout_s must be greater than 0 seconds"
+            if timeout_s > CronService.MAX_JOB_TIMEOUT_S:
+                return (
+                    f"Error: timeout_s must not exceed "
+                    f"{CronService.MAX_JOB_TIMEOUT_S:g} seconds"
+                )
         if not message:
             return (
                 "Error: cron action='add' requires a non-empty 'message' parameter "
@@ -303,6 +327,7 @@ class CronTool(Tool, ContextAware):
                 isolated=isolated,
                 misfire_policy=misfire_policy,
                 misfire_grace_ms=misfire_grace_seconds * 1000,
+                timeout_s=timeout_s,
             )
         except ValueError as e:
             # Invalid schedule (bad cron expression, non-positive interval,
@@ -411,6 +436,8 @@ class CronTool(Tool, ContextAware):
                     f"{model_detail})"
                 ]
                 parts.append(f"  Misfire: policy={j.misfire_policy}, grace={j.misfire_grace_ms // 1000}s")
+                if j.timeout_s:
+                    parts.append(f"  Timeout: {j.timeout_s:g}s per run (service default {self._cron.job_timeout_s:g}s)")
                 if j.payload.kind == "system_event":
                     parts.append(f"  Purpose: {self._system_job_purpose(j)}")
                     parts.append("  Protected: visible for inspection, but cannot be removed.")
@@ -443,6 +470,7 @@ class CronTool(Tool, ContextAware):
                 listed_jobs.append({"id": j.id, "name": j.name, "enabled": j.enabled,
                                     "misfire_policy": j.misfire_policy,
                                     "misfire_grace_seconds": j.misfire_grace_ms // 1000,
+                                    "timeout_s": j.timeout_s,
                                     "silent": bool(j.payload.silent), "isolated": bool(j.payload.isolated),
                                     "model_preset": model_preset or model_override or "global", "model_override": model_override,
                                     "next_run_at_ms": j.state.next_run_at_ms, "last_run": run_data,

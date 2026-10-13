@@ -1,6 +1,7 @@
 """Cron service for scheduling agent tasks."""
 
 import asyncio
+import math
 import copy
 import json
 import os
@@ -151,10 +152,37 @@ def _normalize_agent_turn_job(job: CronJob) -> bool:
     return True
 
 
+def _validate_job_timeout_s(value: float | None) -> float | None:
+    """Validate a per-job execution timeout in seconds.
+
+    ``None`` means "use the service default". A set value must be a finite,
+    positive number of seconds no greater than
+    ``CronService.MAX_JOB_TIMEOUT_S``.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("timeout_s must be a number of seconds, or null for the default")
+    timeout = float(value)
+    if not math.isfinite(timeout):
+        raise ValueError("timeout_s must be a finite number of seconds")
+    if timeout <= 0:
+        raise ValueError("timeout_s must be greater than 0 seconds")
+    if timeout > CronService.MAX_JOB_TIMEOUT_S:
+        raise ValueError(
+            f"timeout_s must not exceed {CronService.MAX_JOB_TIMEOUT_S:g} seconds"
+        )
+    return timeout
+
+
 class CronService:
     """Service for managing and executing scheduled jobs."""
 
     _MAX_RUN_HISTORY = 20
+
+    # Upper bound for a per-job ``timeout_s``. A run that outlasts this is a
+    # bug rather than a long job, and would hold a concurrency slot forever.
+    MAX_JOB_TIMEOUT_S = 3600.0
 
     def __init__(
         self,
@@ -275,6 +303,7 @@ class CronService:
                         delete_after_run=j.get("deleteAfterRun", False),
                         misfire_policy=j.get("misfirePolicy", j.get("misfire_policy", "coalesce")),
                         misfire_grace_ms=j.get("misfireGraceMs", j.get("misfire_grace_ms", 60_000)),
+                        timeout_s=j.get("timeoutS", j.get("timeout_s")),
                     )
                     _normalize_agent_turn_job(job)
                     jobs.append(job)
@@ -445,6 +474,7 @@ class CronService:
                     "deleteAfterRun": j.delete_after_run,
                     "misfirePolicy": j.misfire_policy,
                     "misfireGraceMs": j.misfire_grace_ms,
+                    "timeoutS": j.timeout_s,
                 }
                 for j in self._store.jobs
             ]
@@ -649,6 +679,15 @@ class CronService:
         await self._run_claimed(claimed_job, scheduled_ms, detected_ms, token)
         self._finalize_claim(claimed_job, scheduled_ms, token)
 
+    def effective_timeout_s(self, job: CronJob) -> float:
+        """Wall-clock cap for one execution of *job*.
+
+        A job may carry its own ``timeout_s``; otherwise the service default
+        applies. Only jobs that genuinely need a longer single run raise it, so
+        the guardrail stays in place for everything else.
+        """
+        return job.timeout_s if job.timeout_s else self.job_timeout_s
+
     async def _execute_job(self, job: CronJob, scheduled_ms: int | None = None, detected_ms: int | None = None) -> None:
         """Execute a single job."""
         detected_ms = detected_ms if detected_ms is not None else _now_ms()
@@ -656,10 +695,11 @@ class CronService:
         start_ms = _now_ms()
         logger.info("Cron: executing job '{}' ({})", job.name, job.id)
 
+        timeout_s = self.effective_timeout_s(job)
         result = None
         try:
             if self.on_job:
-                result = await asyncio.wait_for(self.on_job(job), timeout=self.job_timeout_s)
+                result = await asyncio.wait_for(self.on_job(job), timeout=timeout_s)
 
             job.state.last_status = "ok"
             job.state.last_error = None
@@ -678,7 +718,7 @@ class CronService:
             logger.exception("Cron: job '{}' was cancelled", job.name)
         except TimeoutError:
             job.state.last_status = "error"
-            job.state.last_error = f"job timed out after {self.job_timeout_s:g}s"
+            job.state.last_error = f"job timed out after {timeout_s:g}s"
             logger.error("Cron: job '{}' timed out", job.name)
         except Exception as e:
             job.state.last_status = "error"
@@ -937,6 +977,7 @@ class CronService:
         isolated: bool = True,
         misfire_policy: Literal["skip", "coalesce"] = "coalesce",
         misfire_grace_ms: int = 60_000,
+        timeout_s: float | None = None,
     ) -> CronJob:
         """Add a new job."""
         now = _now_ms()
@@ -945,6 +986,7 @@ class CronService:
             raise ValueError("misfire_policy must be 'skip' or 'coalesce'")
         if misfire_grace_ms < 0:
             raise ValueError("misfire_grace_ms must be non-negative")
+        timeout_s = _validate_job_timeout_s(timeout_s)
 
         job = CronJob(
             id=str(uuid.uuid4())[:8],
@@ -972,6 +1014,7 @@ class CronService:
             delete_after_run=delete_after_run,
             misfire_policy=misfire_policy,
             misfire_grace_ms=misfire_grace_ms,
+            timeout_s=timeout_s,
         )
         _normalize_agent_turn_job(job)
         store = self._mutate(lambda s: s.jobs.append(job))
