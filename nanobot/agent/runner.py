@@ -16,6 +16,7 @@ from loguru import logger
 
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
 from nanobot.agent.tools.base import ToolResult, adapt_legacy_tool_result
+from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.utils.file_edit_events import (
@@ -587,7 +588,9 @@ class AgentRunner:
                 )
 
             clean = hook.finalize_content(context, response.content)
-            if response.finish_reason != "error" and is_blank_text(clean):
+            message_tool = spec.tools.get("message")
+            already_delivered = isinstance(message_tool, MessageTool) and message_tool._sent_in_turn
+            if response.finish_reason != "error" and is_blank_text(clean) and not already_delivered:
                 empty_content_retries += 1
                 if empty_content_retries < _MAX_EMPTY_RETRIES:
                     logger.warning(
@@ -688,10 +691,17 @@ class AgentRunner:
                     continue
                 break
             if is_blank_text(clean):
-                final_content = EMPTY_FINAL_RESPONSE_MESSAGE
-                stop_reason = "empty_final_response"
-                error = final_content
-                self._append_final_message(messages, final_content)
+                if already_delivered:
+                    # The tool reply is the final answer. Tool results may end
+                    # the history; no synthetic assistant message is needed.
+                    final_content = None
+                    stop_reason = "delivered_via_tool"
+                    error = None
+                else:
+                    final_content = EMPTY_FINAL_RESPONSE_MESSAGE
+                    stop_reason = "empty_final_response"
+                    error = final_content
+                    self._append_final_message(messages, final_content)
                 context.final_content = final_content
                 context.error = error
                 context.stop_reason = stop_reason

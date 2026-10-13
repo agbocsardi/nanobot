@@ -1368,6 +1368,10 @@ class AgentLoop:
         # progress hooks, and session bookkeeping all agree on the run kind.
         effective_metadata = self._effective_turn_metadata(metadata)
 
+        def reply_delivered() -> bool:
+            message_tool = (tools or self.tools).get("message")
+            return isinstance(message_tool, MessageTool) and message_tool._sent_in_turn
+
         loop_hook = AgentProgressHook(
             on_progress=on_progress,
             on_stream=on_stream,
@@ -1380,6 +1384,7 @@ class AgentLoop:
             tool_hint_max_length=self.tool_hint_max_length,
             set_tool_context=self._set_tool_context,
             on_iteration=lambda iteration: setattr(self, "_current_iteration", iteration),
+            reply_delivered=reply_delivered,
         )
         hook: AgentHook = loop_hook
         if not ephemeral and self._extra_hooks:
@@ -2021,7 +2026,7 @@ class AgentLoop:
             self._waiting_runs.mark_complete(
                 resumed_run_id,
                 ok=stop_reason
-                in ("completed", "partial_completion", "max_iterations", "ask_user"),
+                in ("completed", "delivered_via_tool", "partial_completion", "max_iterations", "ask_user"),
             )
         # If this turn hit an ask_user boundary, fill the envelope the tool
         # already persisted with the continuation note and bounded budgets.
@@ -2200,7 +2205,7 @@ class AgentLoop:
         """Assemble the final outbound message from turn results."""
         # MessageTool suppression
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
-            if not had_injections or stop_reason == "empty_final_response":
+            if not had_injections or stop_reason in {"empty_final_response", "delivered_via_tool"}:
                 return None
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
@@ -2382,6 +2387,7 @@ class AgentLoop:
         if (
             (ctx.final_content is None or not ctx.final_content.strip())
             and not ctx.suppress_response
+            and ctx.stop_reason != "delivered_via_tool"
         ):
             ctx.final_content = EMPTY_FINAL_RESPONSE_MESSAGE
 

@@ -375,3 +375,108 @@ async def test_subagent_max_iterations_announces_incomplete_fallback(tmp_path, m
     assert args[5] == "error"
     assert status.phase == "incomplete"
     assert status.stop_reason == "max_iterations"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("final_text", ["", "duplicate reply"])
+async def test_message_tool_delivery_suppresses_retry_and_stream(tmp_path, final_text):
+    from nanobot.agent.hook import AgentHook
+    from nanobot.agent.loop import TurnContext, TurnState
+    from nanobot.agent.turn_delivery import _turn_outcome
+    from nanobot.bus.events import DeliveryResult, InboundMessage
+    from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
+
+    loop = _make_loop(tmp_path)
+    contexts = []
+    run_contexts = []
+
+    class CaptureHook(AgentHook):
+        async def after_iteration(self, context):
+            contexts.append(context)
+
+        async def after_run(self, context):
+            run_contexts.append(context)
+
+    loop._extra_hooks = [CaptureHook()]
+    message_tool = loop.tools.get("message")
+    sent = AsyncMock(return_value=DeliveryResult(status="delivered"))
+    message_tool.set_send_callback(sent)
+    message_tool.start_turn()
+    tool_response = LLMResponse(
+        content="",
+        tool_calls=[ToolCallRequest(id="send", name="message", arguments={"content": "reply"})],
+    )
+    loop.provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content=final_text))
+    stream_calls = 0
+
+    async def chat_stream_with_retry(*, on_content_delta, **kwargs):
+        nonlocal stream_calls
+        stream_calls += 1
+        return tool_response
+
+    loop.provider.chat_stream_with_retry = chat_stream_with_retry
+    published = AsyncMock()
+
+    async def on_stream(delta):
+        await published(delta)
+
+    final, _, messages, reason, injected = await loop._run_agent_loop(
+        [], channel="telegram", chat_id="chat", on_stream=on_stream,
+    )
+
+    assert message_tool._sent_in_turn
+    sent.assert_awaited_once()
+    assert stream_calls == 1
+    loop.provider.chat_with_retry.assert_awaited_once()
+    assert reason == ("delivered_via_tool" if not final_text else "completed")
+    assert contexts[-1].error is None
+    assert run_contexts[-1].error is None
+    assert all(m.get("content") != EMPTY_FINAL_RESPONSE_MESSAGE for m in messages)
+    if not final_text:
+        assert final is None
+        assert messages[-1]["role"] == "tool"
+        assert _turn_outcome(reason) == ("completed", None)
+        session = Session(key="webui:tool-delivery")
+        ctx = TurnContext(
+            msg=InboundMessage(channel="websocket", sender_id="user", chat_id="chat", content="hi"),
+            session_key=session.key,
+            state=TurnState.SAVE,
+            turn_id="tool-delivery",
+            session=session,
+            all_messages=[{"role": "system", "content": "system"}, *messages],
+            stop_reason=reason,
+            ephemeral=True,
+        )
+        await loop._state_save(ctx)
+        assert ctx.final_content is None
+        assert session.messages[-1]["role"] == "tool"
+        assert all(m.get("content") != EMPTY_FINAL_RESPONSE_MESSAGE for m in session.messages)
+    assert loop._assemble_outbound(
+        InboundMessage(channel="telegram", sender_id="user", chat_id="chat", content="hi"),
+        final, messages, reason, injected, on_stream,
+    ) is None
+    if not final_text:
+        assert loop._assemble_outbound(
+            InboundMessage(channel="telegram", sender_id="user", chat_id="chat", content="hi"),
+            final, messages, reason, True, on_stream,
+        ) is None
+    published.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_late_stream_delta_after_message_tool_send_is_not_published(tmp_path):
+    from nanobot.agent.hook import AgentHookContext
+    from nanobot.agent.progress_hook import AgentProgressHook
+
+    loop = _make_loop(tmp_path)
+    message_tool = loop.tools.get("message")
+    message_tool.start_turn()
+    published = AsyncMock()
+    hook = AgentProgressHook(
+        on_stream=published, reply_delivered=lambda: message_tool._sent_in_turn,
+    )
+    assert hook.wants_streaming()
+    message_tool._sent_in_turn = True
+    assert not hook.wants_streaming()
+    await hook.on_stream(AgentHookContext(iteration=2, messages=[]), "duplicate reply")
+    published.assert_not_awaited()
