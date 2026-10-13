@@ -1533,6 +1533,19 @@ class AgentLoop:
             reset_request_context(request_token)
             reset_file_states(file_state_token)
         self._last_usage = result.usage
+        # A per-turn sink survives MessageTool suppressing the outbound response;
+        # shared foreground state is not valid cron audit data.
+        run_usage = effective_metadata.get("_cron_run_usage")
+        if isinstance(run_usage, dict):
+            from nanobot.utils.run_records import build_usage_block
+
+            provider = run_provider or self.provider
+            spec = getattr(provider, "_spec", None)
+            run_usage.update(build_usage_block(
+                result.usage,
+                provider=str(getattr(spec, "name", None) or type(provider).__name__),
+                model=effective_model,
+            ))
         self._record_session_usage(
             session,
             result.usage,

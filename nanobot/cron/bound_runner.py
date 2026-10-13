@@ -88,8 +88,8 @@ def _cron_prompt_ref(prompt: str) -> dict[str, Any]:
     }
 
 
-def _agent_provider_name(agent: BoundCronAgent) -> str:
-    provider = getattr(agent, "provider", None)
+def _agent_provider_name(agent: BoundCronAgent, snapshot: dict[str, Any] | None = None) -> str:
+    provider = (snapshot or {}).get("provider") or getattr(agent, "provider", None)
     spec = getattr(provider, "_spec", None)
     name = getattr(spec, "name", None)
     return str(name or getattr(provider, "__class__", type("x", (), {"__name__": "unknown"})).__name__)
@@ -129,6 +129,8 @@ async def run_bound_cron_job(
         turn_seed=f"cron:{job.id}",
         source_label=job.name,
     )
+    run_usage: dict[str, Any] = {}
+    metadata["_cron_run_usage"] = run_usage
     metadata[CRON_TRIGGER_META] = {
         "job_id": job.id,
         "job_name": job.name,
@@ -212,6 +214,11 @@ async def run_bound_cron_job(
             cron_tool.reset_cron_context(cron_token)
 
     response = resp.content if resp else ""
+    usage = run_usage or build_usage_block(
+        None,
+        provider=_agent_provider_name(agent, snapshot),
+        model=(snapshot or {}).get("model") or getattr(agent, "model", None),
+    )
     if not response:
         delivery_status, delivery_error = "empty", None
     elif job.payload.silent:
@@ -260,22 +267,13 @@ async def run_bound_cron_job(
     # separately measurable from turn duration.
     delivery_finished_at_ms = _now_ms()
     job.state.last_delivery_at_ms = delivery_finished_at_ms
-    # What actually ran + what it cost. provider/model come from the loop's
-    # active runtime for this turn (cron turns do not currently override the
-    # provider). usage is the delta captured by _last_usage for this turn.
-    provider_name = _agent_provider_name(agent)
-    usage_block = build_usage_block(
-        getattr(agent, "last_usage", None),
-        provider=provider_name,
-        model=getattr(agent, "model", None),
-    )
     cron.write_run_record(
         run_id,
         {
             **run_record_base,
             "status": "ok",
             "response": response,
-            "usage": usage_block,
+            "usage": usage,
             "agent_finished_at_ms": agent_finished_at_ms,
             "delivery": {
                 "status": delivery_status,
@@ -351,6 +349,7 @@ async def run_isolated_cron_job(
     # retain. ephemeral=True means the working history is never saved.
     session_key = f"cron:{job.id}:{run_id}"
 
+    run_usage: dict[str, Any] = {}
     cron_tool = agent.tools.get("cron")
     cron_token = None
     if isinstance(cron_tool, CronTool):
@@ -363,7 +362,7 @@ async def run_isolated_cron_job(
             chat_id=chat_id,
             on_progress=_async_noop,
             ephemeral=True,
-            metadata={"_interaction_mode": "cron"},
+            metadata={"_interaction_mode": "cron", "_cron_run_usage": run_usage},
             run_provider=(snapshot.get("provider") if snapshot else None),
             run_model=(snapshot.get("model") if snapshot else None),
             run_context_window_tokens=(
@@ -392,6 +391,11 @@ async def run_isolated_cron_job(
             cron_tool.reset_cron_context(cron_token)
 
     response = resp.content if resp else ""
+    usage = run_usage or build_usage_block(
+        None,
+        provider=_agent_provider_name(agent, snapshot),
+        model=(snapshot or {}).get("model") or getattr(agent, "model", None),
+    )
     delivery_error = None
     delivery_failure: BaseException | None = None
     if not response:
@@ -454,19 +458,13 @@ async def run_isolated_cron_job(
     job.state.last_delivery_error = delivery_error
     job.state.last_delivery_at_ms = delivery_finished_at_ms
 
-    provider_name = _agent_provider_name(agent)
-    usage_block = build_usage_block(
-        getattr(agent, "last_usage", None),
-        provider=provider_name,
-        model=getattr(agent, "model", None),
-    )
     cron.write_run_record(
         run_id,
         {
             **run_record_base,
             "status": "ok",
             "response": response,
-            "usage": usage_block,
+            "usage": usage,
             "agent_finished_at_ms": agent_finished_at_ms,
             "delivery": {
                 "status": delivery_status,

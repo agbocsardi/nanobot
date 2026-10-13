@@ -72,6 +72,30 @@ async def test_loop_records_session_usage_by_model(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_cron_usage_sink_records_run_override(tmp_path):
+    loop = _make_loop(tmp_path)
+    background = MagicMock()
+    background._spec.name = "background-provider"
+    background.chat_with_retry = AsyncMock(return_value=LLMResponse(
+        content="done", tool_calls=[],
+        usage={"prompt_tokens": 10, "completion_tokens": 3},
+    ))
+    loop.tools.get_definitions = MagicMock(return_value=[])
+    sink = {}
+
+    await loop._run_agent_loop(
+        [], metadata={"_cron_run_usage": sink},
+        run_provider=background, run_model="background-model",
+    )
+
+    assert sink["provider"] == "background-provider"
+    assert sink["model"] == "background-model"
+    assert sink["prompt_tokens"] == 10
+    assert sink["completion_tokens"] == 3
+    assert loop.model == "test-model"
+
+
+@pytest.mark.asyncio
 async def test_loop_goal_turn_uses_standard_iteration_budget(tmp_path):
     loop = _make_loop(tmp_path)
     loop.provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
