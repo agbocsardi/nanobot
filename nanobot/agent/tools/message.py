@@ -37,11 +37,16 @@ from nanobot.security.workspace_access import current_tool_workspace
             "Do not set this to the current runtime chat for a normal reply."
         ),
         reply_to=BooleanSchema(
-            description="Optional per-call reply threading override: true quotes the triggering message, "
-            "false disables quoting; omitted uses the channel default."
+            description="Optional per-call reply threading override: true quotes the triggering message "
+            "so it is unambiguous what your reply refers to, false disables quoting; omitted uses "
+            "the channel default. Set true when the message you are answering is no longer the latest "
+            "one, when several exchanges are interleaved, or whenever it would otherwise be unclear "
+            "what you are responding to; leave it off when your message plainly follows the one it "
+            "answers. Judge by whether a quote adds clarity, not by whether one was requested."
         ),
         reply_to_message_id=StringSchema(
-            "Optional ID of a specific message in the destination chat to quote. "
+            "Optional ID of a specific message in the destination chat to quote - for when your "
+            "reply refers to an earlier message that is not the triggering one. "
             "Enables quoting unless reply_to is false."
         ),
         media=ArraySchema(
@@ -177,7 +182,10 @@ class MessageTool(Tool, ContextAware):
             "When generate_image creates images in the current chat, use the message tool "
             "with the artifact paths in the media parameter to deliver the images to the user. "
             "For proactive attachment delivery, use the 'media' parameter with file paths. "
-            "Do NOT use read_file to send files — that only reads content for your own analysis."
+            "Do NOT use read_file to send files - that only reads content for your own analysis. "
+            "Reply threading is a clarity tool, not an opt-in: when a message answers a specific "
+            "earlier one and that would not be obvious, quote it via reply_to (or "
+            "reply_to_message_id for a different message)."
         )
 
     def _resolve_media(self, media: list[str]) -> list[str]:
