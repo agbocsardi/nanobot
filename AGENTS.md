@@ -252,5 +252,12 @@ the *server* killed. The cap confines such a runaway to its own scope. Override
 the cap with `NANOBOT_TEST_MEMORY_MB` (default 3072). Plain
 `uv run --extra dev python -m pytest` still works for a quick, known-small file.
 
+After a merge, `scripts/test-delta.sh` separates new failures from known ones. It
+runs the suite through the same runner and diffs the failing node IDs against
+`.pytest-baseline.json` (git-ignored, per checkout); record that baseline from a
+known-good `main` with `scripts/test-delta.sh --save-baseline`. Exit 1 means new
+failures, and exit 2 means the two runs collected different numbers of tests, so
+a subset run or a broken collection cannot quietly hide failures.
+
 If STT changed, restart Nanobot and send a voice note — a successful
 transcription is the real end-to-end check.

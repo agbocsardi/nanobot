@@ -46,6 +46,7 @@ share/python-wheels/
 htmlcov/
 coverage.xml
 *.cover
+.pytest-baseline.json
 
 # Lock files (project policy)
 poetry.lock
