@@ -78,8 +78,19 @@ def build_config_change_handler(agent: Any, config_path: Path) -> Callable[[], N
     from nanobot.agent.tools.runtime_inspector import fingerprint_file
     from nanobot.config.loader import load_config
 
+    baseline_fingerprint = fingerprint_file(config_path)
+    baseline = None
+    if baseline_fingerprint and baseline_fingerprint == agent.loaded_config_fingerprint:
+        try:
+            baseline = load_config(config_path)
+            if fingerprint_file(config_path) != baseline_fingerprint:
+                baseline = None
+        except Exception:
+            logger.exception("Config watcher: failed to read loaded config baseline")
+
     def on_config_change() -> None:
         try:
+            fresh_fingerprint = fingerprint_file(config_path)
             fresh = load_config(config_path)
         except Exception:
             logger.exception("Config watcher: failed to reload config after change")
@@ -105,9 +116,23 @@ def build_config_change_handler(agent: Any, config_path: Path) -> Callable[[], N
                 return
 
             agent.set_model_preset(effective)
-            # Succeeding here means the only drifted setting was hot-applied, so
-            # rebase the drift baseline and let the runtime inspector agree.
-            agent.loaded_config_fingerprint = fingerprint_file(config_path)
+            # Only rebase if every setting other than the active preset still
+            # matches the verified startup baseline, including on later writes.
+            comparable = fresh.model_copy(deep=True)
+            if baseline is not None:
+                comparable.agents.defaults.model_preset = baseline.agents.defaults.model_preset
+            if (
+                baseline is not None
+                and comparable == baseline
+                and fresh_fingerprint is not None
+                and fingerprint_file(config_path) == fresh_fingerprint
+            ):
+                agent.loaded_config_fingerprint = fresh_fingerprint
+            else:
+                logger.warning(
+                    "Config changed: model preset hot-applied, but other settings remain "
+                    "unapplied; manual restart required"
+                )
             logger.info(
                 "Config changed: hot-applied model preset {!r} ({} -> {})",
                 effective,

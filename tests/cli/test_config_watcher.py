@@ -8,7 +8,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from nanobot.agent.tools.runtime_inspector import fingerprint_file
+import pytest
+
+from nanobot.agent.tools.runtime_inspector import RuntimeInspector, fingerprint_file
 from nanobot.cli import commands
 from nanobot.cli.commands import _run_gateway, build_config_change_handler
 from nanobot.config.loader import load_config, set_config_path
@@ -71,15 +73,43 @@ _LOOP_PRESETS = {**_PRESETS, "default": {"model": "main-model", "provider": "cus
 
 class TestConfigChangeHandler:
 
+    @pytest.mark.parametrize("change_streaming", [False, True])
+    def test_preset_rebase_preserves_unapplied_drift(self, tmp_path: Path, monkeypatch, change_streaming: bool) -> None:
+        config_path = tmp_path / "config.json"
+        _write_config(config_path, model_preset="fast", presets=_PRESETS)
+        recorder = _Recorder()
+        monkeypatch.setattr(commands, "logger", recorder)
+        agent = _FakeAgent(_LOOP_PRESETS, "fast", fingerprint_file(config_path))
+        handler = build_config_change_handler(agent, config_path)
+
+        # A later preset-only write must not swallow drift from an earlier write.
+        for preset in ("slow", "fast"):
+            _write_config(
+                config_path, model_preset=preset, presets=_PRESETS,
+                extra={"channels": {"telegram": {"streaming": True}}} if change_streaming else None,
+            )
+            handler()
+            assert agent.model_preset == preset
+            snapshot = RuntimeInspector(SimpleNamespace(
+                _loaded_config_path=config_path,
+                _loaded_config_fingerprint=agent.loaded_config_fingerprint,
+            ))._config()
+            assert snapshot["restart_required"] is change_streaming
+            assert snapshot["drift_status"] == ("changed" if change_streaming else "current")
+        assert bool(recorder.warnings) is change_streaming
+        if change_streaming:
+            assert all("restart" in warning for warning in recorder.warnings)
+
     def test_model_preset_change_is_hot_applied(self, tmp_path: Path, monkeypatch) -> None:
         config_path = tmp_path / "config.json"
         _write_config(config_path, model_preset="fast", presets=_PRESETS)
         recorder = _Recorder()
         monkeypatch.setattr(commands, "logger", recorder)
-        agent = _FakeAgent(_LOOP_PRESETS, current_preset="fast")
+        agent = _FakeAgent(_LOOP_PRESETS, current_preset="fast", fingerprint=fingerprint_file(config_path))
+        handler = build_config_change_handler(agent, config_path)
 
         _write_config(config_path, model_preset="slow", presets=_PRESETS)
-        build_config_change_handler(agent, config_path)()
+        handler()
 
         assert agent.set_calls == ["slow"]
         assert agent.model_preset == "slow"
@@ -91,10 +121,11 @@ class TestConfigChangeHandler:
         _write_config(config_path, model_preset="fast", presets=_PRESETS)
         recorder = _Recorder()
         monkeypatch.setattr(commands, "logger", recorder)
-        agent = _FakeAgent(_LOOP_PRESETS, current_preset="fast")
+        agent = _FakeAgent(_LOOP_PRESETS, current_preset="fast", fingerprint=fingerprint_file(config_path))
+        handler = build_config_change_handler(agent, config_path)
 
         _write_config(config_path, presets=_PRESETS)
-        build_config_change_handler(agent, config_path)()
+        handler()
 
         assert agent.set_calls == ["default"]
         assert agent.loaded_config_fingerprint == fingerprint_file(config_path)
