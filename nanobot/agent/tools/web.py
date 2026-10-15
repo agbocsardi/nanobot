@@ -38,6 +38,14 @@ _VOLCENGINE_TRAFFIC_TAG = "nanobot"
 _VOLCENGINE_TIME_RANGES = {"OneDay", "OneWeek", "OneMonth", "OneYear"}
 _VOLCENGINE_DATE_RANGE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.\.\d{4}-\d{2}-\d{2}$")
 
+# Brave freshness codes for the shared timeRange vocabulary.
+_BRAVE_FRESHNESS = {"OneDay": "pd", "OneWeek": "pw", "OneMonth": "pm", "OneYear": "py"}
+# Brave accepts at most 3 goggles per query; extra_snippets adds up to 5 more
+# excerpts per result, of which only a couple are folded into the snippet text
+# to keep the injected context bounded.
+_BRAVE_MAX_GOGGLES = 3
+_BRAVE_EXTRA_SNIPPETS_PER_RESULT = 2
+
 # Fork addition (WebUI integration, pinned upstream agent/tools/web.py
 # d0d0a44e): single source of truth for selectable search providers (WebUI
 # settings). Trimmed to the providers this fork's _effective_provider supports;
@@ -63,6 +71,11 @@ class WebSearchConfig(Base):
     base_url: str = ""
     max_results: int = 5
     timeout: int = 30
+    # Brave-only ranking controls; ignored by every other provider.
+    country: str = "NL"
+    search_lang: str = ""
+    extra_snippets: bool = True
+    goggles: list[str] = Field(default_factory=list)
 
 
 class WebFetchConfig(Base):
@@ -185,6 +198,33 @@ async def _stream_with_safe_redirects(
     return None, None, f"Too many redirects: exceeded limit of {MAX_REDIRECTS}"
 
 
+def _brave_content(item: dict[str, Any]) -> str:
+    """Brave description plus a bounded number of extra_snippets for triage."""
+    parts = [item.get("description", "")]
+    extras = item.get("extra_snippets")
+    if isinstance(extras, list):
+        parts.extend(str(s) for s in extras[:_BRAVE_EXTRA_SNIPPETS_PER_RESULT])
+    return " … ".join(p for p in parts if p)
+
+
+def _normalize_brave_freshness(value: Any) -> str | None:
+    """Map the shared timeRange vocabulary onto Brave's freshness parameter."""
+    if value is None:
+        return None
+    time_range = str(value).strip()
+    if not time_range:
+        return None
+    if time_range in _BRAVE_FRESHNESS:
+        return _BRAVE_FRESHNESS[time_range]
+    if _VOLCENGINE_DATE_RANGE_RE.fullmatch(time_range):
+        start, end = time_range.split("..")
+        return f"{start}to{end}"
+    raise ValueError(
+        "timeRange must be OneDay, OneWeek, OneMonth, OneYear, "
+        "or YYYY-MM-DD..YYYY-MM-DD"
+    )
+
+
 def _format_results(query: str, items: list[dict[str, Any]], n: int) -> str:
     """Format provider results into shared plaintext output."""
     if not items:
@@ -228,7 +268,7 @@ def _normalize_volcengine_auth_level(value: Any) -> int | None:
 @tool_parameters(
     tool_parameters_schema(
         query=StringSchema("Search query"),
-        count=IntegerSchema(1, description="Results (1-10)", minimum=1, maximum=10),
+        count=IntegerSchema(1, description="Results (1-20)", minimum=1, maximum=20),
         timeRange=StringSchema(
             "Optional time filter for providers that support it: "
             "OneDay, OneWeek, OneMonth, OneYear, or YYYY-MM-DD..YYYY-MM-DD",
@@ -252,8 +292,9 @@ class WebSearchTool(Tool):
     name = "web_search"
     description = (
         "Search the web. Returns titles, URLs, and snippets. "
-        "count defaults to 5 (max 10). "
-        "Some providers support timeRange, authLevel, and queryRewrite. "
+        "count defaults to 5 (max 20). "
+        "timeRange is honoured by the Brave and Volcengine providers; "
+        "authLevel and queryRewrite are provider-specific. "
         "Use web_fetch to read a specific page in full."
     )
 
@@ -360,7 +401,7 @@ class WebSearchTool(Tool):
     ) -> str:
         self._refresh_config()
         provider = self.config.provider.strip().lower() or "brave"
-        n = min(max(count or self.config.max_results, 1), 10)
+        n = min(max(count or self.config.max_results, 1), 20)
 
         if provider == "olostep":
             return await self._search_olostep(query, n)
@@ -381,7 +422,11 @@ class WebSearchTool(Tool):
         elif provider == "jina":
             return await self._search_jina(query, n)
         elif provider == "brave":
-            return await self._search_brave(query, n)
+            return await self._search_brave(
+                query,
+                n,
+                time_range=kwargs.get("timeRange", kwargs.get("time_range", time_range)),
+            )
         elif provider == "kagi":
             return await self._search_kagi(query, n)
         elif provider == "exa":
@@ -447,22 +492,39 @@ class WebSearchTool(Tool):
         except Exception as e:
             return f"Olostep search error: {type(e).__name__}: {e}"
 
-    async def _search_brave(self, query: str, n: int) -> str:
+    async def _search_brave(self, query: str, n: int, time_range: str | None = None) -> str:
         api_key = self.config.api_key or os.environ.get("BRAVE_API_KEY", "")
         if not api_key:
             logger.warning("BRAVE_API_KEY not set, falling back to DuckDuckGo")
             return await self._search_duckduckgo(query, n)
+        try:
+            freshness = _normalize_brave_freshness(time_range)
+        except ValueError as e:
+            return f"Error: {e}"
         try:
             headers = {
                 "Accept": "application/json",
                 "X-Subscription-Token": api_key,
                 "User-Agent": self.user_agent,
             }
+            # Repeated keys (goggles) need a sequence of pairs, not a dict.
+            params: list[tuple[str, str]] = [("q", query), ("count", str(n))]
+            if self.config.country:
+                params.append(("country", self.config.country))
+            if self.config.search_lang:
+                params.append(("search_lang", self.config.search_lang))
+            if freshness:
+                params.append(("freshness", freshness))
+            if self.config.extra_snippets:
+                params.append(("extra_snippets", "true"))
+            for goggle in self.config.goggles[:_BRAVE_MAX_GOGGLES]:
+                if goggle.strip():
+                    params.append(("goggles", goggle.strip()))
             async with httpx.AsyncClient(proxy=self.proxy) as client:
                 for attempt in range(2):
                     r = await client.get(
                         "https://api.search.brave.com/res/v1/web/search",
-                        params={"q": query, "count": n},
+                        params=params,
                         headers=headers,
                         timeout=10.0,
                     )
@@ -473,7 +535,7 @@ class WebSearchTool(Tool):
                         await asyncio.sleep(1.0)
                 r.raise_for_status()
             items = [
-                {"title": x.get("title", ""), "url": x.get("url", ""), "content": x.get("description", "")}
+                {"title": x.get("title", ""), "url": x.get("url", ""), "content": _brave_content(x)}
                 for x in r.json().get("web", {}).get("results", [])
             ]
             return _format_results(query, items, n)

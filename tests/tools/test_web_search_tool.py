@@ -12,11 +12,22 @@ def _tool(
     api_key: str = "",
     base_url: str = "",
     user_agent: str | None = None,
+    **config_kwargs,
 ) -> WebSearchTool:
     return WebSearchTool(
-        config=WebSearchConfig(provider=provider, api_key=api_key, base_url=base_url),
+        config=WebSearchConfig(
+            provider=provider, api_key=api_key, base_url=base_url, **config_kwargs
+        ),
         user_agent=user_agent,
     )
+
+
+def _multi(params) -> dict[str, list[str]]:
+    """Collect request params, preserving repeated keys such as goggles."""
+    out: dict[str, list[str]] = {}
+    for key, value in params:
+        out.setdefault(key, []).append(value)
+    return out
 
 
 def _response(
@@ -63,6 +74,176 @@ async def test_brave_search(monkeypatch):
     result = await tool.execute(query="nanobot", count=1)
     assert "NanoBot" in result
     assert "https://example.com" in result
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("OneDay", "pd"),
+        ("OneWeek", "pw"),
+        ("OneMonth", "pm"),
+        ("OneYear", "py"),
+        (None, None),
+        ("", None),
+    ],
+)
+def test_normalize_brave_freshness(value, expected):
+    from nanobot.agent.tools.web import _normalize_brave_freshness
+
+    assert _normalize_brave_freshness(value) == expected
+
+
+def test_normalize_brave_freshness_rejects_unknown_value():
+    from nanobot.agent.tools.web import _normalize_brave_freshness
+
+    with pytest.raises(ValueError):
+        _normalize_brave_freshness("Yesterday")
+
+
+@pytest.mark.asyncio
+async def test_brave_sends_default_ranking_params(monkeypatch):
+    captured: dict[str, list[str]] = {}
+
+    async def mock_get(self, url, **kw):
+        captured.update(_multi(kw["params"]))
+        return _response(json={"web": {"results": []}})
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", mock_get)
+    tool = _tool(provider="brave", api_key="brave-key")
+    await tool.execute(query="fietspomp", count=5)
+
+    assert captured["country"] == ["NL"]
+    assert captured["extra_snippets"] == ["true"]
+    # Not configured: must be omitted rather than sent empty.
+    assert "search_lang" not in captured
+    assert "freshness" not in captured
+    assert "goggles" not in captured
+
+
+@pytest.mark.asyncio
+async def test_brave_omits_ranking_params_when_disabled(monkeypatch):
+    captured: dict[str, list[str]] = {}
+
+    async def mock_get(self, url, **kw):
+        captured.update(_multi(kw["params"]))
+        return _response(json={"web": {"results": []}})
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", mock_get)
+    tool = _tool(provider="brave", api_key="brave-key", country="", extra_snippets=False)
+    await tool.execute(query="test")
+
+    assert "country" not in captured
+    assert "extra_snippets" not in captured
+
+
+@pytest.mark.asyncio
+async def test_brave_sends_search_lang_and_goggles(monkeypatch):
+    captured: dict[str, list[str]] = {}
+
+    async def mock_get(self, url, **kw):
+        captured.update(_multi(kw["params"]))
+        return _response(json={"web": {"results": []}})
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", mock_get)
+    tool = _tool(
+        provider="brave",
+        api_key="brave-key",
+        search_lang="nl",
+        goggles=["$boost=3,site=example.com", "$discard,site=spam.example"],
+    )
+    await tool.execute(query="test")
+
+    assert captured["search_lang"] == ["nl"]
+    assert captured["goggles"] == [
+        "$boost=3,site=example.com",
+        "$discard,site=spam.example",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_brave_goggles_capped_at_three(monkeypatch):
+    captured: dict[str, list[str]] = {}
+
+    async def mock_get(self, url, **kw):
+        captured.update(_multi(kw["params"]))
+        return _response(json={"web": {"results": []}})
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", mock_get)
+    tool = _tool(
+        provider="brave",
+        api_key="brave-key",
+        goggles=[f"$boost=1,site={name}.example" for name in "abcd"],
+    )
+    await tool.execute(query="test")
+
+    assert len(captured["goggles"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_brave_time_range_maps_to_freshness(monkeypatch):
+    captured: dict[str, list[str]] = {}
+
+    async def mock_get(self, url, **kw):
+        captured.update(_multi(kw["params"]))
+        return _response(json={"web": {"results": []}})
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", mock_get)
+    tool = _tool(provider="brave", api_key="brave-key")
+
+    await tool.execute(query="test", timeRange="OneWeek")
+    assert captured["freshness"] == ["pw"]
+
+    await tool.execute(query="test", timeRange="2026-10-01..2026-10-15")
+    assert captured["freshness"] == ["2026-10-01to2026-10-15"]
+
+
+@pytest.mark.asyncio
+async def test_brave_invalid_time_range_returns_error():
+    tool = _tool(provider="brave", api_key="brave-key")
+    result = await tool.execute(query="test", timeRange="Yesterday")
+
+    assert "timeRange must be" in result
+
+
+@pytest.mark.asyncio
+async def test_brave_count_capped_at_twenty(monkeypatch):
+    captured: dict[str, list[str]] = {}
+
+    async def mock_get(self, url, **kw):
+        captured.update(_multi(kw["params"]))
+        return _response(json={"web": {"results": []}})
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", mock_get)
+    tool = _tool(provider="brave", api_key="brave-key")
+    await tool.execute(query="test", count=50)
+
+    assert captured["count"] == ["20"]
+
+
+@pytest.mark.asyncio
+async def test_brave_folds_extra_snippets_into_snippet(monkeypatch):
+    async def mock_get(self, url, **kw):
+        return _response(json={
+            "web": {
+                "results": [
+                    {
+                        "title": "Example",
+                        "url": "https://example.com",
+                        "description": "main text",
+                        "extra_snippets": ["extra one", "extra two", "extra three"],
+                    }
+                ]
+            }
+        })
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", mock_get)
+    tool = _tool(provider="brave", api_key="brave-key")
+    result = await tool.execute(query="test")
+
+    assert "main text" in result
+    assert "extra one" in result
+    assert "extra two" in result
+    assert "extra three" not in result
 
 
 @pytest.mark.asyncio
