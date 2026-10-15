@@ -112,9 +112,9 @@ async def test_brave_sends_default_ranking_params(monkeypatch):
     tool = _tool(provider="brave", api_key="brave-key")
     await tool.execute(query="fietspomp", count=5)
 
-    assert captured["country"] == ["NL"]
     assert captured["extra_snippets"] == ["true"]
     # Not configured: must be omitted rather than sent empty.
+    assert "country" not in captured
     assert "search_lang" not in captured
     assert "freshness" not in captured
     assert "goggles" not in captured
@@ -148,11 +148,13 @@ async def test_brave_sends_search_lang_and_goggles(monkeypatch):
     tool = _tool(
         provider="brave",
         api_key="brave-key",
+        country="NL",
         search_lang="nl",
         goggles=["$boost=3,site=example.com", "$discard,site=spam.example"],
     )
     await tool.execute(query="test")
 
+    assert captured["country"] == ["NL"]
     assert captured["search_lang"] == ["nl"]
     assert captured["goggles"] == [
         "$boost=3,site=example.com",

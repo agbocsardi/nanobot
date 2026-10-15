@@ -72,7 +72,8 @@ class WebSearchConfig(Base):
     max_results: int = 5
     timeout: int = 30
     # Brave-only ranking controls; ignored by every other provider.
-    country: str = "NL"
+    # Neutral by default: set e.g. "NL" to bias results toward a market.
+    country: str = ""
     search_lang: str = ""
     extra_snippets: bool = True
     goggles: list[str] = Field(default_factory=list)
