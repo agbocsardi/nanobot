@@ -1276,77 +1276,124 @@ class TelegramChannel(BaseChannel):
             thread_kwargs = {}
             if message_thread_id := meta.get("message_thread_id"):
                 thread_kwargs["message_thread_id"] = message_thread_id
-            raw_text = buf.text
+            await self._finalize_stream_message(int_chat_id, buf, thread_kwargs)
+            self._stream_bufs.pop(chat_id, None)
+            return
 
-            # Fork-native: edit the streamed preview into a rich message
-            # (Bot API 10.1). buf.message_id is guaranteed set by the early
-            # return above; gated by rich_streaming. Falls back to the legacy
-            # HTML edit below on any failure.
-            if (
-                buf.message_id
-                and self.config.rich_messages
-                and self.config.rich_streaming
-                and not getattr(self, "_rich_send_disabled", False)
-            ):
-                if await self._try_edit_rich(int_chat_id, buf.message_id, raw_text):
-                    self._remember_sent_message(chat_id, buf.message_id, raw_text)
-                    self._stream_bufs.pop(chat_id, None)
-                    return
+        await self._update_stream_preview(chat_id, delta, meta)
 
-            # Legacy path: edit existing streaming message with HTML
-            html_chunks = _split_telegram_markdown_html(raw_text, TELEGRAM_HTML_MAX_LEN)
-            primary_html = html_chunks[0]
-            extra_html_chunks = html_chunks[1:]
+    async def _finalize_stream_message(
+        self, int_chat_id: int, buf: "_StreamBuf", thread_kwargs: dict,
+    ) -> None:
+        """Apply final formatting to a completed stream message or overflow chunk."""
+        chat_id = str(int_chat_id)
+        raw_text = buf.text
+        # Upgrade completed previews to rich messages, with the legacy HTML fallback.
+        if (
+            buf.message_id
+            and self.config.rich_messages
+            and self.config.rich_streaming
+            and not getattr(self, "_rich_send_disabled", False)
+        ):
+            if await self._try_edit_rich(int_chat_id, buf.message_id, raw_text):
+                self._remember_sent_message(chat_id, buf.message_id, raw_text)
+                return
+
+        # Legacy path: edit existing streaming message with HTML
+        html_chunks = _split_telegram_markdown_html(raw_text, TELEGRAM_HTML_MAX_LEN)
+        primary_html = html_chunks[0]
+        extra_html_chunks = html_chunks[1:]
+        try:
+            await self._call_with_retry(
+                self._app.bot.edit_message_text,
+                chat_id=int_chat_id, message_id=buf.message_id,
+                text=primary_html, parse_mode="HTML",
+            )
+            self._remember_sent_message(
+                chat_id, buf.message_id, self._visible_html_text(primary_html)
+            )
+        except BadRequest as e:
+            # Only fall back to plain text on actual HTML parse/format errors.
+            # Network errors (TimedOut, NetworkError) should propagate immediately
+            # to avoid doubling connection demand during pool exhaustion.
+            if self._is_not_modified_error(e):
+                self.logger.debug("Final stream edit already applied for {}", chat_id)
+                return
+            self.logger.debug("Final stream edit failed (HTML), trying plain: {}", e)
+            # Fall back to raw markdown (not HTML) so users don't see raw tags.
+            primary_plain = split_message(raw_text, TELEGRAM_MAX_MESSAGE_LEN)[0] if len(raw_text) > TELEGRAM_MAX_MESSAGE_LEN else raw_text
             try:
                 await self._call_with_retry(
                     self._app.bot.edit_message_text,
                     chat_id=int_chat_id, message_id=buf.message_id,
-                    text=primary_html, parse_mode="HTML",
+                    text=primary_plain,
+                )
+                self._remember_sent_message(chat_id, buf.message_id, primary_plain)
+            except Exception as e2:
+                if self._is_not_modified_error(e2):
+                    self.logger.debug("Final stream plain edit already applied for {}", chat_id)
+                else:
+                    self.logger.warning("Final stream edit failed: {}", e2)
+                    raise  # Let ChannelManager handle retry
+        for extra_html_chunk in extra_html_chunks:
+            try:
+                sent = await self._call_with_retry(
+                    self._app.bot.send_message,
+                    chat_id=int_chat_id, text=extra_html_chunk,
+                    parse_mode="HTML",
+                    **thread_kwargs,
                 )
                 self._remember_sent_message(
-                    chat_id, buf.message_id, self._visible_html_text(primary_html)
+                    chat_id, sent.message_id, self._visible_html_text(extra_html_chunk)
                 )
-            except BadRequest as e:
-                # Only fall back to plain text on actual HTML parse/format errors.
-                # Network errors (TimedOut, NetworkError) should propagate immediately
-                # to avoid doubling connection demand during pool exhaustion.
-                if self._is_not_modified_error(e):
-                    self.logger.debug("Final stream edit already applied for {}", chat_id)
-                    self._stream_bufs.pop(chat_id, None)
-                    return
-                self.logger.debug("Final stream edit failed (HTML), trying plain: {}", e)
-                # Fall back to raw markdown (not HTML) so users don't see raw tags.
-                primary_plain = split_message(raw_text, TELEGRAM_MAX_MESSAGE_LEN)[0] if len(raw_text) > TELEGRAM_MAX_MESSAGE_LEN else raw_text
-                try:
-                    await self._call_with_retry(
-                        self._app.bot.edit_message_text,
-                        chat_id=int_chat_id, message_id=buf.message_id,
-                        text=primary_plain,
-                    )
-                    self._remember_sent_message(chat_id, buf.message_id, primary_plain)
-                except Exception as e2:
-                    if self._is_not_modified_error(e2):
-                        self.logger.debug("Final stream plain edit already applied for {}", chat_id)
-                    else:
-                        self.logger.warning("Final stream edit failed: {}", e2)
-                        raise  # Let ChannelManager handle retry
-            for extra_html_chunk in extra_html_chunks:
-                try:
-                    sent = await self._call_with_retry(
-                        self._app.bot.send_message,
-                        chat_id=int_chat_id, text=extra_html_chunk,
-                        parse_mode="HTML",
-                        **thread_kwargs,
-                    )
-                    self._remember_sent_message(
-                        chat_id, sent.message_id, self._visible_html_text(extra_html_chunk)
-                    )
-                except Exception:
-                    # Fall back to _send_text which handles HTML→plain gracefully.
-                    await self._send_text(int_chat_id, extra_html_chunk)
-            self._stream_bufs.pop(chat_id, None)
-            return
+            except Exception:
+                # Fall back to _send_text which handles HTML→plain gracefully.
+                await self._send_text(int_chat_id, extra_html_chunk)
 
+    async def _send_finalized_chunk(
+        self, chat_id: int, text: str, thread_kwargs: dict,
+    ) -> None:
+        """Deliver one completed overflow chunk in its final format, in a single call.
+
+        Sending the chunk as plain text and editing it into shape afterwards
+        costs two Bot API calls per chunk and briefly shows the stripped
+        preview, so each chunk is sent once, already formatted.
+        """
+        if (
+            self.config.rich_messages
+            and self.config.rich_streaming
+            and not getattr(self, "_rich_send_disabled", False)
+        ):
+            result = await self._try_send_rich(chat_id, text, thread_kwargs=thread_kwargs)
+            if result is not None:
+                if result.status == "delivered":
+                    return
+                if result.status == "failed":
+                    # Definitely rejected, so the legacy fallback cannot duplicate.
+                    self.logger.debug(
+                        "Overflow chunk rich send rejected, falling back to legacy path: {}",
+                        result.error,
+                    )
+                else:
+                    # Ambiguous outcome: resending would duplicate the chunk.
+                    raise RuntimeError(f"Stream overflow chunk send failed: {result.error}")
+        for html_chunk in _split_telegram_markdown_html(text, TELEGRAM_HTML_MAX_LEN):
+            try:
+                sent = await self._call_with_retry(
+                    self._app.bot.send_message,
+                    chat_id=chat_id, text=html_chunk, parse_mode="HTML",
+                    **thread_kwargs,
+                )
+                self._remember_sent_message(
+                    str(chat_id), sent.message_id, self._visible_html_text(html_chunk)
+                )
+            except Exception:
+                # Fall back to _send_text which handles HTML→plain gracefully.
+                await self._send_text(chat_id, html_chunk, None, thread_kwargs)
+
+    async def _update_stream_preview(self, chat_id: str, delta: str, meta: dict) -> None:
+        int_chat_id = int(chat_id)
+        stream_id = meta.get("_stream_id")
         buf = self._stream_bufs.get(chat_id)
         if buf is None or (stream_id is not None and buf.stream_id is not None and buf.stream_id != stream_id):
             buf = _StreamBuf(stream_id=stream_id)
@@ -1414,24 +1461,11 @@ class TelegramChannel(BaseChannel):
         chunks = _split_telegram_markdown(buf.text, TELEGRAM_MAX_MESSAGE_LEN)
         if len(chunks) <= 1:
             return
-        try:
-            await self._call_with_retry(
-                self._app.bot.edit_message_text,
-                chat_id=chat_id, message_id=buf.message_id,
-                text=chunks[0],
-            )
-            if buf.message_id is not None:
-                self._remember_sent_message(str(chat_id), buf.message_id, chunks[0])
-        except Exception as e:
-            if not self._is_not_modified_error(e):
-                self.logger.warning("Stream overflow edit failed: {}", e)
-                raise
+        await self._finalize_stream_message(
+            chat_id, _StreamBuf(text=chunks[0], message_id=buf.message_id), thread_kwargs,
+        )
         for chunk in chunks[1:-1]:
-            sent = await self._call_with_retry(
-                self._app.bot.send_message,
-                chat_id=chat_id, text=chunk, **thread_kwargs,
-            )
-            self._remember_sent_message(str(chat_id), sent.message_id, chunk)
+            await self._send_finalized_chunk(chat_id, chunk, thread_kwargs)
         tail = chunks[-1]
         sent = await self._call_with_retry(
             self._app.bot.send_message,

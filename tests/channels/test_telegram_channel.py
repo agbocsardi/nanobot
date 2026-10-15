@@ -1171,6 +1171,83 @@ async def test_send_delta_incremental_edit_treats_not_modified_as_success() -> N
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("rich_streaming", [True, False])
+@pytest.mark.parametrize("padding", [3800, 7800])
+async def test_stream_overflow_preserves_final_formatting(rich_streaming, padding) -> None:
+    from nanobot.channels.telegram import TELEGRAM_MAX_MESSAGE_LEN, _split_telegram_markdown
+
+    channel = TelegramChannel(
+        TelegramConfig(
+            enabled=True, token="123:abc", allow_from=["*"], rich_streaming=rich_streaming,
+        ),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    channel._app.bot.do_api_request = AsyncMock()
+    channel._app.bot.edit_message_text = AsyncMock()
+    channel._app.bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=99))
+    table = "| Name | Value |\n| --- | --- |\n| alpha | **one** |\n\n"
+    leading = table + "x" * padding + "\n\n"
+    text = leading + "**tail** " * 50
+    chunks = _split_telegram_markdown(text, TELEGRAM_MAX_MESSAGE_LEN)
+    assert len(chunks) >= 2
+    assert table.strip() in chunks[0]
+
+    await channel.send_delta("123", table)
+    channel._stream_bufs["123"].last_edit = 0.0
+    await channel.send_delta("123", text[len(table):])
+    assert channel._stream_bufs["123"].text == chunks[-1]
+    await channel.send_delta("123", "", {"_stream_end": True})
+
+    # Compare every completed overflow chunk to the normal stream-end path.
+    from nanobot.channels.telegram import (
+        TELEGRAM_HTML_MAX_LEN,
+        _split_telegram_markdown_html,
+        _strip_md_block,
+    )
+
+    expected_html = [
+        _split_telegram_markdown_html(chunk, TELEGRAM_HTML_MAX_LEN)[0] for chunk in chunks
+    ]
+    if rich_streaming:
+        payloads = [
+            call.kwargs["api_kwargs"]
+            for call in channel._app.bot.do_api_request.await_args_list
+        ]
+        assert [payload["rich_message"] for payload in payloads] == [
+            {"markdown": chunk} for chunk in chunks
+        ]
+        channel._app.bot.edit_message_text.assert_not_awaited()
+    else:
+        edits = [call.kwargs["text"] for call in channel._app.bot.edit_message_text.await_args_list]
+        sends = [
+            call.kwargs["text"]
+            for call in channel._app.bot.send_message.await_args_list
+            if call.kwargs.get("parse_mode") == "HTML"
+        ]
+        # The leading chunk and the tail are edited in place; the chunks between
+        # them are standalone messages.
+        assert edits == [expected_html[0], expected_html[-1]]
+        assert sends == expected_html[1:-1]
+        assert all(
+            call.kwargs["parse_mode"] == "HTML"
+            for call in channel._app.bot.edit_message_text.await_args_list
+        )
+        channel._app.bot.do_api_request.assert_not_awaited()
+
+    # Each chunk is delivered once, already formatted: sending it plain and
+    # editing it afterwards doubles the API calls and flashes a stripped preview.
+    intermediates = {_strip_md_block(chunk) for chunk in chunks[1:-1]}
+    plain_sends = [
+        call.kwargs.get("text")
+        for call in channel._app.bot.send_message.await_args_list
+        if call.kwargs.get("parse_mode") is None
+    ]
+    assert not (intermediates & set(plain_sends))
+    assert "123" not in channel._stream_bufs
+
+
+@pytest.mark.asyncio
 async def test_send_delta_incremental_edit_splits_oversized_buffer() -> None:
     """Mid-stream overflow: once buf.text exceeds Telegram's limit, split into
     chunks, edit the current message with the first chunk, and re-anchor the
