@@ -1,4 +1,4 @@
-"""Threshold compaction shares checkpoint generation, never memory archival."""
+"""Threshold compaction shares checkpoint generation; hidden ranges stay in searchable history."""
 
 from unittest.mock import AsyncMock
 
@@ -6,7 +6,7 @@ import pytest
 
 from nanobot.agent.loop import AgentLoop
 from nanobot.bus.queue import MessageBus
-from nanobot.session.compaction import CompactionError, RequestBudget
+from nanobot.session.compaction import CompactionError, RequestBudget, latest_checkpoint
 from tests.session.test_compaction import SummaryProvider, transcript
 
 
@@ -40,7 +40,7 @@ async def test_threshold_delegates_to_shared_checkpoint_operation(tmp_path):
     assert snapshot.output == 256
 
 
-async def test_threshold_does_not_archive_or_advance_cursor(tmp_path):
+async def test_untriggered_threshold_compaction_commits_nothing(tmp_path):
     loop = make_loop(tmp_path)
     session = loop.sessions.get_or_create("cli:test")
     session.messages = transcript()
@@ -50,6 +50,27 @@ async def test_threshold_does_not_archive_or_advance_cursor(tmp_path):
     assert session.last_consolidated == 0
     loop.consolidator.archive.assert_not_awaited()
     assert loop.context.memory.read_unprocessed_history(since_cursor=0) == []
+
+
+async def test_committed_checkpoint_archives_hidden_range(tmp_path):
+    loop = make_loop(tmp_path)
+    session = loop.sessions.get_or_create("cli:test")
+    session.messages = transcript()
+    session.add_message("user", "filler " * 20000)
+    session.add_message("assistant", "noted " * 200)
+    loop.sessions.save(session)
+
+    assert await loop.process_direct("please continue the task", session_key="cli:test")
+
+    session = loop.sessions.get_or_create("cli:test")
+    checkpoint = latest_checkpoint(session.metadata)
+    assert checkpoint is not None
+    ids = [m.get("_entry_id") for m in session.messages]
+    hidden = ids.index(checkpoint["first_kept_entry_id"])
+    assert hidden > 0
+
+    archived = loop.context.memory.read_unprocessed_history(since_cursor=0)
+    assert [entry["message_count"] for entry in archived] == [hidden]
 
 
 async def test_checkpoint_summary_is_projected_not_injected_twice(tmp_path):

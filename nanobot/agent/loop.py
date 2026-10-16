@@ -1530,6 +1530,11 @@ class AgentLoop:
                 ids = {m.get("_entry_id") for m in session.messages}
                 if checkpoint["first_kept_entry_id"] not in ids:
                     raise CompactionError("Checkpoint does not reference the durable transcript")
+                # Keep the checkpointed range in the searchable log too; the
+                # checkpoint only governs what the model replays.
+                self.consolidator.archive_compacted_range(
+                    session, checkpoint, previous=persisted_checkpoint,
+                )
                 session.metadata.setdefault(CHECKPOINTS, []).append(checkpoint)
                 session.metadata.pop("_last_summary", None)
                 self._clear_runtime_checkpoint(session)

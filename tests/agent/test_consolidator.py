@@ -1,4 +1,4 @@
-"""Explicit memory archival is separate from non-destructive session checkpoints."""
+"""Session checkpoints are non-destructive: they never trim, and the range they hide stays in searchable history."""
 
 import asyncio
 from copy import deepcopy
@@ -147,7 +147,45 @@ class TestContinuityCheckpoints:
         assert "_last_summary" not in session.metadata
         assert session.get_history(projected=True, include_entry_ids=True)[0]["_compaction_summary"]
         consolidator.flush_before_compaction.assert_awaited_once_with(session)
-        assert consolidator.store.read_unprocessed_history(since_cursor=0) == []
+        archived = consolidator.store.read_unprocessed_history(since_cursor=0)
+        assert len(archived) == 1
+        assert archived[0]["kind"] == "conversation"
+        assert archived[0]["session_key"] == session.key
+        assert "Original goal" in consolidator.store.history_entry_text(archived[0])
+
+    async def test_archived_range_is_exactly_the_hidden_prefix(self, checkpoint_consolidator):
+        consolidator = checkpoint_consolidator
+        session = consolidator.sessions.get_or_create("test:checkpoint")
+        assert await consolidator.compact_idle_session(session.key)
+        checkpoint = latest_checkpoint(session.metadata)
+        ids = [m.get("_entry_id") for m in session.messages]
+        hidden = ids.index(checkpoint["first_kept_entry_id"])
+        assert 0 < hidden < len(ids)
+
+        archived = consolidator.store.read_unprocessed_history(since_cursor=0)
+        assert len(archived) == 1
+        assert archived[0]["message_count"] == hidden
+
+    async def test_successive_checkpoints_archive_disjoint_ranges(self, checkpoint_consolidator):
+        consolidator = checkpoint_consolidator
+        session = consolidator.sessions.get_or_create("test:checkpoint")
+        assert await consolidator.compact_idle_session(session.key)
+        first_end = [m.get("_entry_id") for m in session.messages].index(
+            latest_checkpoint(session.metadata)["first_kept_entry_id"]
+        )
+
+        for index in range(8):
+            session.add_message("user", f"FOLLOW-UP-{index} " + "more context " * 200)
+            session.add_message("assistant", "acknowledged " * 200)
+        consolidator.sessions.save(session)
+        assert await consolidator.compact_idle_session(session.key) is not None
+
+        ids = [m.get("_entry_id") for m in session.messages]
+        second_end = ids.index(latest_checkpoint(session.metadata)["first_kept_entry_id"])
+        assert second_end > first_end
+
+        archived = consolidator.store.read_unprocessed_history(since_cursor=0)
+        assert [entry["message_count"] for entry in archived] == [first_end, second_end - first_end]
 
     @pytest.mark.parametrize("reason,text", [("error", "failed"), ("length", "partial"),
                                              ("aborted", "partial"), ("stop", "")])

@@ -1388,6 +1388,91 @@ class Consolidator:
         self.sessions.save(session)
 
     @staticmethod
+    def _checkpoint_covered_messages(
+        session: Session,
+        checkpoint: dict[str, Any],
+        previous: dict[str, Any] | None,
+    ) -> list[dict[str, Any]]:
+        """Transcript slice a checkpoint moves out of the replay window."""
+        boundary = checkpoint.get("first_kept_entry_id")
+        if not boundary:
+            return []
+        ids = [m.get("_entry_id") for m in session.messages]
+        if boundary not in ids:
+            logger.warning(
+                "Checkpoint boundary absent from transcript for {}; nothing archived",
+                session.key,
+            )
+            return []
+        end = ids.index(boundary)
+        prior_boundary = (previous or {}).get("first_kept_entry_id")
+        if prior_boundary and prior_boundary in ids:
+            start = ids.index(prior_boundary)
+        else:
+            if prior_boundary:
+                logger.warning(
+                    "Previous checkpoint boundary missing for {}; archiving from last_consolidated",
+                    session.key,
+                )
+            start = min(session.last_consolidated, end)
+        return session.messages[start:end]
+
+    def archive_compacted_range(
+        self,
+        session: Session,
+        checkpoint: dict[str, Any],
+        *,
+        previous: dict[str, Any] | None,
+    ) -> bool:
+        """Mirror the range a continuity checkpoint just hid into history.jsonl.
+
+        Checkpoints govern what the model replays; ``memory/history.jsonl`` is
+        the separate, searchable log that memory search, Dream and the
+        reflection jobs read. Hiding a range behind a checkpoint must not take
+        it out of that log, so the newly covered messages are appended as one
+        structured conversation record.
+
+        No summary is attached: checkpoint summaries are cumulative, so storing
+        one per record would repeat earlier context in every later record.
+
+        Never raises. The caller persists the advanced usage watermark in the
+        same save as the checkpoint. Returns True when a record was appended.
+        """
+        try:
+            messages = self._checkpoint_covered_messages(session, checkpoint, previous)
+        except Exception:
+            logger.exception("Could not resolve checkpoint range for {}", session.key)
+            return False
+        if not messages:
+            return False
+        usage = self._usage_to_archive(session.key)
+        try:
+            pruned = self._prune_messages(messages)
+            if not pruned:
+                raise ValueError("nothing survived pruning")
+            self.store.append_conversation_history(
+                pruned,
+                session_key=session.key,
+                usage=usage,
+            )
+        except Exception:
+            logger.warning(
+                "Structured archive of compacted range failed for {}; raw-dumping",
+                session.key,
+            )
+            try:
+                self.store.raw_archive(messages, session_key=session.key, usage=usage)
+            except Exception:
+                logger.exception(
+                    "Could not archive compacted range for {}: those messages are no "
+                    "longer reachable through memory search",
+                    session.key,
+                )
+                return False
+        session.metadata["_usage_archived"] = usage_snapshot(session.metadata.get("usage"))
+        return True
+
+    @staticmethod
     def _full_unconsolidated_history(
         session: Session,
         *,
@@ -1597,6 +1682,9 @@ class Consolidator:
                         or self.sessions.get_or_create(session.key) is not session):
                     raise CompactionError("Session changed during compaction; checkpoint discarded")
                 old_metadata = deepcopy(session.metadata)
+                # Keep the checkpointed range in the searchable log too; the
+                # checkpoint only governs what the model replays.
+                self.archive_compacted_range(session, checkpoint, previous=prior)
                 session.metadata.setdefault(CHECKPOINTS, []).append(checkpoint)
                 session.metadata.pop("_last_summary", None)
                 try:
