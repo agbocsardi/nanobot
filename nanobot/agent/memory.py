@@ -514,8 +514,13 @@ class MemoryStore:
                                 existing = json.loads(line)
                             except json.JSONDecodeError:
                                 continue
+                            if not isinstance(existing, dict):
+                                continue
+                            cursor = self._valid_cursor(existing.get("cursor"))
+                            if cursor is None:
+                                continue
                             if existing.get("_idempotency_key") == idempotency_key:
-                                return int(existing["cursor"])
+                                return cursor
             cursor = self._next_cursor()
             record["cursor"] = cursor
             with open(self.history_file, "a", encoding="utf-8") as f:
@@ -1249,6 +1254,7 @@ class MemoryStore:
         session_key: str | None = None,
         max_chars: int | None = None,
         usage: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
     ) -> None:
         """Fallback: dump raw messages to history.jsonl without LLM summarization."""
         limit = max_chars if max_chars is not None else _RAW_ARCHIVE_MAX_CHARS
@@ -1262,6 +1268,7 @@ class MemoryStore:
             }],
             session_key=session_key,
             usage=usage,
+            idempotency_key=idempotency_key,
         )
         logger.warning(
             "Memory consolidation degraded: raw-archived {} messages", len(messages)
@@ -1471,20 +1478,21 @@ class Consolidator:
             return False
         if not messages:
             return False
+        archive_key = fingerprint({
+            "session_key": session.key,
+            "entry_ids": [message.get("_entry_id") for message in messages],
+        })
+        idempotency_key = f"compacted-range:{archive_key}"
         usage = self._usage_to_archive(session.key)
         try:
             pruned = self._prune_messages(messages)
             if not pruned:
                 raise ValueError("nothing survived pruning")
-            archive_key = fingerprint({
-                "session_key": session.key,
-                "entry_ids": [message.get("_entry_id") for message in messages],
-            })
             self.store.append_conversation_history(
                 pruned,
                 session_key=session.key,
                 usage=usage,
-                idempotency_key=f"compacted-range:{archive_key}",
+                idempotency_key=idempotency_key,
             )
         except Exception:
             logger.warning(
@@ -1492,7 +1500,10 @@ class Consolidator:
                 session.key,
             )
             try:
-                self.store.raw_archive(messages, session_key=session.key, usage=usage)
+                self.store.raw_archive(
+                    messages, session_key=session.key, usage=usage,
+                    idempotency_key=idempotency_key,
+                )
             except Exception:
                 logger.exception(
                     "Could not archive compacted range for {}: those messages are no "

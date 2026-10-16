@@ -90,6 +90,19 @@ async def test_failed_atomic_save_leaves_transcript_and_checkpoint_unchanged(tmp
     original = deepcopy(session.messages)
     save = loop.sessions.save
     failed = False
+    append = loop.consolidator.store.append_conversation_history
+    append_calls = 0
+
+    def fail_structured_once(*args, **kwargs):
+        nonlocal append_calls
+        append_calls += 1
+        if append_calls == 1:
+            raise OSError("simulated structured archive failure")
+        return append(*args, **kwargs)
+
+    monkeypatch.setattr(
+        loop.consolidator.store, "append_conversation_history", fail_structured_once,
+    )
 
     def fail_once(candidate, **kwargs):
         nonlocal failed
@@ -108,8 +121,19 @@ async def test_failed_atomic_save_leaves_transcript_and_checkpoint_unchanged(tmp
     assert loaded.messages == original
     assert not latest_checkpoint(loaded.metadata)
 
-    # Retry commits the checkpoint, while the pre-save archive append is deduplicated.
+    # First structured append fails; raw fallback succeeds before the save fails.
+    archives_after_failure = [
+        entry for entry in loop.consolidator.store._read_entries()
+        if entry.get("session_key") == session.key
+        and entry.get("kind") == "conversation"
+    ]
+    assert len(archives_after_failure) == 1
+    assert archives_after_failure[0]["messages"][0]["content"].startswith("[RAW]")
+    assert append_calls == 2
+
+    # Retry commits the checkpoint, and the keyed fallback record is not duplicated.
     assert await loop.consolidator.compact_session(loaded)
+    assert append_calls == 3
     archives = [
         entry for entry in loop.consolidator.store._read_entries()
         if entry.get("session_key") == session.key
