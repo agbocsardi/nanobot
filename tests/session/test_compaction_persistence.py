@@ -89,13 +89,16 @@ async def test_failed_atomic_save_leaves_transcript_and_checkpoint_unchanged(tmp
     loop.sessions.save(session)
     original = deepcopy(session.messages)
     save = loop.sessions.save
+    failed = False
 
-    def fail_commit(candidate, **kwargs):
-        if latest_checkpoint(candidate.metadata):
+    def fail_once(candidate, **kwargs):
+        nonlocal failed
+        if latest_checkpoint(candidate.metadata) and not failed:
+            failed = True
             raise OSError("simulated fsync failure")
         save(candidate, **kwargs)
 
-    monkeypatch.setattr(loop.sessions, "save", fail_commit)
+    monkeypatch.setattr(loop.sessions, "save", fail_once)
     with pytest.raises(OSError, match="simulated"):
         await loop.consolidator.compact_session(session)
     assert session.messages == original
@@ -104,3 +107,12 @@ async def test_failed_atomic_save_leaves_transcript_and_checkpoint_unchanged(tmp
     loaded = loop.sessions.get_or_create(session.key)
     assert loaded.messages == original
     assert not latest_checkpoint(loaded.metadata)
+
+    # Retry commits the checkpoint, while the pre-save archive append is deduplicated.
+    assert await loop.consolidator.compact_session(loaded)
+    archives = [
+        entry for entry in loop.consolidator.store._read_entries()
+        if entry.get("session_key") == session.key
+        and entry.get("kind") == "conversation"
+    ]
+    assert len(archives) == 1

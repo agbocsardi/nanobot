@@ -469,6 +469,7 @@ class MemoryStore:
         max_chars: int | None = None,
         usage: dict[str, Any] | None = None,
         summary: str | None = None,
+        idempotency_key: str | None = None,
     ) -> int:
         """Append a structured conversation archive entry to history.jsonl.
 
@@ -495,12 +496,26 @@ class MemoryStore:
             record["summary"] = truncate_text(strip_think(summary.strip()), _ARCHIVE_SUMMARY_MAX_CHARS)
         if usage:
             record["usage"] = usage
-        return self._append_history_record(record)
+        if idempotency_key:
+            record["_idempotency_key"] = idempotency_key
+        return self._append_history_record(record, idempotency_key=idempotency_key)
 
-    def _append_history_record(self, record: dict[str, Any]) -> int:
+    def _append_history_record(
+        self, record: dict[str, Any], *, idempotency_key: str | None = None,
+    ) -> int:
         # Cursor allocation and the append must be atomic: concurrent writers
         # could otherwise read the same current cursor and emit duplicates.
         with self._append_lock:
+            if idempotency_key:
+                with suppress(FileNotFoundError):
+                    with open(self.history_file, "r", encoding="utf-8") as history:
+                        for line in history:
+                            try:
+                                existing = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            if existing.get("_idempotency_key") == idempotency_key:
+                                return int(existing["cursor"])
             cursor = self._next_cursor()
             record["cursor"] = cursor
             with open(self.history_file, "a", encoding="utf-8") as f:
@@ -1438,6 +1453,8 @@ class Consolidator:
         Never raises. The caller persists the advanced usage watermark in the
         same save as the checkpoint. Returns True when a record was appended.
         """
+        from nanobot.session.compaction import fingerprint
+
         try:
             messages = self._checkpoint_covered_messages(session, checkpoint, previous)
         except Exception:
@@ -1450,10 +1467,15 @@ class Consolidator:
             pruned = self._prune_messages(messages)
             if not pruned:
                 raise ValueError("nothing survived pruning")
+            archive_key = fingerprint({
+                "session_key": session.key,
+                "entry_ids": [message.get("_entry_id") for message in messages],
+            })
             self.store.append_conversation_history(
                 pruned,
                 session_key=session.key,
                 usage=usage,
+                idempotency_key=f"compacted-range:{archive_key}",
             )
         except Exception:
             logger.warning(
