@@ -182,16 +182,26 @@ def _tool_image_references(content: Any, workspace: Path | None) -> list[str]:
 
 
 def _sanitize_tool_result(content: Any, workspace: Path | None) -> Any:
-    """Keep bounded text evidence while replacing embedded images with safe references."""
+    """Keep textual evidence and safe provider fields, excluding embedded image payloads."""
     if not isinstance(content, list):
         return content
 
-    text_blocks = [
-        block for block in content
-        if isinstance(block, dict) and block.get("type") == "text"
-        and isinstance(block.get("text"), str)
-    ]
-    text_blocks = deepcopy(text_blocks)
+    text_blocks = []
+    for block in content:
+        if not (
+            isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+        ):
+            continue
+        # Keep provider fields used by replay, but don't persist arbitrary fields
+        # (which could smuggle image payloads or private metadata on a text block).
+        public = strip_private_fields(block)
+        safe_block = {"type": "text", "text": public["text"]}
+        for key in ("cache_control", "citations", "annotations"):
+            if key in public:
+                safe_block[key] = deepcopy(public[key])
+        text_blocks.append(safe_block)
     text_blocks.extend(
         {"type": "text", "text": f"[image: {ref}; re-read via read_file]"}
         for ref in _tool_image_references(content, workspace)
