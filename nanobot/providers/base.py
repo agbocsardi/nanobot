@@ -16,6 +16,7 @@ from typing import Any, Literal, cast
 import json_repair
 from loguru import logger
 
+from nanobot.providers.errors import is_context_overflow
 from nanobot.utils.helpers import image_placeholder_text, sanitize_surrogates_deep
 
 
@@ -812,9 +813,8 @@ class LLMProvider(ABC):
 
         # Safety net: ensure the first non-system message is not a bare
         # ``assistant`` message.  Providers like GLM reject system→assistant
-        # with error 1214.  This can happen when upstream truncation (e.g.
-        # _snip_history) drops the only user message.  Insert a synthetic
-        # user message to keep the sequence valid.
+        # with error 1214. Imported or assistant-first histories may lack a
+        # user turn; insert a synthetic user message to keep the sequence valid.
         for i, msg in enumerate(merged):
             if msg.get("role") != "system":
                 if msg.get("role") == "assistant" and not msg.get("tool_calls"):
@@ -1134,6 +1134,11 @@ class LLMProvider(ABC):
             attempt += 1
             response = await call(**kw)
             if response.finish_reason != "error":
+                return response
+            # Context recovery belongs to the owning runner, not transport
+            # retries or the legacy image-stripping fallback. Summarizers also
+            # need a genuinely bounded single-call mode.
+            if retry_mode == "none" or is_context_overflow(response):
                 return response
             last_response = response
             if should_retry_guard is not None and not should_retry_guard():
