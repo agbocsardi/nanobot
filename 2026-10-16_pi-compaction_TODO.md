@@ -11,9 +11,11 @@
 
 ## Idle microcompaction follow-up
 
-- [ ] Replace idle LLM compaction with durable, no-LLM tool-result projection; retain scheduler admission/backoff safeguards.
-- [ ] Apply placeholders only to normal model inputs; use stored tool results for manual/token-pressure summaries and preserve JSONL originals.
-- [ ] Align token estimates, reset behavior and configuration docs; migrate affected existing checks and validate runtime/reload behavior.
+- [x] Replace idle LLM compaction with durable, no-LLM tool-result projection; retain scheduler admission/backoff safeguards.
+- [x] Apply placeholders only to normal model inputs; use stored tool results for manual/token-pressure summaries and preserve JSONL originals.
+- [x] Align token estimates, reset behavior and configuration docs; migrate affected existing checks and validate runtime/reload behavior.
+
+Completed follow-up implementation, review, commit mapping and verification are recorded in `2026-10-16_transcript-retention_TODO.md`. Final focused suite: 510 passed; full current and untouched baseline both 3,585 passed / 3 existing email timeouts. No push/deploy/restart.
 
 ## Log
 
