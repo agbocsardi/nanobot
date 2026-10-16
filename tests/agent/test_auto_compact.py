@@ -332,7 +332,9 @@ class TestAutoCompact:
         session.add_message("user", "inspect these results")
         for i in range(12):
             _add_tool_turn(session, "output", i)
-            session.messages[-1]["content"] = f"evidence-{i} " * 100
+            session.messages[-1]["content"] = [
+                {"type": "text", "text": f"evidence-{i} " * 100},
+            ]
         loop.sessions.save(session)
         originals = [dict(m) for m in session.messages]
 
@@ -341,7 +343,9 @@ class TestAutoCompact:
         projected = microcompact(session.get_history(projected=True, include_entry_ids=True),
                                  session.metadata[MICROCOMPACT_THROUGH])
         results = [m for m in projected if m["role"] == "tool"]
-        assert [m["content"] for m in results[:2]] == ["[exec result omitted from context]"] * 2
+        assert [m["content"] for m in results[:2]] == [
+            [{"type": "text", "text": "[exec result omitted from context]"}],
+        ] * 2
         assert results[2]["content"] == session.messages[6]["content"]
         assert session.messages == originals
         assert loop.context.memory.read_unprocessed_history(since_cursor=0) == []
@@ -462,19 +466,18 @@ class TestAutoCompactIdleDetection:
         session.updated_at = datetime.now() - timedelta(minutes=20)
         loop.sessions.save(session)
 
-        archived_messages = []
-        loop.consolidator.compact_idle_session = _make_fake_compact(
-            loop, track_archived=archived_messages,
-        )
+        microcompact_idle = AsyncMock(wraps=loop.consolidator.microcompact_idle_session)
+        loop.consolidator.microcompact_idle_session = microcompact_idle
 
-        # Simulate proactive archive completing before message arrives
+        # Simulate idle projection completing before message arrives
         await loop.auto_compact._archive("cli:test")
 
         msg = InboundMessage(channel="cli", sender_id="user", chat_id="test", content="new msg")
         await loop._process_message(msg)
 
         session_after = loop.sessions.get_or_create("cli:test")
-        assert archived_messages == []
+        microcompact_idle.assert_awaited_once_with("cli:test")
+        assert MICROCOMPACT_THROUGH in session_after.metadata
         assert any(m["content"] == "old user 0" for m in session_after.messages)
         assert any(m["content"] == "new msg" for m in session_after.messages)
         await loop.close_mcp()
@@ -527,8 +530,6 @@ class TestAutoCompactIdleDetection:
             session.add_message("assistant", f"resp{i}")
         session.updated_at = datetime.now() - timedelta(minutes=20)
         loop.sessions.save(session)
-
-        loop.consolidator.compact_idle_session = _make_fake_compact(loop)
 
         msg = InboundMessage(channel="cli", sender_id="user", chat_id="test", content="/new")
         response = await loop._process_message(msg)
@@ -589,9 +590,7 @@ class TestAutoCompactSystemMessages:
         session.updated_at = datetime.now() - timedelta(minutes=20)
         loop.sessions.save(session)
 
-        loop.consolidator.compact_idle_session = _make_fake_compact(loop)
-
-        # Simulate proactive archive completing before system message arrives
+        # Simulate idle projection completing before system message arrives
         await loop.auto_compact._archive("cli:test")
 
         msg = InboundMessage(
@@ -669,19 +668,14 @@ class TestAutoCompactEdgeCases:
         session.updated_at = datetime.now() - timedelta(minutes=20)
         loop.sessions.save(session)
 
-        archived_messages = []
-        loop.consolidator.compact_idle_session = _make_fake_compact(
-            loop, track_archived=archived_messages,
-        )
-
-        # Simulate proactive archive completing before message arrives
+        # Idle microcompaction preserves the runtime checkpoint and transcript.
         await loop.auto_compact._archive("cli:test")
 
         msg = InboundMessage(channel="cli", sender_id="user", chat_id="test", content="continue")
         await loop._process_message(msg)
 
         session_after = loop.sessions.get_or_create("cli:test")
-        assert archived_messages == []
+        assert MICROCOMPACT_THROUGH in session_after.metadata
         assert any(m["content"] == "previous message" for m in session_after.messages)
         assert any(m["content"] == "interrupted response" for m in session_after.messages)
 
@@ -764,9 +758,7 @@ class TestAutoCompactIntegration:
         session.updated_at = datetime.now() - timedelta(minutes=20)
         loop.sessions.save(session)
 
-        loop.consolidator.compact_idle_session = _make_fake_compact(loop)
-
-        # Simulate proactive archive completing before message arrives
+        # Simulate idle projection completing before message arrives
         await loop.auto_compact._archive("cli:test")
 
         msg = InboundMessage(
@@ -838,14 +830,14 @@ class TestProactiveAutoCompact:
         session.updated_at = datetime.now() - timedelta(minutes=20)
         loop.sessions.save(session)
 
-        _fake_compact = _make_fake_compact(loop)
-        loop.consolidator.compact_idle_session = _fake_compact
+        operation = AsyncMock(wraps=loop.consolidator.microcompact_idle_session)
+        loop.consolidator.microcompact_idle_session = operation
 
         await self._run_check_expired(loop)
 
         session_after = loop.sessions.get_or_create("dream:20260602-155256")
         assert len(session_after.messages) == 12
-        assert _fake_compact.state["count"] == 0
+        operation.assert_not_awaited()
         assert "dream:20260602-155256" not in loop.auto_compact._archiving
         assert "dream:20260602-155256" not in loop.auto_compact._summaries
         await loop.close_mcp()
@@ -929,8 +921,6 @@ class TestProactiveAutoCompact:
         session.updated_at = datetime.now() - timedelta(minutes=20)
         loop.sessions.save(session)
 
-        loop.consolidator.compact_idle_session = _make_fake_compact(loop)
-
         await self._run_check_expired(loop)
 
         # Empty session should not produce a summary
@@ -946,12 +936,12 @@ class TestProactiveAutoCompact:
         session.updated_at = datetime.now() - timedelta(minutes=20)
         loop.sessions.save(session)
 
-        _fake_compact = _make_fake_compact(loop)
-        loop.consolidator.compact_idle_session = _fake_compact
+        operation = AsyncMock(wraps=loop.consolidator.microcompact_idle_session)
+        loop.consolidator.microcompact_idle_session = operation
 
         # Simulate an active agent task for this session
         await self._run_check_expired(loop, active_session_keys={"cli:test"})
-        assert _fake_compact.state["count"] == 0
+        operation.assert_not_awaited()
 
         session_after = loop.sessions.get_or_create("cli:test")
         assert len(session_after.messages) == 12  # All messages preserved
@@ -1028,8 +1018,6 @@ class TestProactiveAutoCompact:
         session = loop.sessions.get_or_create("cli:test")
         session.updated_at = datetime.now() - timedelta(minutes=20)
         loop.sessions.save(session)
-
-        loop.consolidator.compact_idle_session = _make_fake_compact(loop)
 
         # First tick: skips (no messages), refreshes updated_at
         await self._run_check_expired(loop)

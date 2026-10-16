@@ -33,9 +33,23 @@ def microcompact(
     for index in eligible[:-_KEEP_RECENT]:
         message = messages[index]
         content = message.get("content")
-        if isinstance(content, str) and len(content) >= _MIN_CHARS:
+        is_blocks = isinstance(content, list)
+        if is_blocks:
+            if any(
+                not isinstance(block, dict)
+                or block.get("type") != "text"
+                or not isinstance(block.get("text"), str)
+                or block["text"].startswith("[image: ")
+                for block in content
+            ):
+                continue
+            text = "".join(block["text"] for block in content)
+        else:
+            text = content if isinstance(content, str) else ""
+        if len(text) >= _MIN_CHARS:
+            placeholder = f"[{message['name']} result omitted from context]"
             updated[index] = {
                 **message,
-                "content": f"[{message['name']} result omitted from context]",
+                "content": [{"type": "text", "text": placeholder}] if is_blocks else placeholder,
             }
     return updated

@@ -1216,7 +1216,16 @@ class MemoryStore:
         cleaned: list[dict[str, Any]] = []
         for original in messages:
             message = sanitize_message_for_persistence(original)
-            content = strip_think(str(message.get("content") or ""))
+            content = message.get("content") or ""
+            if message.get("role") == "tool":
+                name = str(message.get("name") or "tool")
+                if isinstance(content, list):
+                    content = " ".join(
+                        block.get("text", "") for block in content
+                        if isinstance(block, dict) and block.get("type") == "text"
+                    )
+                content = f"[tool result omitted: {name}, {len(str(content))} chars]"
+            content = strip_think(str(content))
             if not content:
                 continue
             record: dict[str, Any] = {

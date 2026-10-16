@@ -116,3 +116,25 @@ async def test_failed_atomic_save_leaves_transcript_and_checkpoint_unchanged(tmp
         and entry.get("kind") == "conversation"
     ]
     assert len(archives) == 1
+    first_key = archives[0]["_idempotency_key"]
+
+    # A fresh /new transcript under the same session key is a different range.
+    loaded.clear()
+    loaded.add_message("user", "fresh conversation")
+    loaded.add_message("assistant", "new evidence")
+    loaded.add_message("user", "retained suffix")
+    loop.sessions.save(loaded)
+    new_checkpoint = {
+        "first_kept_entry_id": loaded.messages[-1]["_entry_id"],
+        "source_end_id": loaded.messages[-1]["_entry_id"],
+    }
+    assert loop.consolidator.archive_compacted_range(
+        loaded, new_checkpoint, previous=None,
+    )
+    archives = [
+        entry for entry in loop.consolidator.store._read_entries()
+        if entry.get("session_key") == session.key
+        and entry.get("kind") == "conversation"
+    ]
+    assert len(archives) == 2
+    assert archives[1]["_idempotency_key"] != first_key

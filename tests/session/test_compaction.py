@@ -80,12 +80,13 @@ async def test_split_summary_iteration_and_reload_parity(tmp_path):
     session.messages = transcript()
     sessions.save(session)
     originals = deepcopy(session.messages)
-    # Generate from the existing redacted persistence representation.
+    # Generate from retained authoritative session evidence.
     engine = CompactionEngine(provider, budget(provider))
     first = await engine.prepare(session.messages, recent_tokens=40)
     assert first["turn_prefix_summary"]
     assert "Original goal" in str(provider.requests)
-    assert first["details"]["read_files"] == []  # Tool args retain their existing redaction.
+    assert first["details"]["read_files"] == ["work.txt"]
+    assert "evidence evidence" in str(provider.requests)
     session.metadata[CHECKPOINTS] = [first]
     sessions.save(session, fsync=True)
     projection = session.get_history(projected=True)
