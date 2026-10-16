@@ -44,8 +44,16 @@ async def test_pending_batches_commit_once_and_reload_with_checkpoint(tmp_path):
     loop.sessions.invalidate(session.key)
     loaded = loop.sessions.get_or_create(session.key)
     assert loaded.get_history(projected=True) == projection
-    assert all(m["content"].startswith("[tool result omitted:") for m in loaded.messages if m["role"] == "tool")
-    assert all(tc["function"]["arguments"] == "{}" for m in loaded.messages for tc in m.get("tool_calls", []))
+    assert [m["content"] for m in loaded.messages if m["role"] == "tool"] == [
+        m["content"] for m in session.messages if m["role"] == "tool"
+    ]
+    assert [
+        tc["function"]["arguments"]
+        for m in loaded.messages for tc in m.get("tool_calls", [])
+    ] == [
+        tc["function"]["arguments"]
+        for m in session.messages for tc in m.get("tool_calls", [])
+    ]
     loop.consolidator.flush_before_compaction.assert_awaited()
 
 
@@ -81,13 +89,29 @@ async def test_failed_atomic_save_leaves_transcript_and_checkpoint_unchanged(tmp
     loop.sessions.save(session)
     original = deepcopy(session.messages)
     save = loop.sessions.save
+    failed = False
+    append = loop.consolidator.store.append_conversation_history
+    append_calls = 0
 
-    def fail_commit(candidate, **kwargs):
-        if latest_checkpoint(candidate.metadata):
+    def fail_structured_once(*args, **kwargs):
+        nonlocal append_calls
+        append_calls += 1
+        if append_calls == 1:
+            raise OSError("simulated structured archive failure")
+        return append(*args, **kwargs)
+
+    monkeypatch.setattr(
+        loop.consolidator.store, "append_conversation_history", fail_structured_once,
+    )
+
+    def fail_once(candidate, **kwargs):
+        nonlocal failed
+        if latest_checkpoint(candidate.metadata) and not failed:
+            failed = True
             raise OSError("simulated fsync failure")
         save(candidate, **kwargs)
 
-    monkeypatch.setattr(loop.sessions, "save", fail_commit)
+    monkeypatch.setattr(loop.sessions, "save", fail_once)
     with pytest.raises(OSError, match="simulated"):
         await loop.consolidator.compact_session(session)
     assert session.messages == original
@@ -96,3 +120,45 @@ async def test_failed_atomic_save_leaves_transcript_and_checkpoint_unchanged(tmp
     loaded = loop.sessions.get_or_create(session.key)
     assert loaded.messages == original
     assert not latest_checkpoint(loaded.metadata)
+
+    # First structured append fails; raw fallback succeeds before the save fails.
+    archives_after_failure = [
+        entry for entry in loop.consolidator.store._read_entries()
+        if entry.get("session_key") == session.key
+        and entry.get("kind") == "conversation"
+    ]
+    assert len(archives_after_failure) == 1
+    assert archives_after_failure[0]["messages"][0]["content"].startswith("[RAW]")
+    assert append_calls == 2
+
+    # Retry commits the checkpoint, and the keyed fallback record is not duplicated.
+    assert await loop.consolidator.compact_session(loaded)
+    assert append_calls == 3
+    archives = [
+        entry for entry in loop.consolidator.store._read_entries()
+        if entry.get("session_key") == session.key
+        and entry.get("kind") == "conversation"
+    ]
+    assert len(archives) == 1
+    first_key = archives[0]["_idempotency_key"]
+
+    # A fresh /new transcript under the same session key is a different range.
+    loaded.clear()
+    loaded.add_message("user", "fresh conversation")
+    loaded.add_message("assistant", "new evidence")
+    loaded.add_message("user", "retained suffix")
+    loop.sessions.save(loaded)
+    new_checkpoint = {
+        "first_kept_entry_id": loaded.messages[-1]["_entry_id"],
+        "source_end_id": loaded.messages[-1]["_entry_id"],
+    }
+    assert loop.consolidator.archive_compacted_range(
+        loaded, new_checkpoint, previous=None,
+    )
+    archives = [
+        entry for entry in loop.consolidator.store._read_entries()
+        if entry.get("session_key") == session.key
+        and entry.get("kind") == "conversation"
+    ]
+    assert len(archives) == 2
+    assert archives[1]["_idempotency_key"] != first_key

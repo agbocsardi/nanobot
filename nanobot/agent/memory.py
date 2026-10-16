@@ -469,6 +469,7 @@ class MemoryStore:
         max_chars: int | None = None,
         usage: dict[str, Any] | None = None,
         summary: str | None = None,
+        idempotency_key: str | None = None,
     ) -> int:
         """Append a structured conversation archive entry to history.jsonl.
 
@@ -495,12 +496,31 @@ class MemoryStore:
             record["summary"] = truncate_text(strip_think(summary.strip()), _ARCHIVE_SUMMARY_MAX_CHARS)
         if usage:
             record["usage"] = usage
-        return self._append_history_record(record)
+        if idempotency_key:
+            record["_idempotency_key"] = idempotency_key
+        return self._append_history_record(record, idempotency_key=idempotency_key)
 
-    def _append_history_record(self, record: dict[str, Any]) -> int:
+    def _append_history_record(
+        self, record: dict[str, Any], *, idempotency_key: str | None = None,
+    ) -> int:
         # Cursor allocation and the append must be atomic: concurrent writers
         # could otherwise read the same current cursor and emit duplicates.
         with self._append_lock:
+            if idempotency_key:
+                with suppress(FileNotFoundError):
+                    with open(self.history_file, "r", encoding="utf-8") as history:
+                        for line in history:
+                            try:
+                                existing = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            if not isinstance(existing, dict):
+                                continue
+                            cursor = self._valid_cursor(existing.get("cursor"))
+                            if cursor is None:
+                                continue
+                            if existing.get("_idempotency_key") == idempotency_key:
+                                return cursor
             cursor = self._next_cursor()
             record["cursor"] = cursor
             with open(self.history_file, "a", encoding="utf-8") as f:
@@ -1201,7 +1221,16 @@ class MemoryStore:
         cleaned: list[dict[str, Any]] = []
         for original in messages:
             message = sanitize_message_for_persistence(original)
-            content = strip_think(str(message.get("content") or ""))
+            content = message.get("content") or ""
+            if message.get("role") == "tool":
+                name = str(message.get("name") or "tool")
+                if isinstance(content, list):
+                    content = " ".join(
+                        block.get("text", "") for block in content
+                        if isinstance(block, dict) and block.get("type") == "text"
+                    )
+                content = f"[tool result omitted: {name}, {len(str(content))} chars]"
+            content = strip_think(str(content))
             if not content:
                 continue
             record: dict[str, Any] = {
@@ -1225,6 +1254,7 @@ class MemoryStore:
         session_key: str | None = None,
         max_chars: int | None = None,
         usage: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
     ) -> None:
         """Fallback: dump raw messages to history.jsonl without LLM summarization."""
         limit = max_chars if max_chars is not None else _RAW_ARCHIVE_MAX_CHARS
@@ -1238,6 +1268,7 @@ class MemoryStore:
             }],
             session_key=session_key,
             usage=usage,
+            idempotency_key=idempotency_key,
         )
         logger.warning(
             "Memory consolidation degraded: raw-archived {} messages", len(messages)
@@ -1438,6 +1469,8 @@ class Consolidator:
         Never raises. The caller persists the advanced usage watermark in the
         same save as the checkpoint. Returns True when a record was appended.
         """
+        from nanobot.session.compaction import fingerprint
+
         try:
             messages = self._checkpoint_covered_messages(session, checkpoint, previous)
         except Exception:
@@ -1445,6 +1478,11 @@ class Consolidator:
             return False
         if not messages:
             return False
+        archive_key = fingerprint({
+            "session_key": session.key,
+            "entry_ids": [message.get("_entry_id") for message in messages],
+        })
+        idempotency_key = f"compacted-range:{archive_key}"
         usage = self._usage_to_archive(session.key)
         try:
             pruned = self._prune_messages(messages)
@@ -1454,6 +1492,7 @@ class Consolidator:
                 pruned,
                 session_key=session.key,
                 usage=usage,
+                idempotency_key=idempotency_key,
             )
         except Exception:
             logger.warning(
@@ -1461,7 +1500,10 @@ class Consolidator:
                 session.key,
             )
             try:
-                self.store.raw_archive(messages, session_key=session.key, usage=usage)
+                self.store.raw_archive(
+                    messages, session_key=session.key, usage=usage,
+                    idempotency_key=idempotency_key,
+                )
             except Exception:
                 logger.exception(
                     "Could not archive compacted range for {}: those messages are no "
@@ -1479,7 +1521,13 @@ class Consolidator:
         include_timestamps: bool = False,
     ) -> list[dict[str, Any]]:
         """Return the complete continuity projection for prompt estimation."""
-        return session.get_history(projected=True, include_timestamps=include_timestamps)
+        from nanobot.session.microcompaction import MICROCOMPACT_THROUGH, microcompact
+
+        return microcompact(
+            session.get_history(projected=True, include_timestamps=include_timestamps,
+                                include_entry_ids=True),
+            session.metadata.get(MICROCOMPACT_THROUGH),
+        )
 
     def estimate_session_prompt_tokens(
         self,
@@ -1633,7 +1681,7 @@ class Consolidator:
         budget_snapshot = RequestBudget.freeze(
             self.provider, self.model, self.context_window_tokens, self.max_completion_tokens,
         )
-        history = session.get_history(projected=True)
+        history = self._full_unconsolidated_history(session)
         prompt = self._build_messages(history=history, current_message="")
         if (len(session.messages) <= FILE_MAX_MESSAGES
                 and budget_snapshot.estimate(self.provider, prompt, self._get_tool_definitions()) < (
@@ -1842,11 +1890,36 @@ class Consolidator:
         return {k: record.get(k) for k in ("result", "range", "trust", "destinations")}
 
 
+    async def microcompact_idle_session(self, session_key: str) -> int:
+        """Persist a replay boundary only: no LLM, memory flush or history archive."""
+        from copy import deepcopy
+
+        from nanobot.session.microcompaction import MICROCOMPACT_THROUGH, microcompact
+
+        async with self.get_lock(session_key):
+            session = self.sessions.get_or_create(session_key)
+            history = session.get_history(projected=True, include_entry_ids=True)
+            through = next((m["_entry_id"] for m in reversed(history) if m.get("_entry_id")), None)
+            if session.metadata.get(MICROCOMPACT_THROUGH) == through:
+                return 0
+            projected = microcompact(history, through)
+            changed = sum(left["content"] != right["content"]
+                          for left, right in zip(history, projected))
+            old_metadata = deepcopy(session.metadata)
+            session.metadata[MICROCOMPACT_THROUGH] = through
+            try:
+                self.sessions.save(session, fsync=True)
+            except BaseException:
+                session.metadata = old_metadata
+                raise
+            logger.info("Idle microcompact: {} tool results hidden for {}", changed, session_key)
+            return changed
+
     async def compact_idle_session(
         self,
         session_key: str,
     ) -> str | None:
-        """Idle and manual compaction use the same non-destructive checkpoint engine."""
+        """Full manual compaction from stored results (legacy method name)."""
         session = self.sessions.get_or_create(session_key)
         if not session.messages:
             session.updated_at = datetime.now()

@@ -28,6 +28,7 @@ from nanobot.session.compaction import (
     ensure_ids,
     project,
 )
+from nanobot.session.microcompaction import microcompact
 from nanobot.utils.file_edit_events import (
     StreamingFileEditTracker,
     build_file_edit_end_event,
@@ -175,6 +176,7 @@ class AgentRunSpec:
     precompaction_callback: Any | None = None
     compaction_engine_factory: Any | None = None
     continuity_checkpoint: dict[str, Any] | None = None
+    microcompact_through: str | None = None
 
 
 @dataclass(slots=True)
@@ -451,8 +453,14 @@ class AgentRunner:
                     raise CompactionError(getattr(exc, "reason", str(exc))) from exc
             if spec.precompaction_callback is not None:
                 await spec.precompaction_callback()
+            # Summaries consume stored tool results, never idle placeholders.
+            # The engine bounds/chunks this larger input independently; progress
+            # is still measured against the actual (microcompacted) chat payload.
+            summary_payload = await self._govern_payload(
+                spec, messages, checkpoint, for_compaction=True,
+            ) if spec.microcompact_through else before_payload
             candidate = await engine.prepare(
-                before_payload, previous=checkpoint, recent_tokens=recent_tokens,
+                summary_payload, previous=checkpoint, recent_tokens=recent_tokens,
                 tools=spec.tools.get_definitions(),
             )
             after_payload = await self._govern_payload(spec, messages, candidate)
@@ -1200,13 +1208,17 @@ class AgentRunner:
         kwargs = self._build_request_kwargs(spec, messages, tools=None)
         return await self.provider.chat_with_retry(**kwargs)
 
-    async def _govern_payload(self, spec, messages, checkpoint=None):
-        """One model projection: checkpoint → repair → vision → image budget.
+    async def _govern_payload(self, spec, messages, checkpoint=None, *, for_compaction=False):
+        """One projection: checkpoint → idle microcompact → repair → vision → images.
+
+        Full summaries bypass only idle microcompaction, retaining stored results.
 
         Synthetic repair never changes the owning transcript/append boundary.
         Retry a transient repair failure once; never send an ungoverned fallback.
         """
         projected = project(messages, checkpoint)
+        if not for_compaction:
+            projected = microcompact(projected, spec.microcompact_through)
         for attempt in range(2):
             try:
                 repaired = self._backfill_missing_tool_results(self._drop_orphan_tool_results(projected))

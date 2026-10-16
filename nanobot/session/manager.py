@@ -35,7 +35,6 @@ _TOOL_CALL_ECHO_RE = re.compile(r'^\s*(?:generate_image|message)\([^)]*\)\s*$')
 _SESSION_PREVIEW_MAX_CHARS = 120
 _SESSION_LIST_PREVIEW_MAX_RECORDS = 200
 _SESSION_LIST_PREVIEW_MAX_CHARS = 1_000_000
-_PERSISTED_TOOL_RESULT_PREVIEW_CHARS = 0
 _IMAGE_CACHE_RELATIVE_PREFIX = Path("tmp") / "context-images"
 _IMAGE_STAGED_SUFFIXES = {".img", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
 _RUNTIME_CHECKPOINT_KEY = "runtime_checkpoint"
@@ -117,14 +116,6 @@ def _metadata_title(metadata: Any) -> str:
     return strip_think(title)
 
 
-def _content_size(content: Any) -> int:
-    if isinstance(content, str):
-        return len(content)
-    with suppress(Exception):
-        return len(json.dumps(content, ensure_ascii=False))
-    return len(str(content))
-
-
 def _compact_tool_call(tool_call: Any) -> dict[str, Any] | None:
     if not isinstance(tool_call, dict):
         return None
@@ -133,7 +124,10 @@ def _compact_tool_call(tool_call: Any) -> dict[str, Any] | None:
     compact: dict[str, Any] = {
         "id": tool_call.get("id"),
         "type": tool_call.get("type") or "function",
-        "function": {"name": str(name), "arguments": "{}"},
+        "function": {
+            "name": str(name),
+            "arguments": function.get("arguments", "{}"),
+        },
     }
     if compact["id"] is None:
         compact.pop("id")
@@ -187,23 +181,38 @@ def _tool_image_references(content: Any, workspace: Path | None) -> list[str]:
     return refs
 
 
-def _tool_result_placeholder(message: dict[str, Any], workspace: Path | None = None) -> str:
-    content = message.get("content", "")
-    if isinstance(content, str) and content.startswith("[tool result omitted:"):
+def _sanitize_tool_result(content: Any, workspace: Path | None) -> Any:
+    """Keep textual evidence and safe provider fields, excluding embedded image payloads."""
+    if not isinstance(content, list):
         return content
-    name = str(message.get("name") or "tool")
-    chars = _content_size(content)
-    result = f"[tool result omitted: {name}, {chars} chars]"
-    refs = _tool_image_references(content, workspace)
-    if refs:
-        result += "\n" + "\n".join(f"[image: {ref}; re-read via read_file]" for ref in refs)
-    return result
+
+    text_blocks = []
+    for block in content:
+        if not (
+            isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+        ):
+            continue
+        # Keep provider fields used by replay, but don't persist arbitrary fields
+        # (which could smuggle image payloads or private metadata on a text block).
+        public = strip_private_fields(block)
+        safe_block = {"type": "text", "text": public["text"]}
+        for key in ("cache_control", "citations", "annotations"):
+            if key in public:
+                safe_block[key] = deepcopy(public[key])
+        text_blocks.append(safe_block)
+    text_blocks.extend(
+        {"type": "text", "text": f"[image: {ref}; re-read via read_file]"}
+        for ref in _tool_image_references(content, workspace)
+    )
+    return text_blocks
 
 
 def sanitize_message_for_persistence(
     message: dict[str, Any], *, workspace: Path | None = None
 ) -> dict[str, Any]:
-    """Return a replay-safe persisted message without hidden/tool payload bloat."""
+    """Return a replay-safe message, retaining bounded tool evidence and arguments."""
     entry = deepcopy(message)
     entry.pop("reasoning_content", None)
     role = entry.get("role")
@@ -214,7 +223,7 @@ def sanitize_message_for_persistence(
         else:
             entry.pop("tool_calls", None)
     if role == "tool":
-        entry["content"] = _tool_result_placeholder(entry, workspace)
+        entry["content"] = _sanitize_tool_result(entry.get("content", ""), workspace)
     return entry
 
 
@@ -510,6 +519,7 @@ class Session:
         self.updated_at = datetime.now()
         self.metadata.pop("_last_summary", None)
         self.metadata.pop("compaction_checkpoints", None)
+        self.metadata.pop("idle_microcompact_through", None)
         self.metadata.pop("usage", None)
         self.metadata.pop("_usage_archived", None)
 
