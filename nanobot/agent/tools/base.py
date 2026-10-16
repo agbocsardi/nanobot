@@ -16,6 +16,10 @@ _ToolT = TypeVar("_ToolT", bound="Tool")
 ToolOutcomeStatus = Literal[
     "success",
     "partial",
+    # The operation ran and returned a non-zero exit code. The code is payload
+    # data, not a harness failure: it is reported and retryable, but it must
+    # never read as ``success`` and it must not trip the false-success guard.
+    "nonzero_exit",
     "retryable_error",
     "policy_block",
     "fatal_error",
@@ -95,6 +99,17 @@ class ToolResult(str):
     @classmethod
     def retryable_error(cls, content: str, **metadata: Any) -> ToolResult:
         return cls(content, status="retryable_error", **metadata)
+
+    @classmethod
+    def nonzero_exit(cls, content: str, **metadata: Any) -> ToolResult:
+        """A command executed and exited non-zero.
+
+        Distinct from ``retryable_error``: the operation reached a result, so
+        the exit code belongs to the payload. It stays non-success (and
+        retryable) for verification purposes, but a run whose only non-success
+        outcome is a non-zero exit is not an unresolved tool failure.
+        """
+        return cls(content, status="nonzero_exit", retryable=True, **metadata)
 
     @classmethod
     def policy_block(cls, content: str, **metadata: Any) -> ToolResult:

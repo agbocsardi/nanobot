@@ -387,7 +387,7 @@ async def test_runner_routes_local_side_effect_tool_through_receipt_store(tmp_pa
     tools.register(tool)
 
     runner = AgentRunner(MagicMock())
-    results, _events, error = await runner._execute_tools(
+    results, _events, _targets, error = await runner._execute_tools(
         AgentRunSpec(
             initial_messages=[],
             tools=tools,
@@ -447,7 +447,7 @@ async def test_runner_carries_approval_token_into_policy_tool_result():
         channel="cli", chat_id="direct", metadata={}, approvals=store,
     ))
     try:
-        results, events, error = await runner._execute_tools(
+        results, events, _targets, error = await runner._execute_tools(
             spec,
             [ToolCallRequest(id="ask-1", name="write_state", arguments={})],
             {},
