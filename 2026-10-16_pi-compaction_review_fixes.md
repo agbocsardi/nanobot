@@ -216,3 +216,37 @@ including two of the retention tests. Use the documented invocation
 
 
 
+
+## Follow-up (Cody, 2026-10-16): the checkpoint commit now feeds searchable history
+
+F9 pinned the *trim* sink as audit-only, which stands. The review missed the other half: the
+rewrite deleted every writer of `memory/history.jsonl`. On `main` that log was fed by the three
+consolidation `self.archive(chunk, ...)` call sites plus the trim's `on_archive=raw_archive` hook;
+the branch removed all of them, leaving only `/new` and the summariser-failure fallback. New
+conversation would therefore have stopped reaching `memory_search`, Dream, daily reflection, lab
+and perch — a missing writer, not a relocation.
+
+Fix: both checkpoint commit sites (`Consolidator.compact_session`, `AgentLoop._commit_compaction`)
+now call `Consolidator.archive_compacted_range()`, which slices the durable transcript from the
+previous checkpoint boundary to the new one, prunes tool noise, and appends one structured record.
+The trim keeps its audit sink, and the two are complementary rather than duplicative: a message is
+archived when it first moves behind a checkpoint, which is always before the cap can drop it, so no
+range is lost and none is archived twice. Successive checkpoints cover disjoint ranges.
+
+No summary is attached to these records. Checkpoint summaries are cumulative (each folds in the
+previous), so one per record would repeat earlier context in every later record; the verbatim
+messages are what search needs. The advanced `_usage_archived` watermark rides the caller's own
+save rather than doing a second write. `archive_compacted_range()` never raises: a failure falls
+back to `raw_archive`, and a double failure logs an error and still commits the checkpoint, since
+the messages remain on disk in the session file.
+
+Tests: three new cases plus one retitled — `test_archived_range_is_exactly_the_hidden_prefix`,
+`test_successive_checkpoints_archive_disjoint_ranges` (both `tests/agent/test_consolidator.py`),
+`test_committed_checkpoint_archives_hidden_range` (`tests/agent/test_loop_consolidation_tokens.py`,
+drives the real loop/runner path), and `test_untriggered_threshold_compaction_commits_nothing`
+(was `test_threshold_does_not_archive_or_advance_cursor`, whose title asserted an invariant that no
+longer holds; it in fact never triggered compaction). All four fail with the call sites removed.
+
+Verification: full suite **3498 passed / 2 skipped** (147 s). `ruff check nanobot/ tests/` clean
+except the pre-existing `nanobot/cron/service.py` import-order error, which predates the branch.
+Committed as `c68bfc2f1` on `feat/pi-style-compaction`; still not merged or pushed.

@@ -29,3 +29,13 @@ Read the updated review including F8. Completed F2/F3 and appended evidence to `
 Focused: 392 passed. Full: 3473 passed / 3 baseline email timeouts / 2 collection skips; no new failing node IDs versus 3448/4/2 baseline. Net −9 cases from F1 is intentional (ten dead-behavior tests removed, one provider-layer regression added). Lint and diff checks pass; no commits.
 
 Next bounded pass: F4, then F5–F8 in order. Read the review-fixes report before proceeding; the full review is not yet resolved.
+
+### 2026-10-16 — searchable-history writer restored (Cody)
+Audited the F9 decision and found the review had missed the consolidation half: the rewrite removed
+every writer of `memory/history.jsonl` (three `self.archive(chunk, ...)` call sites and the trim's
+`on_archive=raw_archive` hook), so new conversation would no longer reach `memory_search`, Dream,
+daily reflection, lab or perch. Added `Consolidator.archive_compacted_range()` and wired it into
+both checkpoint commit sites (`compact_session`, `_commit_compaction`); the trim keeps its
+audit-only sink. Ranges are disjoint per checkpoint and archived before the cap can drop them.
+Three new tests plus one retitled; full suite 3498 passed / 2 skipped. Committed `c68bfc2f1`;
+not merged or pushed.
