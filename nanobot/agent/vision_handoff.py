@@ -22,6 +22,7 @@ from typing import Any
 from loguru import logger
 
 from nanobot.providers.base import LLMProvider
+from nanobot.utils.helpers import strip_private_fields
 
 _DESCRIBE_SYSTEM = (
     "You are a precise vision assistant. Describe the image exhaustively so a "
@@ -195,7 +196,7 @@ class VisionHandoff:
                     {
                         "role": "user",
                         "content": [
-                            image_block,
+                            strip_private_fields(image_block),
                             {"type": "text", "text": "Describe this image."},
                         ],
                     },

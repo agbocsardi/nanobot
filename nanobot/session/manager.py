@@ -16,12 +16,14 @@ from loguru import logger
 
 from nanobot.config.paths import get_legacy_sessions_dir
 from nanobot.utils.helpers import (
+    atomic_write_lines,
     ensure_dir,
     estimate_message_tokens,
     find_legal_message_start,
     image_placeholder_text,
     recent_message_start_index,
     safe_filename,
+    strip_private_fields,
     strip_think,
 )
 from nanobot.utils.subagent_channel_display import scrub_subagent_announce_body
@@ -262,6 +264,9 @@ class Session:
     last_consolidated: int = 0  # Number of messages already consolidated to files
 
     def __post_init__(self) -> None:
+        from nanobot.session.compaction import ensure_ids
+
+        ensure_ids(self.messages)
         # An out-of-range offset (corrupt metadata) would hide all history; reset it.
         if (
             isinstance(self.last_consolidated, bool)
@@ -269,6 +274,37 @@ class Session:
             or not 0 <= self.last_consolidated <= len(self.messages)
         ):
             self.last_consolidated = 0
+
+    def discard_invalid_checkpoint(self) -> bool:
+        """Fail open to original history, never to a dangling continuity summary."""
+        from nanobot.session.compaction import (
+            CHECKPOINTS,
+            CompactionError,
+            ensure_ids,
+            latest_checkpoint,
+            project,
+        )
+
+        if CHECKPOINTS not in self.metadata:
+            return False
+        ensure_ids(self.messages)
+        try:
+            entries = self.metadata[CHECKPOINTS]
+            if not isinstance(entries, list):
+                raise CompactionError("Checkpoint collection is not a list")
+            checkpoint = latest_checkpoint(self.metadata)
+            if checkpoint is None:
+                return False
+            if not isinstance(checkpoint, dict):
+                raise CompactionError("Checkpoint entry is not an object")
+            project(self.messages, checkpoint)
+            return False
+        except (CompactionError, TypeError, AttributeError) as exc:
+            logger.error("Invalid continuity checkpoint for {}: {}; restoring original history", self.key, exc)
+            self.metadata.pop(CHECKPOINTS, None)
+            self.metadata.pop("_last_summary", None)
+            self.last_consolidated = 0
+            return True
 
     @staticmethod
     def _annotate_message_time(message: dict[str, Any], content: Any) -> Any:
@@ -297,6 +333,9 @@ class Session:
             "timestamp": datetime.now().isoformat(),
             **kwargs
         }
+        from uuid import uuid4
+
+        msg.setdefault("_entry_id", uuid4().hex)
         self.messages.append(msg)
         self.updated_at = datetime.now()
 
@@ -307,24 +346,45 @@ class Session:
         max_tokens: int = 0,
         include_timestamps: bool = False,
         extend_to_user: bool = False,
+        projected: bool = False,
+        include_entry_ids: bool = False,
     ) -> list[dict[str, Any]]:
-        """Return unconsolidated messages for LLM input.
+        """Return public replay, or explicitly opt into internal entry identities.
 
-        History is sliced by message count first (``max_messages``), then by
-        token budget from the tail (``max_tokens``) when provided.
+        ``projected=True`` (also automatic when a checkpoint exists) returns
+        the complete continuity summary and retained suffix. It never slices
+        by ``max_messages``, ``max_tokens`` or ``extend_to_user``: only a new
+        successful checkpoint can hide more task context. The model runner
+        governs this projection using its frozen request budget.
+
+        Without projection/checkpoints, the legacy browsing API slices by
+        message count then tail tokens and aligns legal turn/tool boundaries.
+        ``include_entry_ids`` is reserved for the owning runner's projection
+        bookkeeping; public/UI callers receive no private fields by default.
         """
-        unconsolidated = self.messages[self.last_consolidated:]
+        from nanobot.session.compaction import ensure_ids, latest_checkpoint, project
+
+        ensure_ids(self.messages)
+        checkpoint = latest_checkpoint(self.metadata)
+        projected = projected or checkpoint is not None
+        unconsolidated = project(self.messages, checkpoint) if checkpoint else self.messages[self.last_consolidated:]
         max_messages = max_messages if max_messages > 0 else 120
         start_idx = recent_message_start_index(
             unconsolidated,
             max_messages,
             extend_to_user=extend_to_user,
         )
-        sliced = unconsolidated[start_idx:]
+        sliced = unconsolidated if projected else unconsolidated[start_idx:]
+        legacy_summary = self.metadata.get("_last_summary")
+        if projected and checkpoint is None and isinstance(legacy_summary, dict) and legacy_summary.get("text"):
+            sliced = [{"role": "user", "content": "Previous session summary:\n" + legacy_summary["text"],
+                       "_compaction_summary": True}] + sliced
 
         # Avoid starting mid-turn when possible, except for proactive
         # assistant deliveries that the user may be replying to.
         for i, message in enumerate(sliced):
+            if projected:
+                break
             if message.get("role") == "user":
                 start = i
                 if i > 0 and sliced[i - 1].get("_channel_delivery"):
@@ -402,12 +462,15 @@ class Session:
                 if not any(key in message for key in ("tool_calls", "thinking_blocks")):
                     continue
             entry: dict[str, Any] = {"role": message["role"], "content": content}
-            for key in ("tool_calls", "tool_call_id", "name", "thinking_blocks"):
+            keys = ["tool_calls", "tool_call_id", "name", "thinking_blocks"]
+            if include_entry_ids:
+                keys += ["_entry_id", "_compaction_summary"]
+            for key in keys:
                 if key in message:
                     entry[key] = message[key]
             out.append(entry)
 
-        if max_tokens > 0 and out:
+        if max_tokens > 0 and out and not projected:
             kept: list[dict[str, Any]] = []
             used = 0
             for message in reversed(out):
@@ -438,7 +501,7 @@ class Session:
             if start:
                 kept = kept[start:]
             out = kept
-        return out
+        return out if include_entry_ids else strip_private_fields(out)
 
     def clear(self) -> None:
         """Clear all messages and reset session to initial state."""
@@ -446,6 +509,7 @@ class Session:
         self.last_consolidated = 0
         self.updated_at = datetime.now()
         self.metadata.pop("_last_summary", None)
+        self.metadata.pop("compaction_checkpoints", None)
         self.metadata.pop("usage", None)
         self.metadata.pop("_usage_archived", None)
 
@@ -542,24 +606,39 @@ class Session:
         on_archive: Any = None,
         limit: int = FILE_MAX_MESSAGES,
     ) -> None:
-        """Bound session message growth by archiving and trimming old prefixes."""
-        if limit <= 0 or len(self.messages) <= limit:
-            return
+        """Archive only checkpoint-hidden records; never sacrifice live continuity.
 
-        dropped, already_consolidated = self.retain_recent_legal_suffix(limit)
-        if not dropped:
-            return
+        This is a soft cap if the retained suffix alone exceeds the limit. A
+        missing archive callback/checkpoint cannot authorize discarding data.
+        """
+        from nanobot.session.compaction import CHECKPOINTS, latest_checkpoint, project
 
-        archive_chunk = dropped[already_consolidated:]
-        if archive_chunk and on_archive:
-            on_archive(archive_chunk)
-        logger.info(
-            "Session file cap hit for {}: dropped {}, raw-archived {}, kept {}",
-            self.key,
-            len(dropped),
-            len(archive_chunk),
-            len(self.messages),
-        )
+        if limit <= 0 or len(self.messages) <= limit or on_archive is None:
+            return
+        checkpoint = latest_checkpoint(self.metadata)
+        if checkpoint is None:
+            return
+        project(self.messages, checkpoint)  # Validate references before archiving.
+        first = next(i for i, m in enumerate(self.messages)
+                     if m.get("_entry_id") == checkpoint["first_kept_entry_id"])
+        removable = [i for i in range(first) if self.messages[i].get("role") != "system"]
+        removed = set(removable[:len(self.messages) - limit])
+        if not removed:
+            return
+        dropped = [m for i, m in enumerate(self.messages) if i in removed]
+        on_archive(dropped)  # Must be durable before any active-state mutation.
+        self.messages = [m for i, m in enumerate(self.messages) if i not in removed]
+        self.last_consolidated -= sum(i < self.last_consolidated for i in removed)
+        flush = self.metadata.get("_precompact_flush")
+        if isinstance(flush, dict) and isinstance(flush.get("last"), int):
+            flush["last"] = max(0, flush["last"] - sum(i < flush["last"] for i in removed))
+        retained_ids = {m.get("_entry_id") for m in self.messages}
+        self.metadata[CHECKPOINTS] = [cp for cp in self.metadata[CHECKPOINTS]
+                                    if cp.get("first_kept_entry_id") in retained_ids
+                                    and (not cp.get("source_end_id")
+                                         or cp["source_end_id"] in retained_ids)]
+        logger.info("Session file cap {}: archived {}, retained {} (limit {})",
+                    self.key, len(dropped), len(self.messages), limit)
 
 
 class SessionManager:
@@ -633,15 +712,18 @@ class SessionManager:
         Returns:
             The session.
         """
-        if key in self._cache:
-            return self._cache[key]
-
-        session = self._load(key)
-        if session is None:
-            session = Session(key=key)
-
-        self._cache[key] = session
-        return session
+        with self._session_files_lock:
+            session = self._cache.get(key)
+            if session is None:
+                session = self._load(key) or Session(key=key)
+                self._cache[key] = session
+            if session.discard_invalid_checkpoint():
+                try:
+                    self.save(session, fsync=True)
+                except BaseException:
+                    self._cache.pop(key, None)
+                    raise
+            return session
 
     def _load(self, key: str) -> Session | None:
         """Load a session from disk."""
@@ -761,7 +843,35 @@ class SessionManager:
             "messages": session.messages,
         }
 
+    def _archive_session_prefix(self, key: str, messages: list[dict[str, Any]]) -> None:
+        """Durably preserve redacted originals outside the bounded active file.
+
+        Content-addressed batches make retrying a save idempotent: publishing
+        the same archive again replaces identical bytes, never duplicates it.
+
+        This is the trim's only sink, deliberately. A trimmed prefix is already
+        hidden behind a checkpoint and carried by that checkpoint's summary, so
+        the originals are kept for audit and repair but are not appended to
+        ``memory/history.jsonl`` (which the file cap did route them to before
+        checkpoints existed) — re-feeding already-summarized text would only
+        duplicate material for consolidation. Nothing reads
+        ``sessions/archive/`` automatically: it grows with trimming and has no
+        retention policy, so treat it as an operator-visible audit store rather
+        than a live data source.
+        """
+        from nanobot.session.compaction import fingerprint
+
+        directory = ensure_dir(self.sessions_dir / "archive" / self.safe_key(key))
+        path = directory / f"{fingerprint(messages)}.jsonl"
+        records = [{"_type": "transcript_archive", "key": key}, *messages]
+        atomic_write_lines(path, (json.dumps(record, ensure_ascii=False) for record in records))
+
     def save(self, session: Session, *, fsync: bool = False) -> None:
+        """Serialize transcript/checkpoint commits with metadata-file rewrites."""
+        with self._session_files_lock:
+            self._save_locked(session, fsync=fsync)
+
+    def _save_locked(self, session: Session, *, fsync: bool = False) -> None:
         """Save a session to disk atomically.
 
         When *fsync* is ``True`` the final file and its parent directory are
@@ -771,14 +881,20 @@ class SessionManager:
         write-back caching (e.g. rclone VFS, NFS, FUSE mounts) do not lose
         the most recent writes.
         """
+        from nanobot.session.compaction import ensure_ids
+
         path = self._get_session_path(session.key)
         tmp_path = path.with_suffix(".jsonl.tmp")
-        session.messages = sanitize_messages_for_persistence(session.messages, workspace=self.workspace)
-        sanitized_metadata = sanitize_metadata_for_persistence(session.metadata, workspace=self.workspace)
-        session.metadata.clear()
-        session.metadata.update(sanitized_metadata)
-
         try:
+            ensure_ids(session.messages)
+            session.messages = sanitize_messages_for_persistence(session.messages, workspace=self.workspace)
+            sanitized_metadata = sanitize_metadata_for_persistence(session.metadata, workspace=self.workspace)
+            session.metadata.clear()
+            session.metadata.update(sanitized_metadata)
+            session.enforce_file_cap(
+                on_archive=lambda messages: self._archive_session_prefix(session.key, messages),
+                limit=FILE_MAX_MESSAGES,
+            )
             with open(tmp_path, "w", encoding="utf-8") as f:
                 metadata_line = {
                     "_type": "metadata",
@@ -886,6 +1002,12 @@ class SessionManager:
             return None
 
         metadata = deepcopy(source.metadata)
+        if "compaction_checkpoints" in metadata:
+            ids = {m.get("_entry_id") for m in copied}
+            metadata["compaction_checkpoints"] = [
+                cp for cp in metadata["compaction_checkpoints"]
+                if cp.get("first_kept_entry_id") in ids and cp.get("source_end_id") in ids
+            ]
         for key in _FORK_VOLATILE_METADATA_KEYS:
             metadata.pop(key, None)
 
@@ -1075,9 +1197,9 @@ class SessionManager:
             except (OSError, json.JSONDecodeError) as exc:
                 logger.warning("Failed to update session metadata {}: {}", key, exc)
                 return False
-        cached = self._cache.get(key)
-        if cached is not None:
-            cached.metadata.update(deepcopy(updates))
+            cached = self._cache.get(key)
+            if cached is not None:
+                cached.metadata.update(deepcopy(updates))
         return True
 
     def rename_model_preset(self, old_name: str, new_name: str) -> int:

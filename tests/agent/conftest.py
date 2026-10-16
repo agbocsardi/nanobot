@@ -39,7 +39,6 @@ def make_loop(
     model: str = "test-model",
     context_window_tokens: int = 128_000,
     session_ttl_minutes: int = 0,
-    max_messages: int = 120,
     unified_session: bool = False,
     mcp_servers: dict | None = None,
     tools_config=None,
@@ -65,7 +64,6 @@ def make_loop(
         model=model,
         context_window_tokens=context_window_tokens,
         session_ttl_minutes=session_ttl_minutes,
-        max_messages=max_messages,
         unified_session=unified_session,
     )
     if mcp_servers is not None:

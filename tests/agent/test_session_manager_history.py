@@ -731,9 +731,8 @@ def test_retain_recent_legal_suffix_returns_all_on_zero():
     assert session.messages == []
 
 
-def test_enforce_file_cap_no_duplicate_archive_in_else_branch():
-    """When the tail is assistant-only, enforce_file_cap must not archive
-    messages that are also retained (the bug from issue #4128)."""
+def test_enforce_file_cap_without_checkpoint_preserves_unsummarized_tail():
+    """An assistant-only tail cannot authorize dropping unsummarized context."""
     from unittest.mock import MagicMock
 
     session = Session(key="test:else-archive")
@@ -746,7 +745,8 @@ def test_enforce_file_cap_no_duplicate_archive_in_else_branch():
     archive_fn = MagicMock()
     session.enforce_file_cap(on_archive=archive_fn, limit=6)
 
-    assert len(session.messages) <= 6
+    assert len(session.messages) == 25
+    archive_fn.assert_not_called()
 
     # Verify archived messages have NO overlap with retained
     if archive_fn.called:
@@ -759,9 +759,8 @@ def test_enforce_file_cap_no_duplicate_archive_in_else_branch():
         )
 
 
-def test_enforce_file_cap_no_message_loss_in_else_branch():
-    """In the else branch, no messages should silently disappear — every
-    message must be either retained or archived."""
+def test_enforce_file_cap_no_message_loss_without_checkpoint():
+    """Without a safe checkpoint every original must remain accounted for."""
     from unittest.mock import MagicMock
 
     session = Session(key="test:else-no-loss")
@@ -791,10 +790,8 @@ def test_enforce_file_cap_no_message_loss_in_else_branch():
     )
 
 
-def test_enforce_file_cap_correct_archive_with_last_consolidated_in_else_branch():
-    """When last_consolidated > 0 and the else branch fires, only the
-    unconsolidated dropped messages should be raw-archived.  Messages in the
-    consolidated prefix that are dropped do NOT need raw archiving."""
+def test_enforce_file_cap_preserves_audit_records_after_memory_cursor_advance():
+    """Topic-memory consolidation must not substitute for the original audit trail."""
     from unittest.mock import MagicMock
 
     session = Session(key="test:else-lc-archive")
@@ -803,21 +800,19 @@ def test_enforce_file_cap_correct_archive_with_last_consolidated_in_else_branch(
         session.messages.append({"role": "user", "content": f"u{i}"})
     for i in range(10):
         session.messages.append({"role": "assistant", "content": f"a{i}"})
-    # First 8 messages already consolidated
+    # A legacy memory cursor is not proof that original audit records survived.
     session.last_consolidated = 8
+    from tests.session.test_compaction_retention import checkpoint
 
+    checkpoint(session, 16)
     archive_fn = MagicMock()
     session.enforce_file_cap(on_archive=archive_fn, limit=4)
 
-    if archive_fn.called:
-        archived = archive_fn.call_args.args[0]
-        # Archived messages should NOT include any from the consolidated prefix
-        # (u0..u7). They should only be unconsolidated dropped messages.
-        archived_contents = [m["content"] for m in archived]
-        for c in archived_contents:
-            assert c not in [f"u{i}" for i in range(8)], (
-                f"Consolidated message {c!r} should not be raw-archived"
-            )
+    archive_fn.assert_called_once()
+    assert len(archive_fn.call_args.args[0]) == 16
+    assert archive_fn.call_args.args[0][0]["content"] == "u0"
+    assert session.last_consolidated == 0
+    assert len(session.messages) == 4
 
 
 def test_retain_recent_legal_suffix_last_consolidated_correct_in_else_branch():

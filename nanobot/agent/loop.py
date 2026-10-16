@@ -8,9 +8,9 @@ import os
 import re
 import time
 from contextlib import nullcontext, suppress
+from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -274,7 +274,6 @@ class AgentLoop:
         timezone: str | None = None,
         session_ttl_minutes: int = 0,
         consolidation_ratio: float = 0.5,
-        max_messages: int = 120,
         hooks: list[AgentHook] | None = None,
         unified_session: bool = False,
         disabled_skills: list[str] | None = None,
@@ -418,7 +417,6 @@ class AgentLoop:
             context_retrieval=context_retrieval,
         )
         self._unified_session = unified_session
-        self._max_messages = max_messages if max_messages > 0 else 120
         self._running = False
         self._mcp_servers = mcp_servers or {}
         self._mcp_stacks: dict[str, MCPConnection] = {}
@@ -563,7 +561,6 @@ class AgentLoop:
             dream_config=defaults.dream,
             session_ttl_minutes=defaults.session_ttl_minutes,
             consolidation_ratio=defaults.consolidation_ratio,
-            max_messages=defaults.max_messages,
             tools_config=config.tools,
             model_presets=preset_helpers.configured_model_presets(config),
             model_preset=defaults.model_preset,
@@ -1491,10 +1488,73 @@ class AgentLoop:
         ) if _goal_lines else SUSTAINED_GOAL_CONTINUE_PROMPT
         session_metadata = session.metadata if session is not None else None
         runner = AgentRunner(run_provider) if run_provider is not None else self.runner
+        effective_provider = runner.provider
         effective_model = run_model or self.model
         effective_max_iterations = run_max_iterations or self.max_iterations
         effective_max_tool_result_chars = run_max_tool_result_chars or self.max_tool_result_chars
         effective_context_window_tokens = run_context_window_tokens or self.context_window_tokens
+        from nanobot.session.compaction import (
+            CHECKPOINTS,
+            CompactionEngine,
+            CompactionError,
+            RequestBudget,
+            fingerprint,
+            latest_checkpoint,
+        )
+
+        continuity_checkpoint = latest_checkpoint(session.metadata) if session is not None else None
+        transcript_revision = fingerprint(session.messages) if session is not None else None
+        persisted_checkpoint = deepcopy(continuity_checkpoint)
+        pending_start = len(initial_messages)
+        if (session is not None and initial_messages
+                and initial_messages[-1].get("role") == "user"
+                and not initial_messages[-1].get("_entry_id")):
+            if (session.metadata.get(self._PENDING_USER_TURN_KEY) and session.messages
+                    and session.messages[-1].get("role") == "user"):
+                initial_messages[-1]["_entry_id"] = session.messages[-1]["_entry_id"]
+            else:
+                pending_start -= 1
+
+        async def _commit_compaction(source_messages, checkpoint):
+            nonlocal transcript_revision, persisted_checkpoint
+            if session is None:
+                return
+            if (self.sessions.get_or_create(session.key) is not session
+                    or fingerprint(session.messages) != transcript_revision
+                    or latest_checkpoint(session.metadata) != persisted_checkpoint):
+                raise CompactionError("Session changed while generating continuity checkpoint")
+            old_messages, old_metadata = deepcopy(session.messages), deepcopy(session.metadata)
+            old_updated_at = session.updated_at
+            try:
+                self._save_turn(session, source_messages, pending_start)
+                ids = {m.get("_entry_id") for m in session.messages}
+                if checkpoint["first_kept_entry_id"] not in ids:
+                    raise CompactionError("Checkpoint does not reference the durable transcript")
+                session.metadata.setdefault(CHECKPOINTS, []).append(checkpoint)
+                session.metadata.pop("_last_summary", None)
+                self._clear_runtime_checkpoint(session)
+                self.sessions.save(session, fsync=True)
+            except BaseException:
+                session.messages, session.metadata = old_messages, old_metadata
+                session.updated_at = old_updated_at
+                raise
+            transcript_revision = fingerprint(session.messages)
+            persisted_checkpoint = deepcopy(checkpoint)
+
+        async def _precompact():
+            if session is not None and not ephemeral:
+                await self.consolidator.flush_before_compaction(session)
+
+        summary_snapshot = (
+            self.consolidator.provider, self.consolidator.model,
+            self.consolidator.context_window_tokens, self.consolidator.max_completion_tokens,
+        )
+
+        def _compaction_engine():
+            # Capture routing/settings now, but only validate the auxiliary
+            # summarizer budget if this turn actually needs a checkpoint.
+            provider, model, window, output = summary_snapshot
+            return CompactionEngine(provider, RequestBudget.freeze(provider, model, window, output))
         effective_llm_timeout_s = run_llm_timeout_s or runner_wall_llm_timeout_s(
             self.sessions,
             session.key if session is not None else session_key,
@@ -1520,6 +1580,10 @@ class AgentLoop:
                 stream_progress_deltas=on_stream is not None,
                 retry_wait_callback=on_retry_wait,
                 checkpoint_callback=_checkpoint,
+                compaction_callback=_commit_compaction if session is not None else None,
+                compaction_engine_factory=_compaction_engine,
+                precompaction_callback=_precompact,
+                continuity_checkpoint=continuity_checkpoint,
                 injection_callback=_drain_pending,
                 # Sustained goals may legitimately exceed NANOBOT_LLM_TIMEOUT_S; idle stall
                 # is still capped by NANOBOT_STREAM_IDLE_TIMEOUT_S in streaming providers.
@@ -1544,7 +1608,7 @@ class AgentLoop:
         if isinstance(run_usage, dict):
             from nanobot.utils.run_records import build_usage_block
 
-            provider = run_provider or self.provider
+            provider = effective_provider
             spec = getattr(provider, "_spec", None)
             run_usage.update(build_usage_block(
                 result.usage,
@@ -1554,7 +1618,7 @@ class AgentLoop:
         self._record_session_usage(
             session,
             result.usage,
-            provider=run_provider or self.provider,
+            provider=effective_provider,
             model=effective_model,
         )
         if result.stop_reason == "max_iterations":
@@ -1927,10 +1991,7 @@ class AgentLoop:
         if pending:
             logger.info("Memory compact triggered for session {}", key)
 
-        await self.consolidator.maybe_consolidate_by_tokens(
-            session,
-            replay_max_messages=self._max_messages,
-        )
+        await self.consolidator.maybe_consolidate_by_tokens(session)
         is_subagent = msg.sender_id == "subagent"
         if is_subagent and self._persist_subagent_followup(session, msg):
             logger.debug("Subagent result persisted for session {}", key)
@@ -1941,10 +2002,9 @@ class AgentLoop:
         )
         current_role = "assistant" if is_subagent else "user"
         _hist_kwargs: dict[str, Any] = {
-            "max_messages": self._max_messages,
-            "max_tokens": self._replay_token_budget(),
             "include_timestamps": True,
-            "extend_to_user": is_subagent,
+            "projected": True,
+            "include_entry_ids": True,
         }
         history = session.get_history(**_hist_kwargs)
         workspace_scope = self.workspace_scopes.for_message(msg, session.metadata)
@@ -2051,17 +2111,10 @@ class AgentLoop:
         self._save_turn(session, all_msgs, 1 + len(history), turn_latency_ms=latency_ms)
         session.metadata["context_report"] = context_report
         self._runtime_events().record_turn_latency(key, latency_ms)
-        session.enforce_file_cap(
-            on_archive=partial(self.context.memory.raw_archive, session_key=key)
-        )
+        # Original transcript is retained; checkpoints govern model projection.
         self._clear_runtime_checkpoint(session)
         self.sessions.save(session)
-        self._schedule_background(
-            self.consolidator.maybe_consolidate_by_tokens(
-                session,
-                replay_max_messages=self._max_messages,
-            )
-        )
+        # Compaction runs at the next request seam, never as a stale writer.
         content = final_content or "Background task completed."
         outbound_metadata: dict[str, Any] = {"_context_report": context_report}
         if channel == "slack" and key.startswith("slack:") and key.count(":") >= 2:
@@ -2295,10 +2348,7 @@ class AgentLoop:
 
     async def _state_build(self, ctx: TurnContext) -> str:
         if not ctx.ephemeral:
-            await self.consolidator.maybe_consolidate_by_tokens(
-                ctx.session,
-                replay_max_messages=self._max_messages,
-            )
+            await self.consolidator.maybe_consolidate_by_tokens(ctx.session)
         self._set_tool_context(
             ctx.msg.channel,
             ctx.msg.chat_id,
@@ -2312,10 +2362,9 @@ class AgentLoop:
                 message_tool.start_turn()
 
         _hist_kwargs: dict[str, Any] = {
-            "max_messages": self._max_messages,
-            "max_tokens": self._replay_token_budget(),
             "include_timestamps": True,
-            "extend_to_user": False,
+            "projected": True,
+            "include_entry_ids": True,
         }
         ctx.history = ctx.session.get_history(**_hist_kwargs)
         self._runtime_events().record_turn_runtime(
@@ -2406,16 +2455,8 @@ class AgentLoop:
             ctx.session_key,
             ctx.turn_latency_ms,
         )
-        if not ctx.ephemeral:
-            ctx.session.enforce_file_cap(
-                on_archive=partial(self.context.memory.raw_archive, session_key=ctx.session_key)
-            )
-            self._schedule_background(
-                self.consolidator.maybe_consolidate_by_tokens(
-                    ctx.session,
-                    replay_max_messages=self._max_messages,
-                )
-            )
+        # Continuity is checkpointed at the next request seam. Never
+        # truncate the transcript or launch a stale background writer here.
         self._clear_pending_user_turn(ctx.session)
         self._clear_runtime_checkpoint(ctx.session)
         self.sessions.save(ctx.session)
@@ -2496,9 +2537,25 @@ class AgentLoop:
             for tc in m.get("tool_calls") or []
             if isinstance(tc, dict) and tc.get("id")
         }
+        from uuid import uuid4
+
+        from nanobot.session.compaction import latest_checkpoint
+
+        checkpoint = latest_checkpoint(session.metadata)
+        if checkpoint is not None:
+            committed_end = checkpoint.get("source_end_id")
+            if committed_end:
+                skip = next((i + 1 for i in range(len(messages) - 1, skip - 1, -1)
+                             if messages[i].get("_entry_id") == committed_end), skip)
+        # A committed run prefix may already be in the audit archive rather
+        # than the active file. Its durable watermark prevents re-appending it.
+        persisted_ids = {m.get("_entry_id") for m in session.messages if m.get("_entry_id")}
         last_assistant_idx: int | None = None
         for m in messages[skip:]:
+            if m.get("_entry_id") and m["_entry_id"] in persisted_ids:
+                continue
             entry = dict(m)
+            entry.setdefault("_entry_id", uuid4().hex)
             role, content = entry.get("role"), entry.get("content")
             if role == "assistant" and not content and not entry.get("tool_calls"):
                 continue  # skip empty assistant messages — they poison session context
@@ -2539,6 +2596,7 @@ class AgentLoop:
             entry.setdefault("timestamp", datetime.now().isoformat())
             entry = sanitize_message_for_persistence(entry)
             session.messages.append(entry)
+            persisted_ids.add(entry["_entry_id"])
             if role == "assistant":
                 last_assistant_idx = len(session.messages) - 1
                 declared_tool_call_ids.update(

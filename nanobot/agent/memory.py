@@ -20,15 +20,12 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator
 import tiktoken
 from loguru import logger
 
-from nanobot.session.manager import Session, sanitize_message_for_persistence
+from nanobot.session.manager import FILE_MAX_MESSAGES, Session, sanitize_message_for_persistence
 from nanobot.utils.gitstore import GitStore
 from nanobot.utils.helpers import (
     ensure_dir,
-    estimate_message_tokens,
     estimate_prompt_tokens_chain,
-    find_legal_message_start,
     load_bundled_template,
-    recent_message_start_index,
     strip_think,
     truncate_text,
 )
@@ -1321,9 +1318,7 @@ _HISTORY_ENTRY_HARD_CAP = 64_000      # emergency cap in append_history
 
 
 class Consolidator:
-    """Lightweight consolidation: summarizes evicted messages into history.jsonl."""
-
-    _MAX_CONSOLIDATION_ROUNDS = 5
+    """Coordinate continuity checkpoints and the separate explicit memory-archive policy."""
 
     _SAFETY_BUFFER = 1024  # extra headroom for tokenizer estimation drift
 
@@ -1392,110 +1387,14 @@ class Consolidator:
         session.metadata["_usage_archived"] = usage_snapshot(session.metadata.get("usage"))
         self.sessions.save(session)
 
-    def pick_consolidation_boundary(
-        self,
-        session: Session,
-        tokens_to_remove: int,
-    ) -> tuple[int, int] | None:
-        """Pick a user-turn boundary that removes enough old prompt tokens."""
-        start = session.last_consolidated
-        if start >= len(session.messages) or tokens_to_remove <= 0:
-            return None
-
-        removed_tokens = 0
-        last_boundary: tuple[int, int] | None = None
-        for idx in range(start, len(session.messages)):
-            message = session.messages[idx]
-            if idx > start and message.get("role") == "user":
-                last_boundary = (idx, removed_tokens)
-                if removed_tokens >= tokens_to_remove:
-                    return last_boundary
-            removed_tokens += estimate_message_tokens(message)
-
-        return last_boundary
-
     @staticmethod
     def _full_unconsolidated_history(
         session: Session,
         *,
         include_timestamps: bool = False,
     ) -> list[dict[str, Any]]:
-        """Return the whole unconsolidated tail for consolidation decisions."""
-        unconsolidated_count = len(session.messages) - session.last_consolidated
-        if unconsolidated_count <= 0:
-            return []
-        return session.get_history(
-            max_messages=unconsolidated_count,
-            include_timestamps=include_timestamps,
-        )
-
-    @staticmethod
-    def _replay_overflow_boundary(
-        session: Session,
-        replay_max_messages: int | None,
-    ) -> int | None:
-        if not replay_max_messages or replay_max_messages <= 0:
-            return None
-        tail = list(enumerate(session.messages[session.last_consolidated:], session.last_consolidated))
-        if len(tail) <= replay_max_messages:
-            return None
-
-        tail_messages = [message for _idx, message in tail]
-        start_idx = recent_message_start_index(
-            tail_messages,
-            replay_max_messages,
-            extend_to_user=True,
-        )
-        sliced = tail[start_idx:]
-        for i, (_idx, message) in enumerate(sliced):
-            if message.get("role") == "user":
-                start = i
-                if i > 0 and sliced[i - 1][1].get("_channel_delivery"):
-                    start = i - 1
-                sliced = sliced[start:]
-                break
-
-        legal_start = find_legal_message_start([message for _idx, message in sliced])
-        if legal_start:
-            sliced = sliced[legal_start:]
-        if not sliced:
-            return len(session.messages)
-
-        first_visible_idx = sliced[0][0]
-        if first_visible_idx <= session.last_consolidated:
-            return None
-        return first_visible_idx
-
-    async def _consolidate_replay_overflow(
-        self,
-        session: Session,
-        replay_max_messages: int | None,
-    ) -> str | None:
-        """Archive messages that would be hidden by the replay message window."""
-        end_idx = self._replay_overflow_boundary(session, replay_max_messages)
-        if end_idx is None:
-            return None
-        chunk = session.messages[session.last_consolidated:end_idx]
-        if not chunk:
-            return None
-        logger.info(
-            "Replay-window consolidation for {}: chunk={} msgs, replay_max={}",
-            session.key,
-            len(chunk),
-            replay_max_messages,
-        )
-        summary = await self.archive(chunk, session_key=session.key)
-        session.last_consolidated = end_idx
-        self.sessions.save(session)
-        return summary
-
-    def _persist_last_summary(self, session: Session, summary: str | None) -> None:
-        if summary and summary != "(nothing)":
-            session.metadata["_last_summary"] = {
-                "text": summary,
-                "last_active": session.updated_at.isoformat(),
-            }
-            self.sessions.save(session)
+        """Return the complete continuity projection for prompt estimation."""
+        return session.get_history(projected=True, include_timestamps=include_timestamps)
 
     def estimate_session_prompt_tokens(
         self,
@@ -1523,49 +1422,6 @@ class Consolidator:
             probe_messages,
             self._get_tool_definitions(),
         )
-
-    def _prompt_diagnostics(self, session: Session) -> dict[str, int]:
-        """Estimate fixed/replay prompt components for consolidation logs."""
-        history = self._full_unconsolidated_history(session, include_timestamps=True)
-        channel, chat_id = (session.key.split(":", 1) if ":" in session.key else (None, None))
-        system_messages = self._build_messages(
-            history=[],
-            current_message="[token-probe]",
-            channel=channel,
-            chat_id=chat_id,
-            sender_id=None,
-            session_metadata=session.metadata,
-            session_key=session.key,
-            unified_session=self.unified_session,
-            input_token_budget=self._input_token_budget,
-        )[:1]
-        def _safe_estimate(message: dict[str, Any]) -> int:
-            try:
-                return estimate_message_tokens(message)
-            except Exception:
-                content = message.get("content", "")
-                return max(4, len(str(content)) // 4 + 4)
-
-        system_tokens = sum(_safe_estimate(m) for m in system_messages)
-        replay_tokens = sum(_safe_estimate(m) for m in history)
-        # Archived summaries are now folded into the system prompt (read from
-        # history.jsonl by session_key); report their standalone size for logs.
-        summaries = self.store.unprocessed_session_summaries(
-            since_cursor=self.store.get_last_dream_cursor(),
-            session_key=session.key,
-            unified_session=self.unified_session,
-        )
-        summary_text = "\n\n".join(reversed(summaries))
-        summary_tokens = _safe_estimate(
-            {"role": "system", "content": f"[Archived Context Summary]\n\n{summary_text}"}
-        ) if summary_text else 0
-        return {
-            "system_tokens": system_tokens,
-            "summary_chars": len(summary_text),
-            "summary_tokens": summary_tokens,
-            "replay_tokens": replay_tokens,
-            "message_count": len(history),
-        }
 
     @property
     def _input_token_budget(self) -> int:
@@ -1683,144 +1539,75 @@ class Consolidator:
     async def maybe_consolidate_by_tokens(
         self,
         session: Session,
-        *,
-        replay_max_messages: int | None = None,
     ) -> None:
-        """Loop: archive old messages until prompt fits within safe budget.
+        """Checkpoint session continuity; archival/Dream are separate policies."""
+        from nanobot.session.compaction import RequestBudget
 
-        The budget reserves space for completion tokens and a safety buffer
-        so the LLM request never exceeds the context window.
-        """
-        if self.context_window_tokens <= 0:
+        if self.context_window_tokens <= 0 or not session.messages:
             return
+        budget_snapshot = RequestBudget.freeze(
+            self.provider, self.model, self.context_window_tokens, self.max_completion_tokens,
+        )
+        history = session.get_history(projected=True)
+        prompt = self._build_messages(history=history, current_message="")
+        if (len(session.messages) <= FILE_MAX_MESSAGES
+                and budget_snapshot.estimate(self.provider, prompt, self._get_tool_definitions()) < (
+                    budget_snapshot.input_limit - budget_snapshot.headroom
+                )):
+            return
+        await self.compact_session(session, budget_snapshot=budget_snapshot)
 
-        lock = self.get_lock(session.key)
-        async with lock:
-            # Refresh session reference: AutoCompact may have replaced it.
-            fresh = self.sessions.get_or_create(session.key)
-            if fresh is not session:
-                session = fresh
-            if not session.messages:
-                return
+    async def compact_session(self, session: Session, *, budget_snapshot=None) -> str | None:
+        """Generate optimistically and commit only against the unchanged transcript."""
+        from copy import deepcopy
 
-            budget = self._input_token_budget
-            target = int(budget * self.consolidation_ratio)
-            last_summary = await self._consolidate_replay_overflow(
-                session,
-                replay_max_messages,
-            )
+        from nanobot.session.compaction import (
+            CHECKPOINTS,
+            CompactionEngine,
+            CompactionError,
+            RequestBudget,
+            fingerprint,
+            latest_checkpoint,
+        )
+
+        provider = self.provider
+        budget = budget_snapshot or RequestBudget.freeze(
+            provider, self.model, self.context_window_tokens, self.max_completion_tokens,
+        )
+        async with self.get_lock(session.key):
+            if self.sessions.get_or_create(session.key) is not session:
+                return None
+            await self.flush_before_compaction(session)
+            before = fingerprint(session.messages)
+            prior = deepcopy(latest_checkpoint(session.metadata))
+            source = session.messages
+            if prior is None:
+                source = session.messages[session.last_consolidated:]
+                legacy = session.metadata.get("_last_summary")
+                if isinstance(legacy, dict) and legacy.get("text"):
+                    source = [{"role": "user", "content": legacy["text"],
+                               "_compaction_summary": True}] + source
             try:
-                estimated, source = self.estimate_session_prompt_tokens(
-                    session,
+                checkpoint = await CompactionEngine(provider, budget).prepare(
+                    source, previous=prior,
+                    recent_tokens=max(1, int(budget.input_limit * self.consolidation_ratio)),
                 )
-            except Exception:
-                logger.exception("Token estimation failed for {}", session.key)
-                estimated, source = 0, "error"
-            if estimated <= 0:
-                self._persist_last_summary(session, last_summary)
-                return
-            if estimated >= budget:
-                diag = self._prompt_diagnostics(session)
-                logger.info(
-                    "Token consolidation diagnostics for {}: total={}/{} via {}, "
-                    "system_tokens={}, archived_summary={} chars/{} tokens, "
-                    "replay_tokens={}, replay_msgs={}, target={}",
-                    session.key,
-                    estimated,
-                    self.context_window_tokens,
-                    source,
-                    diag["system_tokens"],
-                    diag["summary_chars"],
-                    diag["summary_tokens"],
-                    diag["replay_tokens"],
-                    diag["message_count"],
-                    target,
-                )
-                if diag["system_tokens"] >= target:
-                    logger.warning(
-                        "Prompt bloat for {} is unreducible by message consolidation: "
-                        "system+archived context is already {} tokens (target {}, budget {}).",
-                        session.key,
-                        diag["system_tokens"],
-                        target,
-                        budget,
-                    )
-            if estimated < budget:
-                unconsolidated_count = len(session.messages) - session.last_consolidated
-                logger.debug(
-                    "Token consolidation idle {}: {}/{} via {}, msgs={}",
-                    session.key,
-                    estimated,
-                    self.context_window_tokens,
-                    source,
-                    unconsolidated_count,
-                )
-                self._persist_last_summary(session, last_summary)
-                return
-
-            for round_num in range(self._MAX_CONSOLIDATION_ROUNDS):
-                if estimated <= target:
-                    break
-
-                boundary = self.pick_consolidation_boundary(session, max(1, estimated - target))
-                if boundary is None:
-                    diag = self._prompt_diagnostics(session)
-                    logger.warning(
-                        "Token consolidation cannot shrink {} (round {}): no safe boundary; "
-                        "system_tokens={}, archived_summary={} chars/{} tokens, replay_tokens={}, budget={}",
-                        session.key,
-                        round_num,
-                        diag["system_tokens"],
-                        diag["summary_chars"],
-                        diag["summary_tokens"],
-                        diag["replay_tokens"],
-                        budget,
-                    )
-                    break
-
-                end_idx = boundary[0]
-
-                chunk = session.messages[session.last_consolidated:end_idx]
-                if not chunk:
-                    break
-
-                logger.info(
-                    "Token consolidation round {} for {}: {}/{} via {}, chunk={} msgs",
-                    round_num,
-                    session.key,
-                    estimated,
-                    self.context_window_tokens,
-                    source,
-                    len(chunk),
-                )
-                summary = await self.archive(chunk, session_key=session.key)
-                # Advance the cursor either way: on success the chunk was
-                # summarized; on failure archive() already raw-archived it as
-                # a breadcrumb. Re-archiving the same chunk on the next call
-                # would just emit duplicate [RAW] entries.
-                if summary:
-                    last_summary = summary
-                session.last_consolidated = end_idx
-                self.sessions.save(session)
-                if not summary:
-                    # LLM is degraded — stop hammering it this call;
-                    # the next invocation can retry a fresh chunk.
-                    break
-
+                if (fingerprint(session.messages) != before
+                        or latest_checkpoint(session.metadata) != prior
+                        or self.sessions.get_or_create(session.key) is not session):
+                    raise CompactionError("Session changed during compaction; checkpoint discarded")
+                old_metadata = deepcopy(session.metadata)
+                session.metadata.setdefault(CHECKPOINTS, []).append(checkpoint)
+                session.metadata.pop("_last_summary", None)
                 try:
-                    estimated, source = self.estimate_session_prompt_tokens(
-                        session,
-                    )
-                except Exception:
-                    logger.exception("Token estimation failed for {}", session.key)
-                    estimated, source = 0, "error"
-                if estimated <= 0:
-                    break
-
-            # Persist the last summary to session metadata so it can be injected
-            # into the runtime context on the next prepare_session() call, aligning
-            # the summary injection strategy with AutoCompact._archive().
-            self._persist_last_summary(session, last_summary)
+                    self.sessions.save(session, fsync=True)
+                except BaseException:
+                    session.metadata = old_metadata
+                    raise
+                return checkpoint["summary"]
+            except CompactionError as exc:
+                logger.warning("Compaction failed for {}: {}", session.key, exc)
+                return None
 
     # ------------------------------------------------------------------
     # Pre-compaction memory flush (issue #33)
@@ -1970,79 +1757,11 @@ class Consolidator:
     async def compact_idle_session(
         self,
         session_key: str,
-        max_suffix: int = 8,
     ) -> str | None:
-        """Hard-truncate an idle session under the consolidation lock.
-
-        Used by AutoCompact so all session mutation goes through a single
-        lock-protected path.  Returns the summary text on success, ``None``
-        if the LLM failed (raw_archive fallback), or ``""`` if there was
-        nothing to archive.
-        """
-        lock = self.get_lock(session_key)
-        async with lock:
-            self.sessions.invalidate(session_key)
-            session = self.sessions.get_or_create(session_key)
-
-            # Pre-compaction memory flush (issue #33): best-effort, never blocks.
-            try:
-                await self.flush_before_compaction(session)
-            except Exception:
-                logger.warning("Precompact flush failed for {}", session_key, exc_info=True)
-
-            messages_to_summarize = list(session.messages[session.last_consolidated:])
-            if not messages_to_summarize:
-                session.updated_at = datetime.now()
-                self.sessions.save(session)
-                return ""
-
-            probe = Session(
-                key=session.key,
-                messages=messages_to_summarize.copy(),
-                created_at=session.created_at,
-                updated_at=session.updated_at,
-                metadata={},
-                last_consolidated=0,
-            )
-            dropped, already_consolidated = probe.retain_recent_legal_suffix(max_suffix, extend_to_user=True)
-            messages_to_keep = probe.messages
-            messages_to_remove = dropped[already_consolidated:]
-
-            if not messages_to_remove and not messages_to_keep:
-                session.updated_at = datetime.now()
-                self.sessions.save(session)
-                return ""
-
-            last_active = session.updated_at
-            summary: str | None = ""
-            if messages_to_remove:
-                # Summarize the retained suffix too, but only archive messages
-                # removed from the live session. Upstream contract; prevents
-                # stale summaries when a correction lands in the kept tail.
-                summary = await self.archive(
-                    messages_to_remove,
-                    session_key=session.key,
-                    summary_messages=messages_to_summarize,
-                )
-
-            if summary and summary != "(nothing)":
-                session.metadata["_last_summary"] = {
-                    "text": summary,
-                    "last_active": last_active.isoformat(),
-                }
-
-            session.messages = messages_to_keep
-            session.last_consolidated = 0
+        """Idle and manual compaction use the same non-destructive checkpoint engine."""
+        session = self.sessions.get_or_create(session_key)
+        if not session.messages:
             session.updated_at = datetime.now()
             self.sessions.save(session)
-
-            if messages_to_remove:
-                logger.info(
-                    "Idle-session compact for {}: archived={}, kept={}, summary={}",
-                    session_key,
-                    len(messages_to_remove),
-                    len(messages_to_keep),
-                    bool(summary),
-                )
-
-            return summary
+            return ""
+        return await self.compact_session(session)

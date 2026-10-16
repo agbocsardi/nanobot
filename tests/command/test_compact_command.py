@@ -9,12 +9,15 @@ import pytest
 from nanobot.agent.loop import AgentLoop  # noqa: F401
 from nanobot.command.builtin import cmd_compact
 from nanobot.command.router import CommandContext
+from nanobot.session.compaction import CHECKPOINTS
+from nanobot.session.manager import Session
 
 
 @pytest.mark.asyncio
-async def test_compact_archives_old_history_and_reports_counts():
-    old = SimpleNamespace(messages=[{}, {}, {}, {}])
-    new = SimpleNamespace(messages=[{}, {}])
+async def test_compact_checkpoints_old_history_and_reports_counts():
+    old = Session(key="test:chat", messages=[{"role": "user", "content": str(i)} for i in range(4)])
+    new = Session(key="test:chat", messages=list(old.messages))
+    new.metadata[CHECKPOINTS] = [{"first_kept_entry_id": new.messages[2]["_entry_id"]}]
     sessions = MagicMock()
     sessions.get_or_create.side_effect = [old, new]
     consolidator = SimpleNamespace(compact_idle_session=AsyncMock(return_value="summary"))
@@ -24,14 +27,18 @@ async def test_compact_archives_old_history_and_reports_counts():
 
     result = await cmd_compact(ctx)
 
-    consolidator.compact_idle_session.assert_awaited_once_with("test:chat", 8)
-    assert result.content == "Compacted session: archived 2 old message(s) and kept 2 recent message(s)."
+    consolidator.compact_idle_session.assert_awaited_once_with("test:chat")
+    assert result.content == (
+        "Compacted 2 message(s) into a continuity checkpoint; kept 2 recent message(s). "
+        "Original transcript retained."
+    )
+    assert new.messages == old.messages
     assert result.metadata["render_as"] == "text"
 
 
 @pytest.mark.asyncio
 async def test_compact_empty_session_is_clear():
-    session = SimpleNamespace(messages=[{}])
+    session = Session(key="test:chat")
     sessions = MagicMock()
     sessions.get_or_create.side_effect = [session, session]
     consolidator = SimpleNamespace(compact_idle_session=AsyncMock(return_value=""))
@@ -41,7 +48,7 @@ async def test_compact_empty_session_is_clear():
 
     result = await cmd_compact(ctx)
 
-    assert result.content == "Nothing to compact; kept 1 recent message(s)."
+    assert result.content == "Nothing to compact; original transcript retained."
 
 
 @pytest.mark.asyncio
@@ -54,8 +61,8 @@ async def test_compact_rejects_arguments():
 
 @pytest.mark.asyncio
 async def test_compact_reports_missing_summary_without_claiming_success():
-    old = SimpleNamespace(messages=[{}, {}, {}, {}])
-    new = SimpleNamespace(messages=[{}, {}])
+    old = Session(key="test:chat", messages=[{"role": "user", "content": str(i)} for i in range(4)])
+    new = Session(key="test:chat", messages=list(old.messages))
     sessions = MagicMock()
     sessions.get_or_create.side_effect = [old, new]
     consolidator = SimpleNamespace(compact_idle_session=AsyncMock(return_value=None))
@@ -65,7 +72,8 @@ async def test_compact_reports_missing_summary_without_claiming_success():
 
     result = await cmd_compact(ctx)
 
-    assert "no summary was produced" in result.content
+    assert "could not produce a safe checkpoint" in result.content
+    assert new.messages == old.messages
     assert "Compacted session" not in result.content
     assert ctx.session is new
 
@@ -87,7 +95,7 @@ async def test_compact_shortcut_cannot_restore_stale_session(tmp_path):
     # Make the scope dirty after the last save, as the live turn does.
     original.metadata["workspace_scope"]["project"] = str(tmp_path / "project-dirty")
 
-    async def compact(key, _max_suffix):
+    async def compact(key):
         sessions.invalidate(key)
         fresh = sessions.get_or_create(key)
         fresh.messages = fresh.messages[-1:]

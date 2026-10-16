@@ -15,7 +15,6 @@ if TYPE_CHECKING:
 
 
 class AutoCompact:
-    _RECENT_SUFFIX_MESSAGES = 8
     _INTERNAL_SESSION_PREFIXES = ("dream:",)
 
     def __init__(self, sessions: SessionManager, consolidator: Consolidator,
@@ -61,9 +60,7 @@ class AutoCompact:
             self._archiving.discard(key)
             return
         try:
-            summary = await self.consolidator.compact_idle_session(
-                key, self._RECENT_SUFFIX_MESSAGES,
-            )
+            summary = await self.consolidator.compact_idle_session(key)
             if summary and summary != "(nothing)":
                 session = self.sessions.get_or_create(key)
                 meta = session.metadata.get("_last_summary")
@@ -85,6 +82,11 @@ class AutoCompact:
         if key in self._archiving or self._is_expired(session.updated_at):
             logger.info("Auto-compact: reloading session {} (archiving={})", key, key in self._archiving)
             session = self.sessions.get_or_create(key)
+        from nanobot.session.compaction import latest_checkpoint
+
+        if latest_checkpoint(session.metadata):
+            self._summaries.pop(key, None)
+            return session, None  # get_history owns deterministic summary projection.
         # Hot path: summary from in-memory dict (process hasn't restarted).
         entry = self._summaries.pop(key, None)
         if entry:

@@ -6,7 +6,7 @@ import pytest
 from nanobot.agent.loop import AgentLoop
 from nanobot.agent.tools.context import RequestContext
 from nanobot.bus.queue import MessageBus
-from nanobot.providers.base import LLMResponse, ToolCallRequest
+from nanobot.providers.base import GenerationSettings, LLMResponse, ToolCallRequest
 
 
 class _ContextRecordingTool:
@@ -49,6 +49,7 @@ class _Tools:
 @pytest.mark.asyncio
 async def test_loop_hook_preserves_metadata_when_resetting_tool_context(tmp_path: Path) -> None:
     provider = MagicMock()
+    provider.generation = GenerationSettings(max_tokens=4096)
     calls = {"n": 0}
 
     async def chat_with_retry(**_kwargs):

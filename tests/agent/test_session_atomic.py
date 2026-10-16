@@ -230,7 +230,10 @@ class TestRepairCorruptFile:
         assert payload is not None
         assert payload["key"] == "test:read-repair"
         assert payload["metadata"] == {"source": "repair"}
-        assert payload["messages"] == [{"role": "user", "content": "survived"}]
+        assert [{k: v for k, v in m.items() if k != "_entry_id"} for m in payload["messages"]] == [
+            {"role": "user", "content": "survived"}
+        ]
+        assert payload["messages"][0]["_entry_id"]
 
     def test_list_sessions_keeps_repaired_corrupt_file(self, tmp_path: Path):
         mgr = SessionManager(tmp_path)
