@@ -1501,6 +1501,7 @@ class AgentLoop:
             fingerprint,
             latest_checkpoint,
         )
+        from nanobot.session.microcompaction import MICROCOMPACT_THROUGH
 
         continuity_checkpoint = latest_checkpoint(session.metadata) if session is not None else None
         transcript_revision = fingerprint(session.messages) if session is not None else None
@@ -1589,6 +1590,7 @@ class AgentLoop:
                 compaction_engine_factory=_compaction_engine,
                 precompaction_callback=_precompact,
                 continuity_checkpoint=continuity_checkpoint,
+                microcompact_through=session.metadata.get(MICROCOMPACT_THROUGH) if session else None,
                 injection_callback=_drain_pending,
                 # Sustained goals may legitimately exceed NANOBOT_LLM_TIMEOUT_S; idle stall
                 # is still capped by NANOBOT_STREAM_IDLE_TIMEOUT_S in streaming providers.

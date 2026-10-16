@@ -1479,7 +1479,13 @@ class Consolidator:
         include_timestamps: bool = False,
     ) -> list[dict[str, Any]]:
         """Return the complete continuity projection for prompt estimation."""
-        return session.get_history(projected=True, include_timestamps=include_timestamps)
+        from nanobot.session.microcompaction import MICROCOMPACT_THROUGH, microcompact
+
+        return microcompact(
+            session.get_history(projected=True, include_timestamps=include_timestamps,
+                                include_entry_ids=True),
+            session.metadata.get(MICROCOMPACT_THROUGH),
+        )
 
     def estimate_session_prompt_tokens(
         self,
@@ -1633,7 +1639,7 @@ class Consolidator:
         budget_snapshot = RequestBudget.freeze(
             self.provider, self.model, self.context_window_tokens, self.max_completion_tokens,
         )
-        history = session.get_history(projected=True)
+        history = self._full_unconsolidated_history(session)
         prompt = self._build_messages(history=history, current_message="")
         if (len(session.messages) <= FILE_MAX_MESSAGES
                 and budget_snapshot.estimate(self.provider, prompt, self._get_tool_definitions()) < (
@@ -1842,11 +1848,36 @@ class Consolidator:
         return {k: record.get(k) for k in ("result", "range", "trust", "destinations")}
 
 
+    async def microcompact_idle_session(self, session_key: str) -> int:
+        """Persist a replay boundary only: no LLM, memory flush or history archive."""
+        from copy import deepcopy
+
+        from nanobot.session.microcompaction import MICROCOMPACT_THROUGH, microcompact
+
+        async with self.get_lock(session_key):
+            session = self.sessions.get_or_create(session_key)
+            history = session.get_history(projected=True, include_entry_ids=True)
+            through = next((m["_entry_id"] for m in reversed(history) if m.get("_entry_id")), None)
+            if session.metadata.get(MICROCOMPACT_THROUGH) == through:
+                return 0
+            projected = microcompact(history, through)
+            changed = sum(left["content"] != right["content"]
+                          for left, right in zip(history, projected))
+            old_metadata = deepcopy(session.metadata)
+            session.metadata[MICROCOMPACT_THROUGH] = through
+            try:
+                self.sessions.save(session, fsync=True)
+            except BaseException:
+                session.metadata = old_metadata
+                raise
+            logger.info("Idle microcompact: {} tool results hidden for {}", changed, session_key)
+            return changed
+
     async def compact_idle_session(
         self,
         session_key: str,
     ) -> str | None:
-        """Idle and manual compaction use the same non-destructive checkpoint engine."""
+        """Full manual compaction from stored results (legacy method name)."""
         session = self.sessions.get_or_create(session_key)
         if not session.messages:
             session.updated_at = datetime.now()

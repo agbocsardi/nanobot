@@ -9,6 +9,12 @@
 - [x] Run memory-capped full current/baseline suites with comparable collections; confirm no new failures. Current: 3475 passed, 3 baseline email timeouts, 2 collection skips.
 - [x] Document architecture, exact commands, collection changes, baseline failures and limitations in `2026-10-16_pi-compaction_report.md`; leave reviewable uncommitted changes.
 
+## Idle microcompaction follow-up
+
+- [ ] Replace idle LLM compaction with durable, no-LLM tool-result projection; retain scheduler admission/backoff safeguards.
+- [ ] Apply placeholders only to normal model inputs; use stored tool results for manual/token-pressure summaries and preserve JSONL originals.
+- [ ] Align token estimates, reset behavior and configuration docs; migrate affected existing checks and validate runtime/reload behavior.
+
 ## Log
 
 ### 2026-10-16
@@ -39,3 +45,8 @@ both checkpoint commit sites (`compact_session`, `_commit_compaction`); the trim
 audit-only sink. Ranges are disjoint per checkpoint and archived before the cap can drop them.
 Three new tests plus one retitled; full suite 3498 passed / 2 skipped. Committed `c68bfc2f1`;
 not merged or pushed.
+
+### 2026-10-16 — idle compaction request-storm repair
+Fixed `AutoCompact` admission on `feat/idle-compaction-backoff`: one background task with no queued backlog, starts spaced at least 60 seconds apart, successful/no-op activity revisions suppressed, and failure backoff doubling from 60 seconds to a 3,600-second cap. `None` results count as failures, not only exceptions. Cron run sessions join Dream sessions in the background exclusion. Existing checkpoint source-end identities prevent re-compacting an unchanged retained suffix after restart; no activity-timestamp workaround was added.
+
+Validation: 406 existing focused compaction/runner/command cases passed; Ruff and whitespace checks passed. Temporary synthetic runtime checks covered 3,000 rapid sweeps, blocked-task concurrency, new activity, exclusions, returned/raised failures and capped backoff. A real scheduler → Consolidator → CompactionEngine run with the existing offline provider fixture produced one checkpoint/searchable archive and no repeat model calls before or after session-manager reload, while preserving the activity timestamp. No tests were added, no real API requests or private-session reads, and no commit/push/deployment/restart. Failure backoff is process-local; successful checkpoint suppression is durable.

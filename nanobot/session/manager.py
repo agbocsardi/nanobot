@@ -510,6 +510,7 @@ class Session:
         self.updated_at = datetime.now()
         self.metadata.pop("_last_summary", None)
         self.metadata.pop("compaction_checkpoints", None)
+        self.metadata.pop("idle_microcompact_through", None)
         self.metadata.pop("usage", None)
         self.metadata.pop("_usage_archived", None)
 

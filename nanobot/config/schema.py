@@ -195,7 +195,7 @@ class AgentDefaults(Base):
         ge=0,
         validation_alias=AliasChoices("idleCompactAfterMinutes", "sessionTtlMinutes"),
         serialization_alias="idleCompactAfterMinutes",
-    )  # Auto-compact idle threshold in minutes (0 = disabled)
+    )  # No-LLM idle tool-result microcompaction threshold in minutes (0 = disabled)
     max_messages: int = Field(
         default=120,
         ge=0,
