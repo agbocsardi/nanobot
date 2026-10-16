@@ -14,6 +14,9 @@ from nanobot.command import CommandContext
 from nanobot.config.schema import AgentDefaults
 from nanobot.providers.base import LLMResponse
 
+# Only the simulated old persisted-summary backend uses a message-count suffix.
+_LEGACY_SUFFIX_MESSAGES = 8
+
 
 def _make_loop(
     tmp_path: Path,
@@ -85,7 +88,7 @@ def _make_fake_compact(
 
     state = {"count": 0}
 
-    async def _fake_compact(key: str, max_suffix: int = 8) -> str:
+    async def _fake_compact(key: str, max_suffix: int = _LEGACY_SUFFIX_MESSAGES) -> str:
         state["count"] += 1
         session = loop.sessions.get_or_create(key)
 
@@ -198,8 +201,13 @@ class TestAgentLoopTTLParam:
         assert loop.auto_compact._ttl == 0
 
     @pytest.mark.asyncio
-    async def test_process_message_reads_history_with_token_budget(self, tmp_path):
-        """_process_message should pass an auto-derived token budget to get_history."""
+    async def test_process_message_reads_projected_history(self, tmp_path):
+        """_process_message should request the projected replay, not a capped slice.
+
+        Context is governed by the runner's frozen request budget and by
+        token-budget checkpoints, so the history call must not cap the replay by
+        token budget or message count (see the retired max_messages field).
+        """
         loop = _make_loop(tmp_path)
         session = loop.sessions.get_or_create("cli:direct")
         session.get_history = MagicMock(return_value=[])
@@ -216,9 +224,11 @@ class TestAgentLoopTTLParam:
         await loop._process_message(msg)
         session.get_history.assert_called_once()
         kwargs = session.get_history.call_args.kwargs
-        assert isinstance(kwargs.get("max_tokens"), int)
-        assert kwargs["max_tokens"] > 0
+        assert kwargs["projected"] is True
         assert kwargs["include_timestamps"] is True
+        assert kwargs["include_entry_ids"] is True
+        assert "max_tokens" not in kwargs
+        assert "max_messages" not in kwargs
 
     @pytest.mark.asyncio
     async def test_session_file_cap_archives_and_trims_old_messages(self, tmp_path):
@@ -238,7 +248,7 @@ class TestAgentLoopTTLParam:
         from nanobot.session.manager import FILE_MAX_MESSAGES
         assert len(session.messages) <= FILE_MAX_MESSAGES
 
-    def test_session_enforce_file_cap_skips_archive_when_dropped_prefix_already_consolidated(self, tmp_path):
+    def test_file_cap_does_not_discard_legacy_cursor_without_checkpoint(self, tmp_path):
         from nanobot.session.manager import Session
         archive_fn = MagicMock()
         session = Session(key="cli:direct")
@@ -248,23 +258,25 @@ class TestAgentLoopTTLParam:
 
         session.enforce_file_cap(on_archive=archive_fn, limit=4)
 
-        assert len(session.messages) <= 4
+        assert len(session.messages) == 8
         archive_fn.assert_not_called()
 
-    def test_session_enforce_file_cap_archives_only_unconsolidated_dropped_prefix(self, tmp_path):
+    def test_file_cap_archives_all_checkpoint_hidden_originals(self, tmp_path):
         from nanobot.session.manager import Session
         archive_fn = MagicMock()
         session = Session(key="cli:direct")
         for i in range(8):
             session.add_message("user", f"u{i}")
         session.last_consolidated = 2
+        from tests.session.test_compaction_retention import checkpoint
 
+        checkpoint(session, 4)
         session.enforce_file_cap(on_archive=archive_fn, limit=4)
 
         assert len(session.messages) <= 4
         archive_fn.assert_called_once()
         archived = archive_fn.call_args.args[0]
-        assert [m["content"] for m in archived] == ["u2", "u3"]
+        assert [m["content"] for m in archived] == ["u0", "u1", "u2", "u3"]
 
 
 class TestAutoCompact:
@@ -330,14 +342,15 @@ class TestAutoCompact:
 
         assert len(archived_messages) == 4
         session_after = loop.sessions.get_or_create("cli:test")
-        assert len(session_after.messages) == loop.auto_compact._RECENT_SUFFIX_MESSAGES
+        assert len(session_after.messages) == _LEGACY_SUFFIX_MESSAGES
         assert session_after.messages[0]["content"] == "msg user 2"
         assert session_after.messages[-1]["content"] == "msg assistant 5"
         await loop.close_mcp()
 
     @pytest.mark.asyncio
-    async def test_auto_compact_extends_recent_suffix_to_user_turn(self, tmp_path):
+    async def test_auto_compact_preserves_transcript_and_projects_legal_suffix(self, tmp_path):
         loop = _make_loop(tmp_path, session_ttl_minutes=15)
+        loop.provider.estimate_prompt_tokens.return_value = (0, "heuristic")
         session = loop.sessions.get_or_create("cli:test")
         _add_turns(session, 2, prefix="old")
         session.add_message("user", "record this")
@@ -349,17 +362,20 @@ class TestAutoCompact:
         await loop.auto_compact._archive("cli:test")
 
         session_after = loop.sessions.get_or_create("cli:test")
-        assert len(session_after.messages) > loop.auto_compact._RECENT_SUFFIX_MESSAGES
-        assert session_after.messages[0]["content"] == "record this"
+        assert len(session_after.messages) > _LEGACY_SUFFIX_MESSAGES
+        assert session_after.messages[0]["content"] == "old user 0"
         assert session_after.messages[-1]["content"] == "done"
+        projected = session_after.get_history(projected=True, include_entry_ids=True)
+        assert projected[0]["_compaction_summary"]
+        assert len(projected) < len(session_after.messages)
         tool_results = {
             m.get("tool_call_id")
-            for m in session_after.messages
+            for m in projected
             if m.get("role") == "tool"
         }
         assert all(
             tc["id"] in tool_results
-            for m in session_after.messages
+            for m in projected
             for tc in (m.get("tool_calls") or [])
         )
         await loop.close_mcp()
@@ -382,7 +398,7 @@ class TestAutoCompact:
         assert entry is not None
         assert entry[0] == "User said hello."
         session_after = loop.sessions.get_or_create("cli:test")
-        assert len(session_after.messages) == loop.auto_compact._RECENT_SUFFIX_MESSAGES
+        assert len(session_after.messages) == _LEGACY_SUFFIX_MESSAGES
         await loop.close_mcp()
 
     @pytest.mark.asyncio
@@ -598,7 +614,7 @@ class TestAutoCompactEdgeCases:
 
     @pytest.mark.asyncio
     async def test_auto_compact_with_nothing_summary(self, tmp_path):
-        """Auto-new should not inject when archive produces '(nothing)'."""
+        """An empty semantic summary must not advance continuity."""
         loop = _make_loop(tmp_path, session_ttl_minutes=15)
         session = loop.sessions.get_or_create("cli:test")
         _add_turns(session, 6, prefix="thanks")
@@ -612,15 +628,16 @@ class TestAutoCompactEdgeCases:
         await loop.auto_compact._archive("cli:test")
 
         session_after = loop.sessions.get_or_create("cli:test")
-        assert len(session_after.messages) == loop.auto_compact._RECENT_SUFFIX_MESSAGES
+        assert len(session_after.messages) == 12
+        assert "compaction_checkpoints" not in session_after.metadata
         # "(nothing)" summary should not be stored
         assert "cli:test" not in loop.auto_compact._summaries
 
         await loop.close_mcp()
 
     @pytest.mark.asyncio
-    async def test_auto_compact_archive_failure_still_keeps_recent_suffix(self, tmp_path):
-        """Auto-new should keep the recent suffix even if LLM archive falls back to raw dump."""
+    async def test_auto_compact_failure_preserves_all_original_messages(self, tmp_path):
+        """Failed generation must not discard unsummarized task context."""
         loop = _make_loop(tmp_path, session_ttl_minutes=15)
         session = loop.sessions.get_or_create("cli:test")
         _add_turns(session, 6, prefix="important")
@@ -633,7 +650,9 @@ class TestAutoCompactEdgeCases:
         await loop.auto_compact._archive("cli:test")
 
         session_after = loop.sessions.get_or_create("cli:test")
-        assert len(session_after.messages) == loop.auto_compact._RECENT_SUFFIX_MESSAGES
+        assert len(session_after.messages) == 12
+        assert "compaction_checkpoints" not in session_after.metadata
+        assert session_after.last_consolidated == 0
 
         await loop.close_mcp()
 
@@ -810,7 +829,7 @@ class TestProactiveAutoCompact:
         await self._run_check_expired(loop)
 
         session_after = loop.sessions.get_or_create("cli:test")
-        assert len(session_after.messages) == loop.auto_compact._RECENT_SUFFIX_MESSAGES
+        assert len(session_after.messages) == _LEGACY_SUFFIX_MESSAGES
         assert len(archived_messages) == 2
         entry = loop.auto_compact._summaries.get("cli:test")
         assert entry is not None
@@ -865,7 +884,7 @@ class TestProactiveAutoCompact:
         started = asyncio.Event()
         block_forever = asyncio.Event()
 
-        async def _slow_compact(key, max_suffix=8):
+        async def _slow_compact(key):
             nonlocal archive_count
             archive_count += 1
             started.set()
@@ -897,7 +916,7 @@ class TestProactiveAutoCompact:
         session.updated_at = datetime.now() - timedelta(minutes=20)
         loop.sessions.save(session)
 
-        async def _failing_compact(key, max_suffix=8):
+        async def _failing_compact(key):
             raise RuntimeError("LLM down")
 
         loop.consolidator.compact_idle_session = _failing_compact
@@ -993,7 +1012,7 @@ class TestProactiveAutoCompact:
 
         assert _fake_compact.state["count"] == 1
         s1_after = loop.sessions.get_or_create("cli:expired_idle")
-        assert len(s1_after.messages) == loop.auto_compact._RECENT_SUFFIX_MESSAGES
+        assert len(s1_after.messages) == _LEGACY_SUFFIX_MESSAGES
         s2_after = loop.sessions.get_or_create("cli:expired_active")
         assert len(s2_after.messages) == 12  # Preserved
         s3_after = loop.sessions.get_or_create("cli:recent")
@@ -1121,7 +1140,7 @@ class TestSummaryPersistence:
 
         # prepare_session should recover summary from metadata
         reloaded = loop.sessions.get_or_create("cli:test")
-        assert len(reloaded.messages) == loop.auto_compact._RECENT_SUFFIX_MESSAGES
+        assert len(reloaded.messages) == _LEGACY_SUFFIX_MESSAGES
         _, summary = loop.auto_compact.prepare_session(reloaded, "cli:test")
 
         assert summary is not None

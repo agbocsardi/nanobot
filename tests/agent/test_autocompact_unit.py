@@ -292,7 +292,7 @@ class TestArchiveDelegates:
         await ac._archive("cli:test")
 
         ac.consolidator.compact_idle_session.assert_awaited_once_with(
-            "cli:test", ac._RECENT_SUFFIX_MESSAGES,
+            "cli:test",
         )
 
     @pytest.mark.asyncio

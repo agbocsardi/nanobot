@@ -199,14 +199,15 @@ class AgentDefaults(Base):
     max_messages: int = Field(
         default=120,
         ge=0,
-    )  # Max messages to replay from session history (0 = use default 120, respects token budget)
+        description="Legacy compatibility field; ignored by model replay. Token-budget checkpoints govern context.",
+    )
     consolidation_ratio: float = Field(
         default=0.5,
         ge=0.1,
         le=0.95,
         validation_alias=AliasChoices("consolidationRatio"),
         serialization_alias="consolidationRatio",
-    )  # Consolidation target ratio (0.5 = 50% of budget retained after compression)
+    )  # Recent-token target for checkpoints; overflow recovery can retain less
     dream: DreamConfig = Field(default_factory=DreamConfig)
     vision_handoff: VisionHandoffConfig = Field(default_factory=VisionHandoffConfig)
 

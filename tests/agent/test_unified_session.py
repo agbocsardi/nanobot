@@ -428,19 +428,16 @@ class TestConsolidationUnaffectedByUnifiedSession:
         session.messages = [{"role": "user", "content": "msg"}]
         sessions.get_or_create.return_value = session
 
-        # Simulate over-budget: estimated > budget
-        consolidator.estimate_session_prompt_tokens = MagicMock(return_value=(950, "tiktoken"))
-        # No valid boundary found → returns gracefully without archiving
-        consolidator.pick_consolidation_boundary = MagicMock(return_value=None)
+        # The unified key uses the same frozen-budget checkpoint operation.
+        mock_provider.estimate_prompt_tokens.return_value = (950, "test")
+        consolidator.compact_session = AsyncMock(return_value=None)
         consolidator.archive = AsyncMock()
 
         await consolidator.maybe_consolidate_by_tokens(session)
 
-        # estimate was called (consolidation was attempted)
-        consolidator.estimate_session_prompt_tokens.assert_called_once_with(
-            session,
-        )
-        # but archive was not called (no valid boundary)
+        consolidator.compact_session.assert_awaited_once()
+        assert consolidator.compact_session.await_args.args == (session,)
+        assert consolidator.compact_session.await_args.kwargs["budget_snapshot"].model == "test-model"
         consolidator.archive.assert_not_called()
 
 

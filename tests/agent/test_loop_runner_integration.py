@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from nanobot.config.schema import AgentDefaults
-from nanobot.providers.base import LLMResponse, ToolCallRequest
+from nanobot.providers.base import GenerationSettings, LLMResponse, ToolCallRequest
 from nanobot.session.manager import Session
 
 _MAX_TOOL_RESULT_CHARS = AgentDefaults().max_tool_result_chars
@@ -21,6 +21,7 @@ def _make_loop(tmp_path):
     bus = MessageBus()
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
+    provider.generation = GenerationSettings(max_tokens=4096)
 
     with patch("nanobot.agent.loop.ContextBuilder"), \
          patch("nanobot.agent.loop.SessionManager"), \
@@ -75,6 +76,7 @@ async def test_loop_records_session_usage_by_model(tmp_path):
 async def test_cron_usage_sink_records_run_override(tmp_path):
     loop = _make_loop(tmp_path)
     background = MagicMock()
+    background.generation = GenerationSettings(max_tokens=4096)
     background._spec.name = "background-provider"
     background.chat_with_retry = AsyncMock(return_value=LLMResponse(
         content="done", tool_calls=[],
@@ -222,6 +224,7 @@ async def test_streamed_flag_not_set_on_llm_error(tmp_path):
     bus = MessageBus()
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
+    provider.generation = GenerationSettings(max_tokens=4096)
     loop = AgentLoop(bus=bus, provider=provider, workspace=tmp_path, model="test-model")
     error_resp = LLMResponse(
         content="503 service unavailable", finish_reason="error", tool_calls=[], usage={},
@@ -254,6 +257,7 @@ async def test_ssrf_soft_block_can_finalize_after_streamed_tool_call(tmp_path):
     bus = MessageBus()
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
+    provider.generation = GenerationSettings(max_tokens=4096)
     tool_call_resp = LLMResponse(
         content="checking metadata",
         tool_calls=[ToolCallRequest(
@@ -301,6 +305,7 @@ async def test_next_turn_after_llm_error_keeps_turn_boundary(tmp_path):
 
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
+    provider.generation = GenerationSettings(max_tokens=4096)
     provider.chat_with_retry = AsyncMock(side_effect=[
         LLMResponse(content="429 rate limit exceeded", finish_reason="error", tool_calls=[], usage={}),
         LLMResponse(content="Recovered answer", tool_calls=[], usage={}),
@@ -349,6 +354,7 @@ async def test_subagent_max_iterations_announces_incomplete_fallback(tmp_path, m
     bus = MessageBus()
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
+    provider.generation = GenerationSettings(max_tokens=4096)
     provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
         content="working",
         tool_calls=[ToolCallRequest(id="call_1", name="list_dir", arguments={"path": "."})],

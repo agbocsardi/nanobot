@@ -49,7 +49,8 @@ def test_loaded_corrupt_offset_keeps_messages(tmp_path: Path):
 
         session = manager.get_or_create("chan:chat")
 
-        assert session.messages == [message]
+        assert [{k: v for k, v in m.items() if k != "_entry_id"} for m in session.messages] == [message]
+        assert session.messages[0]["_entry_id"]
         assert session.last_consolidated == 0
         assert session.get_history(max_messages=10) == [message]
 

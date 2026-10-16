@@ -1870,17 +1870,13 @@ When a user is idle for longer than a configured threshold, nanobot **proactivel
 `sessionTtlMinutes` remains accepted as a legacy alias for backward compatibility, but `idleCompactAfterMinutes` is the preferred config key going forward.
 
 How it works:
-1. **Idle detection**: On each idle tick (~1 s), checks all sessions for expiration.
-2. **Background compaction**: Idle sessions summarize the older live prefix via LLM and keep the most recent legal suffix (currently 8 messages).
-3. **Summary injection**: When the user returns, the summary is injected as runtime context (one-shot, not persisted) alongside the retained recent suffix.
-4. **Restart-safe resume**: The summary is also mirrored into session metadata so it can still be recovered after a process restart.
+1. **Idle detection**: Idle ticks check session expiration, excluding active and Dream sessions.
+2. **Shared checkpoint engine**: Idle compaction, `/compact`, request thresholds, and explicit context-overflow recovery all use the same engine.
+3. **Transcript versus projection**: Original session messages remain in their existing redacted persistence representation. A versioned checkpoint stores an evolving structured summary and references a token-sized recent suffix. Tool calls/results stay paired; a split-turn summary preserves the original request and early work.
+4. **Restart-safe continuation**: Checkpoints and any referenced pending tool batches are saved atomically. Reload rebuilds the same summary-plus-suffix projection. Failed, cancelled, empty, or length-truncated summaries never advance continuity.
+5. **Request recovery**: The runner checks the transformed payload, including tool schemas, against a frozen model/window/output budget. Compaction pauses only between completed tool batches and retries only the interrupted continuation, not completed tools or answers. Irreducible fixed instructions and exchanges produce specific errors.
 
-> [!NOTE]
-> Mental model: "summarize older context, keep the freshest live turns, **and overwrite the session file with the compact form.**" It is not a full `session.clear()`, but it is a write — not a soft cursor move.
->
-> Concretely, auto compact rewrites `sessions/<key>.jsonl` in place: older messages (including their structured `tool_calls` / `tool_call_id` / `reasoning_content`) are replaced by just the retained recent suffix (currently 8 messages), while the archived prefix is preserved only as a plain-text summary appended to `memory/history.jsonl` (or a `[RAW] ...` flattened dump if LLM summarization fails). The original structured JSON of those turns is no longer recoverable from the session file.
->
-> This differs from the **token-driven soft consolidation** that fires when a prompt exceeds the context budget: that path only advances an internal `last_consolidated` cursor and leaves the session file untouched, so the raw tool-call trail stays on disk and can still be replayed or audited. If you rely on that trail for debugging or auditing, leave `idleCompactAfterMinutes` at the default `0` and let only the token-driven path run.
+Compaction does not discard original transcript records, write a fallback topic-memory archive, or advance `last_consolidated`. When an active session file exceeds 2,000 messages, checkpoint-hidden records may move into lossless, redacted audit batches under `sessions/archive/<session>/`; the projected context is unchanged. System messages and everything at or after the retained entry are never removed by this cap. If no safe hidden prefix exists, continuity takes priority over the cap; message-count pressure requests a checkpoint at the next turn. Existing explicit pre-compaction personal-memory flushing remains separate; checkpoint continuity does not depend on Dream/topic-memory extraction. `agents.defaults.maxMessages` is a **legacy/no-op compatibility field**: old JSON configs still load, but its value has no effect on model replay. Direct `AgentLoop(max_messages=...)` overrides and the internal idle/manual count overrides are retired. Checkpoints retain a token-sized legal suffix; the separate legacy `Session.get_history(max_messages=...)` browsing limit applies only without projection/checkpoints. The nine-raw-image handoff policy is unchanged.
 
 ## Timezone
 

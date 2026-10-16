@@ -430,14 +430,11 @@ def _status_model_chain(loop: Any) -> str:
 
 
 
-_COMPACT_RECENT_SUFFIX_MESSAGES = 8
-
-
 async def cmd_compact(ctx: CommandContext) -> OutboundMessage:
     """Summarize old history while retaining a recent legal message suffix.
 
-    Consolidator owns the lock, archival, and legal-boundary handling.  This
-    command deliberately does not retry or otherwise recover provider errors.
+    Consolidator owns generation, the lock, and checkpoint commit. Original
+    messages are retained even when summary generation fails.
     """
     if ctx.args.strip():
         return OutboundMessage(
@@ -450,17 +447,18 @@ async def cmd_compact(ctx: CommandContext) -> OutboundMessage:
     loop = ctx.loop
     sessions = loop.sessions
     before = sessions.get_or_create(ctx.key)
-    # ``compact_idle_session`` may invalidate and reload this session. Persist
-    # turn-local mutations first (for example, workspace scope from restore),
-    # or the reload would discard them before compaction can archive safely.
+    # Persist turn-local metadata (for example, workspace scope from restore)
+    # before the checkpoint transaction.
     current = ctx.session if ctx.session is not None else before
     if current is not before:
         before = current
     sessions.save(before)
-    before_count = len(before.messages)
-    summary = await loop.consolidator.compact_idle_session(
-        ctx.key, _COMPACT_RECENT_SUFFIX_MESSAGES,
-    )
+    from nanobot.session.compaction import latest_checkpoint
+
+    previous = latest_checkpoint(before.metadata)
+    previous_start = next((i for i, m in enumerate(before.messages)
+                           if previous and m.get("_entry_id") == previous.get("first_kept_entry_id")), 0)
+    summary = await loop.consolidator.compact_idle_session(ctx.key)
     after = sessions.get_or_create(ctx.key)
     # The consolidator invalidates and replaces the cached session.  The turn
     # state machine persists the command after this handler using its original
@@ -472,19 +470,19 @@ async def cmd_compact(ctx: CommandContext) -> OutboundMessage:
             if hasattr(after, attr):
                 setattr(ctx.session, attr, getattr(after, attr))
     ctx.session = after
-    archived = max(0, before_count - len(after.messages))
+    checkpoint = latest_checkpoint(after.metadata)
+    start = next((i for i, m in enumerate(after.messages)
+                  if checkpoint and m.get("_entry_id") == checkpoint.get("first_kept_entry_id")), 0)
+    compacted = max(0, start - previous_start)
     metadata = {**dict(ctx.msg.metadata or {}), "render_as": "text"}
-    if not archived:
-        content = f"Nothing to compact; kept {len(after.messages)} recent message(s)."
-    elif summary is None:
-        content = (
-            f"Archived {archived} old message(s) and kept {len(after.messages)} "
-            "recent message(s), but no summary was produced."
-        )
+    if summary is None:
+        content = "Compaction could not produce a safe checkpoint; original continuity retained."
+    elif not compacted:
+        content = "Nothing to compact; original transcript retained."
     else:
         content = (
-            f"Compacted session: archived {archived} old message(s) and kept "
-            f"{len(after.messages)} recent message(s)."
+            f"Compacted {compacted} message(s) into a continuity checkpoint; "
+            f"kept {len(after.messages) - start} recent message(s). Original transcript retained."
         )
     return OutboundMessage(
         channel=ctx.msg.channel,

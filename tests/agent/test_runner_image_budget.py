@@ -54,11 +54,14 @@ async def test_governance_exception_still_rejects_oversized_prompt():
     provider = MagicMock()
     provider.chat_with_retry = AsyncMock()
     runner = AgentRunner(provider)
-    runner._snip_history = MagicMock(side_effect=RuntimeError("governance failed"))
     messages = [{"role": "user", "content": [
         {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * 12000}},
     ]}]
+    runner._drop_orphan_tool_results = MagicMock(
+        side_effect=[RuntimeError("governance failed"), messages],
+    )
     result = await runner.run(_spec(messages, _tools(), context_block_limit=20))
+    assert runner._drop_orphan_tool_results.call_count == 2
     assert result.stop_reason == "context_budget_exceeded"
     provider.chat_with_retry.assert_not_awaited()
 

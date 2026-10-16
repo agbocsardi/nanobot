@@ -47,6 +47,16 @@ def sanitize_surrogates(text: str) -> str:
     )
 
 
+def strip_private_fields(value: Any) -> Any:
+    """Remove internal underscore-prefixed keys at public message boundaries."""
+    if isinstance(value, dict):
+        return {key: strip_private_fields(item) for key, item in value.items()
+                if not (isinstance(key, str) and key.startswith("_"))}
+    if isinstance(value, (list, tuple)):
+        return [strip_private_fields(item) for item in value]
+    return value
+
+
 def sanitize_surrogates_deep(value: Any) -> Any:
     """Recursively apply :func:`sanitize_surrogates` to every string leaf.
 
