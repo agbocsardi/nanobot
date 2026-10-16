@@ -530,7 +530,8 @@ def test_registry_classifies_nonzero_session_exit_as_retryable(tmp_path):
     result = asyncio.run(run())
 
     assert "Exit code: 3" in str(result)
-    assert result.status == "retryable_error"
+    assert result.status == "nonzero_exit"
+    assert result.retryable is True
     assert result.data["state"] == "exited"
     assert result.exit_code == 3
 

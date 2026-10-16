@@ -315,9 +315,12 @@ class ExecTool(Tool):
 
             stdout_text = stdout.decode("utf-8", errors="replace")
             stderr_text = stderr.decode("utf-8", errors="replace")
+            # A command that ran and returned is not a harness failure: the
+            # exit code is payload data (see ToolResult.nonzero_exit).
             return ToolResult(
                 result,
-                status="success" if process.returncode == 0 else "retryable_error",
+                status="success" if process.returncode == 0 else "nonzero_exit",
+                retryable=process.returncode != 0,
                 data={
                     "exit_code": process.returncode,
                     "stdout": stdout_text,

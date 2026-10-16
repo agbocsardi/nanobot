@@ -420,6 +420,9 @@ class AgentRunner:
         error: str | None = None
         stop_reason = "completed"
         tool_events: list[dict[str, Any]] = []
+        # Index-aligned with tool_events: what each call touched, used only to
+        # decide whether a failure was later resolved (never exposed).
+        tool_event_targets: list[list[str]] = []
         external_lookup_counts: dict[str, int] = {}
         # Per-turn throttle for repeated attempts against the same outside target.
         workspace_violation_counts: dict[str, int] = {}
@@ -605,13 +608,14 @@ class AgentRunner:
 
                 await hook.before_execute_tools(context)
 
-                results, new_events, fatal_error = await self._execute_tools(
+                results, new_events, new_event_targets, fatal_error = await self._execute_tools(
                     spec,
                     response.tool_calls,
                     external_lookup_counts,
                     workspace_violation_counts,
                 )
                 tool_events.extend(new_events)
+                tool_event_targets.extend(new_event_targets)
                 tools_used.extend(
                     tool_call.name
                     for tool_call, event in zip(response.tool_calls, new_events)
@@ -809,10 +813,14 @@ class AgentRunner:
                     continue
                 break
 
-            terminal_tool_reason = self._terminal_tool_stop_reason(tool_events)
+            terminal_tool_reason = self._terminal_tool_stop_reason(
+                tool_events, tool_event_targets,
+            )
             if terminal_tool_reason is not None:
                 stop_reason = terminal_tool_reason
-                clean = self._suppress_false_success(clean, stop_reason)
+                clean = self._suppress_false_success(
+                    clean, stop_reason, tool_events, tool_event_targets,
+                )
                 assistant_message = build_assistant_message(
                     clean,
                     reasoning_content=response.reasoning_content,
@@ -885,34 +893,128 @@ class AgentRunner:
             had_injections=had_injections,
         )
 
-    @staticmethod
-    def _terminal_tool_stop_reason(tool_events: list[dict[str, Any]]) -> str | None:
-        latest_by_tool: dict[str, str] = {}
-        for event in tool_events:
-            name = str(event.get("name") or "")
+    # Statuses that mean a material operation may not have landed.
+    # ``nonzero_exit`` is deliberately absent: the command ran and returned, so
+    # its exit code is data rather than an unresolved failure.
+    _FAILURE_STATUSES = frozenset({"partial", "retryable_error"})
+    # Failures a later success can supersede. Policy blocks participate so a
+    # blocked call that is then satisfied by another route stops being terminal.
+    _RESOLVABLE_STATUSES = frozenset({"partial", "retryable_error", "policy_block"})
+    # How many unresolved failures the notice names before it elides the rest.
+    _MAX_NOTICE_DETAILS = 3
+
+    @classmethod
+    def _unresolved_events(
+        cls,
+        tool_events: list[dict[str, Any]],
+        event_targets: list[list[str]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Failures that no later success resolved, in call order."""
+        unresolved: list[dict[str, Any]] = []
+        for index, event in enumerate(tool_events):
             status = str(event.get("status") or "")
-            if name and status:
-                latest_by_tool[name] = status
-        statuses = set(latest_by_tool.values())
+            if status not in cls._RESOLVABLE_STATUSES:
+                continue
+            if cls._superseded(index, event, tool_events, event_targets):
+                continue
+            unresolved.append(event)
+        return unresolved
+
+    @staticmethod
+    def _targets_at(
+        event_targets: list[list[str]] | None,
+        index: int,
+    ) -> set[str]:
+        if not event_targets or index >= len(event_targets):
+            return set()
+        return {t for t in event_targets[index] if isinstance(t, str)}
+
+    @classmethod
+    def _superseded(
+        cls,
+        index: int,
+        event: dict[str, Any],
+        tool_events: list[dict[str, Any]],
+        event_targets: list[list[str]] | None = None,
+    ) -> bool:
+        """True when a later success cleared this failure.
+
+        Two ways to clear: the same tool succeeded again (a retry that worked),
+        or another tool succeeded on the same target -- apply_patch failing and
+        edit_file then writing that same file is a recovery, not a failure. An
+        unrelated success never launders a failure.
+        """
+        name = str(event.get("name") or "")
+        targets = cls._targets_at(event_targets, index)
+        for later_index in range(index + 1, len(tool_events)):
+            later = tool_events[later_index]
+            if str(later.get("status") or "") != "success":
+                continue
+            if str(later.get("name") or "") == name:
+                return True
+            if targets & cls._targets_at(event_targets, later_index):
+                return True
+        return False
+
+    @classmethod
+    def _terminal_tool_stop_reason(
+        cls,
+        tool_events: list[dict[str, Any]],
+        event_targets: list[list[str]] | None = None,
+    ) -> str | None:
+        statuses = {
+            str(event.get("status") or "")
+            for event in cls._unresolved_events(tool_events, event_targets)
+        }
         if "policy_block" in statuses:
             return "policy_block"
-        if "partial" in statuses:
+        if statuses & cls._FAILURE_STATUSES:
             return "partial_completion"
-        if "retryable_error" in statuses:
-            return "partial_completion"
-        if "ask_user" in statuses:
+        if any(str(event.get("status") or "") == "ask_user" for event in tool_events):
             return "ask_user"
         return None
 
-    @staticmethod
-    def _suppress_false_success(content: str, stop_reason: str) -> str:
+    @classmethod
+    def _suppress_false_success(
+        cls,
+        content: str,
+        stop_reason: str,
+        tool_events: list[dict[str, Any]] | None = None,
+        event_targets: list[list[str]] | None = None,
+    ) -> str:
         # Only false-success outcomes get a prefix; ask_user (a deliberate
         # wait-for-user pause) and other terminal reasons pass content through.
+        # The first line stays byte-identical so log fingerprinting and the
+        # error ledger keep tracking this class; the specifics follow on their
+        # own lines, which is what makes the notice actionable.
         if stop_reason == "policy_block":
-            return f"{_POLICY_BLOCK_PREFIX}\n\n{content}" if content else _POLICY_BLOCK_PREFIX
-        if stop_reason == "partial_completion":
-            return f"{_PARTIAL_COMPLETION_PREFIX}\n\n{content}" if content else _PARTIAL_COMPLETION_PREFIX
-        return content
+            prefix = _POLICY_BLOCK_PREFIX
+        elif stop_reason == "partial_completion":
+            prefix = _PARTIAL_COMPLETION_PREFIX
+        else:
+            return content
+        details = cls._failure_details(tool_events or [], event_targets)
+        if details:
+            prefix = "\n".join([prefix, *details])
+        return f"{prefix}\n\n{content}" if content else prefix
+
+    @classmethod
+    def _failure_details(
+        cls,
+        tool_events: list[dict[str, Any]],
+        event_targets: list[list[str]] | None = None,
+    ) -> list[str]:
+        """Name the unresolved failures, bounded to keep the notice scannable."""
+        unresolved = cls._unresolved_events(tool_events, event_targets)
+        lines: list[str] = []
+        for event in unresolved[: cls._MAX_NOTICE_DETAILS]:
+            name = str(event.get("name") or "tool")
+            detail = str(event.get("detail") or "").strip()
+            lines.append(f"- {name}: {detail}" if detail else f"- {name}")
+        remaining = len(unresolved) - len(lines)
+        if remaining > 0:
+            lines.append(f"- and {remaining} more")
+        return lines
 
     def _build_request_kwargs(
         self,
@@ -1406,7 +1508,7 @@ class AgentRunner:
         tool_calls: list[ToolCallRequest],
         external_lookup_counts: dict[str, int],
         workspace_violation_counts: dict[str, int],
-    ) -> tuple[list[Any], list[dict[str, Any]], BaseException | None]:
+    ) -> tuple[list[Any], list[dict[str, Any]], list[list[str]], BaseException | None]:
         batches = self._partition_tool_batches(spec, tool_calls)
         tool_results: list[tuple[Any, dict[str, Any], BaseException | None]] = []
         for batch in batches:
@@ -1429,13 +1531,17 @@ class AgentRunner:
 
         results: list[Any] = []
         events: list[dict[str, Any]] = []
+        # Targets stay out of the events: default runs keep the legacy event
+        # shape (see test_runner_events_unchanged_without_flag). Batches keep
+        # tool_calls order, so this list is index-aligned with `events`.
+        event_targets = [self._event_targets(call.arguments) for call in tool_calls]
         fatal_error: BaseException | None = None
         for result, event, error in tool_results:
             results.append(result)
             events.append(event)
             if error is not None and fatal_error is None:
                 fatal_error = error
-        return results, events, fatal_error
+        return results, events, event_targets, fatal_error
 
     async def _run_tool(
         self,
@@ -1647,6 +1753,45 @@ class AgentRunner:
         return payload, self._tool_event(
             tool_call.name, outcome, arguments=recorded_args,
         ), None
+
+    # Argument keys that identify what a call touched. Matched across tools so
+    # that a failure recovered through a different tool on the same target
+    # (apply_patch -> edit_file on one file) resolves instead of lingering.
+    _EVENT_TARGET_KEYS: tuple[str, ...] = (
+        "path",
+        "file_path",
+        "file",
+        "session_id",
+        "job_id",
+        "intent_id",
+    )
+    _EVENT_TARGET_MAX_ITEMS = 4
+
+    @classmethod
+    def _event_targets(cls, arguments: Any) -> list[str]:
+        """Identifying values this call touched, in a bounded, JSON-safe form."""
+        if not isinstance(arguments, dict):
+            return []
+        targets: list[str] = []
+
+        def _add(value: Any) -> None:
+            if isinstance(value, str) and value.strip():
+                cleaned = value.strip()[:_RECORDED_ARG_MAX_CHARS]
+                if cleaned not in targets:
+                    targets.append(cleaned)
+
+        for key in cls._EVENT_TARGET_KEYS:
+            _add(arguments.get(key))
+        edits = arguments.get("edits")
+        if isinstance(edits, list):
+            for item in edits:
+                if isinstance(item, dict):
+                    _add(item.get("path"))
+        channel = arguments.get("channel")
+        chat_id = arguments.get("chat_id")
+        if isinstance(channel, str) and isinstance(chat_id, (str, int)):
+            _add(f"{channel}:{chat_id}")
+        return targets[: cls._EVENT_TARGET_MAX_ITEMS]
 
     @staticmethod
     def _tool_event(
