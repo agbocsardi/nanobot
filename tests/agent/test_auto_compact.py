@@ -317,7 +317,6 @@ class TestAutoCompact:
         s2.add_message("user", "recent")
         loop.sessions.save(s2)
 
-        loop.consolidator.compact_idle_session = _make_fake_compact(loop)
         loop.auto_compact.check_expired(loop._schedule_background)
         await _drain_background_tasks(loop)
 
@@ -410,8 +409,6 @@ class TestAutoCompact:
         """_archive on empty session should not store a summary."""
         loop = _make_loop(tmp_path, session_ttl_minutes=15)
 
-        loop.consolidator.compact_idle_session = _make_fake_compact(loop)
-
         await loop.auto_compact._archive("cli:test")
 
         session_after = loop.sessions.get_or_create("cli:test")
@@ -428,14 +425,9 @@ class TestAutoCompact:
         session.last_consolidated = 18
         loop.sessions.save(session)
 
-        archived_messages = []
-        loop.consolidator.compact_idle_session = _make_fake_compact(
-            loop, track_archived=archived_messages,
-        )
-
         await loop.auto_compact._archive("cli:test")
 
-        assert archived_messages == []
+        assert loop.context.memory.read_unprocessed_history(since_cursor=0) == []
         assert session.last_consolidated == 18
         assert len(session.messages) == 28
         loop.provider.chat_with_retry.assert_not_awaited()
