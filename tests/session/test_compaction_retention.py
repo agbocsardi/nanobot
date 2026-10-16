@@ -123,7 +123,7 @@ async def test_final_save_does_not_reappend_a_committed_archived_run_prefix(tmp_
     assert [m["content"] for m in session.messages] == ["7", "8", "9", "final answer"]
 
 
-def test_cap_archives_only_the_existing_redacted_representation(tmp_path, monkeypatch):
+def test_cap_archives_tool_history_without_hidden_reasoning(tmp_path, monkeypatch):
     monkeypatch.setattr("nanobot.session.manager.FILE_MAX_MESSAGES", 2)
     sessions = SessionManager(tmp_path)
     session = sessions.get_or_create("test:privacy")
@@ -139,11 +139,14 @@ def test_cap_archives_only_the_existing_redacted_representation(tmp_path, monkey
     sessions.save(session)
     path = next((sessions.sessions_dir / "archive").rglob("*.jsonl"))
     text = path.read_text()
-    assert "secret" not in text
+    assert "hidden-secret" not in text
+    assert "argument-secret" in text
+    assert "result-secret" in text
     records = [json.loads(line) for line in text.splitlines()][1:]
     assert len(records) == 3
-    assert records[1]["tool_calls"][0]["function"]["arguments"] == "{}"
+    assert records[1]["tool_calls"][0]["function"]["arguments"] == '{"command":"argument-secret"}'
     assert records[2]["tool_call_id"] == "call"
+    assert records[2]["content"] == "result-secret"
 
 
 async def test_message_count_pressure_creates_checkpoint_before_safe_trimming(tmp_path, monkeypatch):

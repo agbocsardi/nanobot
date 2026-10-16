@@ -348,7 +348,7 @@ def test_get_history_does_not_annotate_tool_results_with_timestamps():
 
     tool_result = history[-1]
     assert tool_result["role"] == "tool"
-    assert tool_result["content"] == "[tool result omitted: y, 2 chars]"
+    assert tool_result["content"] == "ok"
 
 
 # --- Window cuts mid-group: assistant present but some tool results orphaned ---
@@ -836,7 +836,7 @@ def test_retain_recent_legal_suffix_last_consolidated_correct_in_else_branch():
     assert already_cons == 9
 
 
-def test_session_save_sanitizes_hidden_and_tool_payloads(tmp_path):
+def test_session_save_retains_tool_history_and_removes_hidden_reasoning(tmp_path):
     manager = SessionManager(tmp_path)
     session = manager.get_or_create("telegram:bloated")
     huge_args = "x" * 10_000
@@ -862,19 +862,23 @@ def test_session_save_sanitizes_hidden_and_tool_payloads(tmp_path):
     raw = manager._get_session_path("telegram:bloated").read_text(encoding="utf-8")
 
     assert "reasoning_content" not in raw
-    assert huge_args not in raw
-    assert "y" * 1000 not in raw
+    assert huge_args in raw
+    assert "y" * 1000 in raw
     assert "visible answer" in raw
-    assert "[tool result omitted: read_file, 20000 chars]" in raw
 
+    assert session.messages[1]["tool_calls"][0]["function"]["arguments"] == huge_args
+    assert session.messages[2]["content"] == "y" * 20_000
     manager.invalidate("telegram:bloated")
     reloaded = manager.get_or_create("telegram:bloated")
     assistant_tool = reloaded.messages[1]["tool_calls"][0]
-    assert assistant_tool["function"] == {"name": "read_file", "arguments": "{}"}
-    assert reloaded.messages[2]["content"] == "[tool result omitted: read_file, 20000 chars]"
+    assert assistant_tool["function"] == {"name": "read_file", "arguments": huge_args}
+    assert reloaded.messages[2]["content"] == "y" * 20_000
+    history = reloaded.get_history(max_messages=10)
+    assert history[1]["tool_calls"][0]["function"]["arguments"] == huge_args
+    assert history[2]["content"] == "y" * 20_000
 
 
-def test_get_history_sanitizes_legacy_bloated_messages() -> None:
+def test_get_history_preserves_legacy_tool_history_and_removes_reasoning() -> None:
     session = Session(key="telegram:legacy")
     session.messages = [
         {"role": "user", "content": "hello"},
@@ -890,5 +894,5 @@ def test_get_history_sanitizes_legacy_bloated_messages() -> None:
     history = session.get_history(max_messages=10)
 
     assert "reasoning_content" not in history[1]
-    assert history[1]["tool_calls"][0]["function"]["arguments"] == "{}"
-    assert history[2]["content"] == "[tool result omitted: exec, 5000 chars]"
+    assert history[1]["tool_calls"][0]["function"]["arguments"] == "x" * 5000
+    assert history[2]["content"] == "z" * 5000

@@ -44,8 +44,16 @@ async def test_pending_batches_commit_once_and_reload_with_checkpoint(tmp_path):
     loop.sessions.invalidate(session.key)
     loaded = loop.sessions.get_or_create(session.key)
     assert loaded.get_history(projected=True) == projection
-    assert all(m["content"].startswith("[tool result omitted:") for m in loaded.messages if m["role"] == "tool")
-    assert all(tc["function"]["arguments"] == "{}" for m in loaded.messages for tc in m.get("tool_calls", []))
+    assert [m["content"] for m in loaded.messages if m["role"] == "tool"] == [
+        m["content"] for m in session.messages if m["role"] == "tool"
+    ]
+    assert [
+        tc["function"]["arguments"]
+        for m in loaded.messages for tc in m.get("tool_calls", [])
+    ] == [
+        tc["function"]["arguments"]
+        for m in session.messages for tc in m.get("tool_calls", [])
+    ]
     loop.consolidator.flush_before_compaction.assert_awaited()
 
 

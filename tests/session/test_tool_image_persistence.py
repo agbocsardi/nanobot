@@ -26,11 +26,12 @@ def test_tool_image_reference_survives_save_load(tmp_path: Path) -> None:
     loaded = manager.get_or_create(session.key)
     tool = loaded.messages[1]
     assert tool["tool_call_id"] == "call-1"
-    lines = tool["content"].splitlines()
-    assert lines[0].startswith("[tool result omitted: generate_image, ")
-    assert lines[0].endswith(" chars]")
-    assert lines[1] == "[image: tmp/context-images/123-random.img; re-read via read_file]"
-    assert "base64" not in tool["content"]
+    text = [block["text"] for block in tool["content"]]
+    assert text == [
+        "created",
+        "[image: tmp/context-images/123-random.img; re-read via read_file]",
+    ]
+    assert "base64" not in str(tool["content"])
 
 
 def test_tool_image_metadata_rejects_remote_and_outside_paths(tmp_path: Path) -> None:
@@ -52,8 +53,8 @@ def test_tool_image_metadata_rejects_remote_and_outside_paths(tmp_path: Path) ->
         assert "base64" not in result["content"]
 
 
-def test_non_image_tool_result_keeps_existing_placeholder(tmp_path: Path) -> None:
+def test_non_image_tool_result_keeps_bounded_text(tmp_path: Path) -> None:
     result = sanitize_message_for_persistence(
         {"role": "tool", "name": "shell", "content": "private output"}, workspace=tmp_path
     )
-    assert result["content"] == "[tool result omitted: shell, 14 chars]"
+    assert result["content"] == "private output"
