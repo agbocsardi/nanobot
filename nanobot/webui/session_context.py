@@ -18,7 +18,10 @@ def session_context_payload(session: Session) -> dict[str, Any]:
     model-specific token budget.  This projection deliberately reports only the
     session-owned part: archived summary plus the replayable raw suffix.
     """
-    replay = session.get_history(max_messages=0, include_runtime_context=False)
+    # Public history deliberately excludes internal checkpoint identities.
+    # Checkpoint summaries are part of these replay metrics, not message data
+    # returned by this aggregate-only endpoint.
+    replay = session.get_history(projected=True)
     raw_summary = session.metadata.get("_last_summary")
     summary = ""
     summary_preview = ""
@@ -44,7 +47,7 @@ def session_context_payload(session: Session) -> dict[str, Any]:
         "schema_version": 1,
         "session_key": session.key,
         "total_messages": len(session.messages),
-        "archived_messages": min(session.last_archived, len(session.messages)),
+        "archived_messages": min(session.last_consolidated, len(session.messages)),
         "replay_messages": len(replay),
         "estimated_replay_tokens": replay_tokens,
         "estimated_summary_tokens": summary_tokens,
