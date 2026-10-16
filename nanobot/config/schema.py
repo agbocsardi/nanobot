@@ -84,18 +84,23 @@ class DreamConfig(Base):
 
 
 class VisionHandoffConfig(Base):
-    """Vision handoff: describe images with a vision model for text-only models.
+    """Vision handoff: bound raw images per request, describing older ones.
 
-    When enabled, outgoing messages for any model preset flagged
-    ``needs_vision_handoff`` have their ``image_url`` blocks replaced with
-    text descriptions produced by ``describer_preset`` (a vision-capable
-    model, e.g. umans-flash) before the request leaves. The simplest form of
-    the pi-vision-handoff pattern: one describer call per image, cached by
-    image hash for the process lifetime.
+    When enabled, only the newest ``max_raw_images`` images in an outgoing
+    request stay raw; every older ``image_url`` block is replaced with a text
+    description produced by ``describer_preset`` (a vision-capable model,
+    e.g. umans-flash) plus the stored file path, so the target model can
+    re-read the image on demand. This bounds both the per-request image count
+    and the token cost of a long image-heavy session.
+
+    Presets flagged ``needs_vision_handoff`` (text-only models) keep zero raw
+    images: every image is described. The pi-vision-handoff pattern, with
+    descriptions cached by image hash for the process lifetime.
     """
 
     enabled: bool = False
     describer_preset: str = "umans-flash"  # model preset that describes the images
+    max_raw_images: int = Field(default=9, ge=0)  # newest N images stay raw; older ones get described
     max_description_tokens: int = 1024
     prompt: str | None = None  # override the describer system prompt
 
