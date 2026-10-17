@@ -95,6 +95,9 @@ async def _failed_postcondition_turn() -> tuple[str, dict[str, int]]:
                 tool_calls=[ToolCallRequest(id="call_1", name="deliver", arguments={})],
             ),
             LLMResponse(content="reminder sent"),
+            # The reply earned its verification turn; the failure is still
+            # unresolved, so the notice prefixes this second claim.
+            LLMResponse(content="reminder sent"),
         ],
         tools=tools,
     )

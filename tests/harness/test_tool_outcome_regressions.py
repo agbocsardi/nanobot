@@ -124,7 +124,7 @@ async def test_unchecked_side_effect_is_recorded_as_partial() -> None:
         ),
     ))
 
-    result, _ = await run_script(_tool_turn("deliver"), tools=tools)
+    result, provider = await run_script(_tool_turn("deliver"), tools=tools)
 
     event = result.tool_events[0]
     assert event["status"] == "partial"
@@ -132,8 +132,12 @@ async def test_unchecked_side_effect_is_recorded_as_partial() -> None:
     assert event["verified"] is False
     assert event["side_effects"] == [{"kind": "message", "recipient": "user-1"}]
     assert result.tools_used == []
+    # An unverifiable side effect earns no verification turn: no tool can
+    # confirm it and a retry is churn. The notice guards the claim instead.
+    assert len(provider.requests) == 2
     assert result.stop_reason == "partial_completion"
-    assert result.final_content != "done"
+    assert result.final_content.startswith("Incomplete:")
+    assert "- deliver" in result.final_content
 
 
 @pytest.mark.asyncio
@@ -192,6 +196,133 @@ async def test_retryable_error_can_recover_with_later_success() -> None:
     ]
     assert result.stop_reason == "completed"
     assert result.final_content == "done with evidence"
+
+
+def _failing_write(name: str = "write_file") -> _PathTool:
+    return _PathTool(
+        name,
+        ToolResult.retryable_error("Error: permission denied"),
+        ToolResult("Successfully wrote the file"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_verification_turn_lets_the_model_retry_before_replying() -> None:
+    """A false-success reply earns one turn to fix the operation, not a prefix."""
+    tools = ToolRegistry()
+    tools.register(_failing_write())
+
+    result, provider = await run_script(
+        [
+            _edit_turn("call_1", "write_file", "/notes/grocery-list.md"),
+            LLMResponse(content="Saved the list."),
+            _edit_turn("call_2", "write_file", "/notes/grocery-list.md"),
+            LLMResponse(content="Saved the list, after a retry."),
+        ],
+        tools=tools,
+        max_iterations=6,
+    )
+
+    # Four provider calls: the original reply, the nudge, the retry, the reply.
+    assert len(provider.requests) == 4
+    nudge = provider.requests[2]["messages"][-1]
+    assert nudge["role"] == "user"
+    assert "did not complete" in nudge["content"]
+    assert "- write_file: Error: permission denied" in nudge["content"]
+    assert result.stop_reason == "completed"
+    assert result.final_content == "Saved the list, after a retry."
+
+
+@pytest.mark.asyncio
+async def test_verification_turn_runs_once_then_reports_the_failure() -> None:
+    """The nudge must not become a loop: one check, then the honest notice."""
+    tools = ToolRegistry()
+    tools.register(_failing_write())
+
+    result, provider = await run_script(
+        [
+            _edit_turn("call_1", "write_file", "/notes/grocery-list.md"),
+            LLMResponse(content="Saved the list."),
+            LLMResponse(content="Saved the list."),
+        ],
+        tools=tools,
+        max_iterations=6,
+    )
+
+    assert len(provider.requests) == 3
+    assert result.stop_reason == "partial_completion"
+    assert result.final_content.startswith("Incomplete:")
+    assert "- write_file: Error: permission denied" in result.final_content
+
+
+@pytest.mark.asyncio
+async def test_no_verification_turn_without_iteration_budget() -> None:
+    """With no slot left, fall back to the prefix rather than the nudge."""
+    tools = ToolRegistry()
+    tools.register(_failing_write())
+
+    result, provider = await run_script(
+        [
+            _edit_turn("call_1", "write_file", "/notes/grocery-list.md"),
+            LLMResponse(content="Saved the list."),
+        ],
+        tools=tools,
+        max_iterations=2,
+    )
+
+    assert len(provider.requests) == 2
+    assert result.stop_reason == "partial_completion"
+    assert result.final_content.startswith("Incomplete:")
+
+
+@pytest.mark.asyncio
+async def test_verification_turn_can_be_disabled() -> None:
+    """verify_tool_failures=False keeps the prefix-only behaviour."""
+    tools = ToolRegistry()
+    tools.register(_failing_write())
+
+    result, provider = await run_script(
+        [
+            _edit_turn("call_1", "write_file", "/notes/grocery-list.md"),
+            LLMResponse(content="Saved the list."),
+        ],
+        tools=tools,
+        max_iterations=6,
+        verify_tool_failures=False,
+    )
+
+    assert len(provider.requests) == 2
+    assert result.stop_reason == "partial_completion"
+    assert result.final_content.startswith("Incomplete:")
+
+
+@pytest.mark.asyncio
+async def test_resolved_failures_never_earn_a_verification_turn() -> None:
+    """Nothing unresolved means no extra call at all."""
+    tools = ToolRegistry()
+    tools.register(_failing_write("apply_patch"))
+    tools.register(_PathTool("edit_file", ToolResult("Successfully edited the file")))
+
+    result, provider = await run_script(
+        [
+            LLMResponse(
+                content="patching",
+                tool_calls=[ToolCallRequest(
+                    id="call_1",
+                    name="apply_patch",
+                    arguments={"edits": [{"path": "/notes/grocery-list.md"}]},
+                )],
+            ),
+            _edit_turn("call_2", "edit_file", "/notes/grocery-list.md"),
+            LLMResponse(content="List updated."),
+        ],
+        tools=tools,
+        max_iterations=6,
+    )
+
+    assert len(provider.requests) == 3
+    assert result.stop_reason == "completed"
+    assert result.final_content == "List updated."
 
 
 @pytest.mark.asyncio
