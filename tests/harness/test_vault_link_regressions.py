@@ -88,7 +88,10 @@ async def test_vault_link_with_failed_postcondition_is_recorded_partial() -> Non
         ),
     ))
 
-    result, _ = await run_script(_tool_turn("generate_link"), tools=tools)
+    result, _ = await run_script(
+        [*_tool_turn("generate_link"), LLMResponse(content="done")],
+        tools=tools,
+    )
 
     event = result.tool_events[0]
     assert event["status"] == "partial"

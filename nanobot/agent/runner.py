@@ -168,6 +168,11 @@ class AgentRunSpec:
     goal_active_predicate: Callable[[], bool] | None = None
     goal_continue_message: str | None = None
     finalize_on_max_iterations: bool = True
+    # When a reply would otherwise be prefixed as a false success, spend one
+    # bounded turn letting the model retry the failed operation or state
+    # plainly what did not happen. Set False to keep the old prefix-only
+    # behaviour (one fewer LLM call on failing turns).
+    verify_tool_failures: bool = True
     vision_handoff: Any = None  # nanobot.agent.vision_handoff.VisionHandoff | None
     # Persisted-run observability: enrich every tool event with a compact
     # args map and a rendered-result preview (see _tool_event).
@@ -423,6 +428,8 @@ class AgentRunner:
         # Index-aligned with tool_events: what each call touched, used only to
         # decide whether a failure was later resolved (never exposed).
         tool_event_targets: list[list[str]] = []
+        # At most one verification turn per run: it must not become a loop.
+        verification_attempted = False
         external_lookup_counts: dict[str, int] = {}
         # Per-turn throttle for repeated attempts against the same outside target.
         workspace_violation_counts: dict[str, int] = {}
@@ -816,6 +823,40 @@ class AgentRunner:
             terminal_tool_reason = self._terminal_tool_stop_reason(
                 tool_events, tool_event_targets,
             )
+            if (
+                terminal_tool_reason == "partial_completion"
+                and spec.verify_tool_failures
+                and not verification_attempted
+                # Only when a retry or a plainer statement could change the
+                # outcome; an unverifiable side effect is not fixable here.
+                and self._actionable_failures(
+                    self._unresolved_events(tool_events, tool_event_targets)
+                )
+                # Leave a slot for the verification call, otherwise the loop
+                # would fall through to max_iterations handling instead.
+                and iteration + 1 < spec.max_iterations
+            ):
+                verification_attempted = True
+                unresolved = self._unresolved_events(tool_events, tool_event_targets)
+                actionable = self._actionable_failures(unresolved)
+                # Record what the model actually said, unprefixed: the reply is
+                # on hold, not rewritten, and the transcript stays honest.
+                messages.append(assistant_message or build_assistant_message(
+                    clean,
+                    reasoning_content=response.reasoning_content,
+                    thinking_blocks=response.thinking_blocks,
+                ))
+                self._append_injected_messages(
+                    messages,
+                    [self._tool_failure_verification_message(actionable)],
+                )
+                logger.info(
+                    "Requesting one verification turn after {} unresolved tool failure(s) for {}",
+                    len(actionable),
+                    spec.session_key or "default",
+                )
+                await hook.after_iteration(context)
+                continue
             if terminal_tool_reason is not None:
                 stop_reason = terminal_tool_reason
                 clean = self._suppress_false_success(
@@ -999,13 +1040,45 @@ class AgentRunner:
         return f"{prefix}\n\n{content}" if content else prefix
 
     @classmethod
-    def _failure_details(
+    def _actionable_failures(
         cls,
-        tool_events: list[dict[str, Any]],
-        event_targets: list[list[str]] | None = None,
-    ) -> list[str]:
-        """Name the unresolved failures, bounded to keep the notice scannable."""
-        unresolved = cls._unresolved_events(tool_events, event_targets)
+        unresolved: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Unresolved failures a retry or a clearer statement could resolve.
+
+        An unchecked postcondition is excluded: the side effect may well have
+        happened and no tool can confirm it, so an extra turn is churn and the
+        notice alone guards the claim. A failure the model can actually act on
+        -- the operation could not run, or it ran and the intended effect did
+        not happen -- earns the turn.
+        """
+        return [
+            event
+            for event in unresolved
+            if str(event.get("status") or "") == "retryable_error"
+            or str(event.get("postcondition") or "") == "failed"
+            or (
+                str(event.get("status") or "") == "partial"
+                and not event.get("postcondition")
+            )
+        ]
+
+    @classmethod
+    def _tool_failure_verification_message(
+        cls,
+        unresolved: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """The single follow-up asking the model to verify before replying."""
+        failures = cls._format_failure_lines(unresolved)
+        content = render_template(
+            "agent/tool_failure_verification.md",
+            strip=True,
+            failures="\n".join(failures),
+        )
+        return {"role": "user", "content": content}
+
+    @classmethod
+    def _format_failure_lines(cls, unresolved: list[dict[str, Any]]) -> list[str]:
         lines: list[str] = []
         for event in unresolved[: cls._MAX_NOTICE_DETAILS]:
             name = str(event.get("name") or "tool")
@@ -1015,6 +1088,17 @@ class AgentRunner:
         if remaining > 0:
             lines.append(f"- and {remaining} more")
         return lines
+
+    @classmethod
+    def _failure_details(
+        cls,
+        tool_events: list[dict[str, Any]],
+        event_targets: list[list[str]] | None = None,
+    ) -> list[str]:
+        """Name the unresolved failures, bounded to keep the notice scannable."""
+        return cls._format_failure_lines(
+            cls._unresolved_events(tool_events, event_targets)
+        )
 
     def _build_request_kwargs(
         self,
