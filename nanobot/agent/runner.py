@@ -937,6 +937,8 @@ class AgentRunner:
     # Statuses that mean a material operation may not have landed.
     # ``nonzero_exit`` is deliberately absent: the command ran and returned, so
     # its exit code is data rather than an unresolved failure.
+    # ``invalid_arguments`` is absent for the same reason at the other end: the
+    # call was rejected before it touched anything, so no effect is unknown.
     _FAILURE_STATUSES = frozenset({"partial", "retryable_error"})
     # Failures a later success can supersede. Policy blocks participate so a
     # blocked call that is then satisfied by another route stops being terminal.
@@ -1665,7 +1667,9 @@ class AgentRunner:
                 if isinstance(prepared, tuple) and len(prepared) == 3:
                     tool, params, prep_error = prepared
         if prep_error:
-            outcome = ToolResult.retryable_error(prep_error)
+            # Schema/parameter rejection: the call never reached the tool, so it
+            # is a malformed call rather than a failed operation.
+            outcome = ToolResult.invalid_arguments(prep_error)
             event = self._tool_event(
                 tool_call.name,
                 outcome,

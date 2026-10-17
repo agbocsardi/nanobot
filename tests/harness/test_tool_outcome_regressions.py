@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from nanobot.agent.tools.apply_patch import ApplyPatchTool
 from nanobot.agent.tools.base import Tool, ToolResult
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
@@ -443,3 +444,182 @@ async def test_unrelated_success_does_not_recover_retryable_error() -> None:
 
     assert result.stop_reason == "partial_completion"
     assert result.final_content.startswith("Incomplete:")
+
+
+# --- a malformed call is not a failed operation (#55) -------------------------
+# A call rejected on its arguments never reached the tool: nothing was
+# attempted, so no effect is unknown. It must not mark the turn incomplete,
+# which is what made a Dream run discard its valid edits (8 times in 6 days).
+
+
+class _RequiredTool(Tool):
+    """Declares a required argument so the registry rejects a call missing it."""
+
+    @property
+    def name(self) -> str:
+        return "needs_path"
+
+    @property
+    def description(self) -> str:
+        return "Fixture tool with a required argument."
+
+    @property
+    def parameters(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        }
+
+    async def execute(self, **kwargs) -> object:
+        raise AssertionError("a rejected call must never execute")
+
+
+def _apply_patch_turn(call_id: str, edits: list[dict]) -> LLMResponse:
+    return LLMResponse(
+        content="patching",
+        tool_calls=[
+            ToolCallRequest(id=call_id, name="apply_patch", arguments={"edits": edits})
+        ],
+    )
+
+
+def _tool_content(result, call_id: str) -> str:
+    for message in result.messages:
+        if message.get("role") == "tool" and message.get("tool_call_id") == call_id:
+            return str(message.get("content") or "")
+    raise AssertionError(f"no tool message for {call_id}")
+
+
+@pytest.mark.asyncio
+async def test_malformed_arguments_are_not_a_failed_operation(tmp_path) -> None:
+    """A call rejected on its arguments never ran, so nothing is in doubt."""
+    tools = ToolRegistry()
+    tools.register(ApplyPatchTool(workspace=tmp_path))
+
+    result, provider = await run_script(
+        [
+            _apply_patch_turn(
+                "call_1",
+                [{"path": "/tmp/helper.sh", "action": "add", "new_text": "x"}],
+            ),
+            LLMResponse(content="Helper script updated."),
+        ],
+        tools=tools,
+        max_iterations=6,
+    )
+
+    event = result.tool_events[0]
+    assert event["status"] == "invalid_arguments"
+    assert event["retryable"] is False
+    # Not a failed operation: no verification turn and no "Incomplete:" prefix.
+    assert len(provider.requests) == 2
+    assert result.stop_reason == "completed"
+    assert result.final_content == "Helper script updated."
+    # The rejection still reaches the model, with a usable next step.
+    rejection = _tool_content(result, "call_1")
+    assert "must be relative" in rejection
+    assert "write_file" in rejection
+
+
+@pytest.mark.asyncio
+async def test_schema_rejection_is_a_malformed_call_not_a_failed_operation() -> None:
+    """A call that never reached the tool has no unknown effect either."""
+    tools = ToolRegistry()
+    tools.register(_RequiredTool())
+
+    result, provider = await run_script(
+        [
+            LLMResponse(
+                content="working",
+                tool_calls=[
+                    ToolCallRequest(id="call_1", name="needs_path", arguments={})
+                ],
+            ),
+            LLMResponse(content="Nothing left to do."),
+        ],
+        tools=tools,
+        max_iterations=6,
+    )
+
+    assert result.tool_events[0]["status"] == "invalid_arguments"
+    assert len(provider.requests) == 2
+    assert result.stop_reason == "completed"
+    assert result.final_content == "Nothing left to do."
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_content_mismatch_still_reports_an_incomplete_turn(
+    tmp_path,
+) -> None:
+    """The edit the model intended did not land: a genuine unresolved failure."""
+    target = tmp_path / "notes.md"
+    target.write_text("# Notes\n", encoding="utf-8")
+    tools = ToolRegistry()
+    tools.register(ApplyPatchTool(workspace=tmp_path))
+
+    result, provider = await run_script(
+        [
+            _apply_patch_turn(
+                "call_1",
+                [{
+                    "path": "notes.md",
+                    "action": "replace",
+                    "old_text": "text that is absent",
+                    "new_text": "replacement",
+                }],
+            ),
+            LLMResponse(content="Notes updated."),
+            LLMResponse(content="Notes updated."),
+        ],
+        tools=tools,
+        max_iterations=6,
+    )
+
+    assert result.tool_events[0]["status"] == "retryable_error"
+    # It earns the verification turn, and stays announced while unresolved.
+    assert len(provider.requests) == 3
+    assert result.stop_reason == "partial_completion"
+    assert "- apply_patch" in result.final_content
+    assert "old_text not found" in result.final_content
+    # Nothing was written: the rejected call is atomic.
+    assert target.read_text(encoding="utf-8") == "# Notes\n"
+
+
+@pytest.mark.asyncio
+async def test_valid_edits_survive_a_malformed_call_in_the_same_run(tmp_path) -> None:
+    """One bad argument must not discard the rest of a Dream-shaped run."""
+    tools = ToolRegistry()
+    tools.register(ApplyPatchTool(workspace=tmp_path))
+
+    result, provider = await run_script(
+        [
+            _apply_patch_turn(
+                "call_1",
+                [{"path": "memory/notes.md", "action": "add", "new_text": "- remembered"}],
+            ),
+            _apply_patch_turn(
+                "call_2",
+                [{
+                    "path": "/tmp/helper.sh",
+                    "action": "replace",
+                    "old_text": "a",
+                    "new_text": "b",
+                }],
+            ),
+            LLMResponse(content="Consolidation complete."),
+        ],
+        tools=tools,
+        max_iterations=6,
+    )
+
+    assert [event["status"] for event in result.tool_events] == [
+        "success",
+        "invalid_arguments",
+    ]
+    # Dream gates on stop_reason == "completed", so this run is not rolled back.
+    assert result.stop_reason == "completed"
+    assert result.final_content == "Consolidation complete."
+    assert (tmp_path / "memory" / "notes.md").read_text(encoding="utf-8") == (
+        "- remembered\n"
+    )
