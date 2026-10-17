@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from nanobot.agent.tools.base import tool_parameters
+from nanobot.agent.tools.base import ToolResult, tool_parameters
 from nanobot.agent.tools.filesystem import _FsTool
 from nanobot.agent.tools.schema import (
     ArraySchema,
@@ -31,19 +31,33 @@ class _PatchError(ValueError):
     pass
 
 
+class _PatchArgumentError(_PatchError):
+    """The call was rejected on its own arguments; nothing was attempted.
+
+    Raised only before any file is read or written, so a rejected call leaves
+    no partial state and no unknown effect. Content and state problems -- a
+    missing file, an ``old_text`` that does not match -- stay ``_PatchError``:
+    those mean the edit the model intended did not land.
+    """
+
+
 _ABSOLUTE_WINDOWS_RE = re.compile(r"^[A-Za-z]:[\\/]")
 
 
 def _validate_relative_path(path: str) -> str:
     normalized = path.strip()
     if not normalized:
-        raise _PatchError("patch path cannot be empty")
+        raise _PatchArgumentError("patch path cannot be empty")
     if "\0" in normalized:
-        raise _PatchError(f"patch path contains a null byte: {path!r}")
+        raise _PatchArgumentError(f"patch path contains a null byte: {path!r}")
     if normalized.startswith(("~", "/", "\\")) or _ABSOLUTE_WINDOWS_RE.match(normalized):
-        raise _PatchError(f"patch path must be relative: {path}")
+        raise _PatchArgumentError(
+            f"patch path must be relative: {path}. apply_patch edits paths "
+            "relative to the workspace; use write_file or edit_file for a path "
+            "outside it."
+        )
     if any(part == ".." for part in re.split(r"[\\/]+", normalized)):
-        raise _PatchError(f"patch path must not contain '..': {path}")
+        raise _PatchArgumentError(f"patch path must not contain '..': {path}")
     return normalized
 
 
@@ -150,27 +164,27 @@ class ApplyPatchTool(_FsTool):
     ) -> str:
         try:
             if not edits:
-                raise _PatchError("must provide edits")
+                raise _PatchArgumentError("must provide edits")
 
             writes: dict[Path, str] = {}
             summaries: list[_PatchSummary] = []
 
             for edit in edits:
                 if not isinstance(edit, dict):
-                    raise _PatchError("each edit must be an object")
+                    raise _PatchArgumentError("each edit must be an object")
                 raw_path = edit.get("path")
                 if not isinstance(raw_path, str):
-                    raise _PatchError("path required for edit")
+                    raise _PatchArgumentError("path required for edit")
                 path = _validate_relative_path(raw_path)
                 action = edit.get("action")
                 if not isinstance(action, str):
-                    raise _PatchError(f"action required for edit: {path}")
+                    raise _PatchArgumentError(f"action required for edit: {path}")
                 source = self._resolve(path)
 
                 if action == "add":
                     new_text = edit.get("new_text")
                     if new_text is None:
-                        raise _PatchError(f"new_text required for add: {path}")
+                        raise _PatchArgumentError(f"new_text required for add: {path}")
 
                     pending = writes.get(source)
                     if pending is not None:
@@ -213,10 +227,10 @@ class ApplyPatchTool(_FsTool):
                 elif action == "replace":
                     old_text = edit.get("old_text") or ""
                     if not old_text:
-                        raise _PatchError(f"old_text required for replace: {path}")
+                        raise _PatchArgumentError(f"old_text required for replace: {path}")
                     new_text = edit.get("new_text")
                     if new_text is None:
-                        raise _PatchError(f"new_text required for replace: {path}")
+                        raise _PatchArgumentError(f"new_text required for replace: {path}")
 
                     pending = writes.get(source)
                     if pending is not None:
@@ -262,7 +276,7 @@ class ApplyPatchTool(_FsTool):
                     )
 
                 else:
-                    raise _PatchError(f"unknown action: {action}")
+                    raise _PatchArgumentError(f"unknown action: {action}")
 
             if dry_run:
                 return "Patch dry-run succeeded:\n" + "\n".join(
@@ -293,8 +307,14 @@ class ApplyPatchTool(_FsTool):
                 _format_summary(summary) for summary in summaries
             )
         except PermissionError as exc:
-            return f"Error: {exc}"
+            return ToolResult.retryable_error(f"Error: {exc}")
+        except _PatchArgumentError as exc:
+            # Rejected on arguments before anything was touched: a malformed
+            # call, not an operation that failed or left an unknown effect.
+            return ToolResult.invalid_arguments(f"Error applying patch: {exc}")
         except _PatchError as exc:
-            return f"Error applying patch: {exc}"
+            # The edit the model intended did not land (missing file, old_text
+            # not found, ambiguous match): a genuine unresolved failure.
+            return ToolResult.retryable_error(f"Error applying patch: {exc}")
         except Exception as exc:
-            return f"Error applying patch: {exc}"
+            return ToolResult.retryable_error(f"Error applying patch: {exc}")

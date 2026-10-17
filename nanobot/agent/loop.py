@@ -24,7 +24,12 @@ from nanobot.agent.cron_turns import CronTurnCoordinator
 from nanobot.agent.hook import AgentHook, CompositeHook
 from nanobot.agent.memory import Consolidator
 from nanobot.agent.progress_hook import AgentProgressHook
-from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
+from nanobot.agent.runner import (
+    _MAX_INJECTIONS_PER_TURN,
+    _PARTIAL_COMPLETION_PREFIX,
+    AgentRunner,
+    AgentRunSpec,
+)
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.approval import ApprovalStore
 from nanobot.agent.tools.context import RequestContext, bind_request_context, reset_request_context
@@ -2268,7 +2273,14 @@ class AgentLoop:
             if not had_injections or stop_reason in {"empty_final_response", "delivered_via_tool"}:
                 return None
 
+        # A false-success notice is bounded (its first line plus at most three
+        # named failures) and is the only place the cause is recorded, so log it
+        # whole instead of truncating: otherwise the journal says a turn was
+        # incomplete but never why, and a reader cannot tell a real failure from
+        # a noisy one.
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
+        if final_content.startswith(_PARTIAL_COMPLETION_PREFIX):
+            preview = final_content.split("\n\n", 1)[0]
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         meta = dict(msg.metadata or {})

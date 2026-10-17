@@ -227,7 +227,10 @@ async def test_runner_rejects_near_miss_tool_name_without_executing():
         max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
     ))
 
-    assert result.stop_reason == "partial_completion"
+    # A call rejected before it reached the tool is a malformed call, not a
+    # failed operation: nothing was attempted, so no effect is unknown and the
+    # turn is not marked incomplete. The rejection still reaches the model.
+    assert result.stop_reason == "completed"
     assert result.final_content.endswith("done")
     assert result.tools_used == []
     assert shared_events == []
@@ -273,7 +276,10 @@ async def test_runner_rejects_openai_compat_invalid_arguments_without_executing(
 
     result, shared_events = await _run_optional_tool_response(parsed)
 
-    assert result.stop_reason == "partial_completion"
+    # A call rejected before it reached the tool is a malformed call, not a
+    # failed operation: nothing was attempted, so no effect is unknown and the
+    # turn is not marked incomplete. The rejection still reaches the model.
+    assert result.stop_reason == "completed"
     assert result.final_content.endswith("done")
     assert parsed.tool_calls[0].arguments == arguments
     assert result.tools_used == []
@@ -298,7 +304,10 @@ async def test_runner_rejects_openai_responses_malformed_arguments_without_execu
 
     result, shared_events = await _run_optional_tool_response(parsed)
 
-    assert result.stop_reason == "partial_completion"
+    # A call rejected before it reached the tool is a malformed call, not a
+    # failed operation: nothing was attempted, so no effect is unknown and the
+    # turn is not marked incomplete. The rejection still reaches the model.
+    assert result.stop_reason == "completed"
     assert result.final_content.endswith("done")
     assert parsed.tool_calls[0].arguments == "{bad"
     assert result.tools_used == []
@@ -323,7 +332,10 @@ async def test_runner_rejects_openai_responses_array_arguments_without_executing
 
     result, shared_events = await _run_optional_tool_response(parsed)
 
-    assert result.stop_reason == "partial_completion"
+    # A call rejected before it reached the tool is a malformed call, not a
+    # failed operation: nothing was attempted, so no effect is unknown and the
+    # turn is not marked incomplete. The rejection still reaches the model.
+    assert result.stop_reason == "completed"
     assert result.final_content.endswith("done")
     assert parsed.tool_calls[0].arguments == []
     assert result.tools_used == []
