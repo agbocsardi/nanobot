@@ -72,3 +72,5 @@ class ToolContext:
     # ChannelManager starts. ``DiscordHistoryTool`` resolves the connected
     # client through it at execution time. None outside the gateway.
     discord_runtime_handle: Any | None = None
+    # The exact run-local registry, including tools deferred from model prompts.
+    registry: Any | None = None

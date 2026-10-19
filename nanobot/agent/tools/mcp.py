@@ -12,7 +12,7 @@ from weakref import WeakKeyDictionary
 import httpx
 from loguru import logger
 
-from nanobot.agent.tools.base import Tool
+from nanobot.agent.tools.base import Tool, ToolResult
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.bus.events import (
     INBOUND_META_RUNTIME_CONTROL,
@@ -294,6 +294,15 @@ class MCPToolWrapper(_MCPWrapperBase):
         raw_schema = tool_def.inputSchema or {"type": "object", "properties": {}}
         self._parameters = _normalize_schema_for_openai(raw_schema)
         self._tool_timeout = tool_timeout
+        annotations = getattr(tool_def, "annotations", None)
+        self._read_only = getattr(annotations, "readOnlyHint", False) is True
+
+    @property
+    def read_only(self) -> bool:
+        return self._read_only
+
+    def effect_for(self, params: dict[str, Any]) -> str:
+        return "read" if self.read_only else "external_write"
 
     @property
     def name(self) -> str:
@@ -307,7 +316,7 @@ class MCPToolWrapper(_MCPWrapperBase):
     def parameters(self) -> dict[str, Any]:
         return self._parameters
 
-    async def execute(self, **kwargs: Any) -> str:
+    async def execute(self, **kwargs: Any) -> ToolResult:
         from mcp import types
 
         retried_transient = False
@@ -322,7 +331,7 @@ class MCPToolWrapper(_MCPWrapperBase):
                 logger.warning(
                     "MCP tool '{}' timed out after {}s", self._name, self._tool_timeout
                 )
-                return f"(MCP tool call timed out after {self._tool_timeout}s)"
+                return ToolResult.retryable_error(f"(MCP tool call timed out after {self._tool_timeout}s)")
             except asyncio.CancelledError:
                 # MCP SDK's anyio cancel scopes can leak CancelledError on timeout/failure.
                 # Re-raise only if our task was externally cancelled (e.g. /stop).
@@ -330,7 +339,7 @@ class MCPToolWrapper(_MCPWrapperBase):
                 if task is not None and task.cancelling() > 0:
                     raise
                 logger.warning("MCP tool '{}' was cancelled by server/SDK", self._name)
-                return "(MCP tool call was cancelled)"
+                return ToolResult.retryable_error("(MCP tool call was cancelled)")
             except Exception as exc:
                 if await self._refresh_session_after_termination(
                     exc,
@@ -355,14 +364,14 @@ class MCPToolWrapper(_MCPWrapperBase):
                         self._name,
                         type(exc).__name__,
                     )
-                    return f"(MCP tool call failed after retry: {type(exc).__name__})"
+                    return ToolResult.retryable_error(f"(MCP tool call failed after retry: {type(exc).__name__})")
                 logger.exception(
                     "MCP tool '{}' failed: {}: {}",
                     self._name,
                     type(exc).__name__,
                     exc,
                 )
-                return f"(MCP tool call failed: {type(exc).__name__})"
+                return ToolResult.retryable_error(f"(MCP tool call failed: {type(exc).__name__})")
             else:
                 # Success — extract result
                 parts = []
@@ -371,9 +380,21 @@ class MCPToolWrapper(_MCPWrapperBase):
                         parts.append(block.text)
                     else:
                         parts.append(str(block))
-                return "\n".join(parts) or "(no output)"
+                is_error = getattr(result, "isError", False) is True
+                if callable(getattr(result, "model_dump", None)):
+                    data = result.model_dump(mode="json", by_alias=True, exclude_none=True)
+                else:
+                    data = {
+                        "content": [{"type": "text", "text": part} for part in parts],
+                        "structuredContent": getattr(result, "structuredContent", None),
+                    }
+                data["isError"] = is_error
+                return ToolResult(
+                    "\n".join(parts) or "(no output)",
+                    status="retryable_error" if is_error else "success", data=data,
+                )
 
-        return "(MCP tool call failed)"  # Unreachable, but satisfies type checkers
+        return ToolResult.retryable_error("(MCP tool call failed)")  # Unreachable, but satisfies type checkers
 
 
 class MCPResourceWrapper(_MCPWrapperBase):

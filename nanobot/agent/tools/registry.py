@@ -1,5 +1,6 @@
 """Tool registry for dynamic tool management."""
 
+import asyncio
 import json
 from typing import Any
 
@@ -76,13 +77,19 @@ class ToolRegistry:
         """Get tool definitions with stable ordering for cache-friendly prompts.
 
         Built-in tools are sorted first as a stable prefix, then MCP tools are
-        sorted and appended.  The result is cached until the next
-        register/unregister call.
+        sorted and appended. With codemode registered, MCP definitions are
+        deferred to its discovery bridge instead of entering every model prompt.
+        Execution still uses the complete registry. The result is cached until
+        the next register/unregister call.
         """
         if self._cached_definitions is not None:
             return self._cached_definitions
 
-        definitions = [tool.to_schema() for tool in self._tools.values()]
+        defer_mcp = self.has("codemode")
+        definitions = [
+            tool.to_schema() for tool in self._tools.values()
+            if not (defer_mcp and tool.name.startswith("mcp_"))
+        ]
         builtins: list[dict[str, Any]] = []
         mcp_tools: list[dict[str, Any]] = []
         for schema in definitions:
@@ -107,9 +114,11 @@ class ToolRegistry:
         if not tool:
             suggestion = self._suggest_name(str(name))
             hint = f" Did you mean '{suggestion}'? Tool names must match exactly." if suggestion else ""
-            return None, params, (
-                f"Error: Tool '{name}' not found.{hint} Available: {', '.join(self.tool_names)}"
+            available = (
+                "Discover tools with search_tools() inside codemode."
+                if self.has("codemode") else f"Available: {', '.join(self.tool_names)}"
             )
+            return None, params, f"Error: Tool '{name}' not found.{hint} {available}"
 
         params = self._coerce_params(tool, params)
         if not isinstance(params, dict):
@@ -278,6 +287,13 @@ class ToolRegistry:
             if outcome.retryable and str(outcome).startswith("Error"):
                 return self._replace_content(outcome, str(outcome) + hint)
             return outcome
+        except asyncio.CancelledError:
+            if receipt is not None:
+                self.receipt_store.complete(
+                    exec_id, status="unknown", ok=False,
+                    outcome="Cancelled after dispatch; side-effect outcome is unknown",
+                )
+            raise
         except Exception as e:
             if receipt is not None:
                 self.receipt_store.complete(exec_id, status="failed", ok=False,

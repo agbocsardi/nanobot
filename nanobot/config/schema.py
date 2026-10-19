@@ -12,6 +12,7 @@ from nanobot.cron.types import CronSchedule
 
 if TYPE_CHECKING:
     from nanobot.agent.tools.cli_apps import CliAppsToolConfig
+    from nanobot.agent.tools.codemode import CodemodeConfig
     from nanobot.agent.tools.filesystem import FileToolsConfig
     from nanobot.agent.tools.image_generation import ImageGenerationToolConfig
     from nanobot.agent.tools.memory_search import MemorySearchToolConfig
@@ -406,6 +407,7 @@ class ToolsConfig(Base):
 
     web: WebToolsConfig = Field(default_factory=lambda: _lazy_default("nanobot.agent.tools.web", "WebToolsConfig"))
     exec: ExecToolConfig = Field(default_factory=lambda: _lazy_default("nanobot.agent.tools.shell", "ExecToolConfig"))
+    codemode: CodemodeConfig = Field(default_factory=lambda: _lazy_default("nanobot.agent.tools.codemode", "CodemodeConfig"))
     file: FileToolsConfig = Field(default_factory=lambda: _lazy_default("nanobot.agent.tools.filesystem", "FileToolsConfig"))
     cli_apps: CliAppsToolConfig = Field(default_factory=lambda: _lazy_default("nanobot.agent.tools.cli_apps", "CliAppsToolConfig"))
     my: MyToolConfig = Field(default_factory=lambda: _lazy_default("nanobot.agent.tools.self", "MyToolConfig"))
@@ -697,6 +699,7 @@ def _resolve_tool_config_refs() -> None:
     import sys
 
     from nanobot.agent.tools.cli_apps import CliAppsToolConfig
+    from nanobot.agent.tools.codemode import CodemodeConfig
     from nanobot.agent.tools.filesystem import FileToolsConfig
     from nanobot.agent.tools.image_generation import ImageGenerationToolConfig
     from nanobot.agent.tools.memory_search import MemorySearchToolConfig
@@ -707,6 +710,7 @@ def _resolve_tool_config_refs() -> None:
     # Re-export into this module's namespace
     mod = sys.modules[__name__]
     mod.ExecToolConfig = ExecToolConfig  # type: ignore[attr-defined]
+    mod.CodemodeConfig = CodemodeConfig  # type: ignore[attr-defined]
     mod.FileToolsConfig = FileToolsConfig  # type: ignore[attr-defined]
     mod.CliAppsToolConfig = CliAppsToolConfig  # type: ignore[attr-defined]
     mod.WebToolsConfig = WebToolsConfig  # type: ignore[attr-defined]

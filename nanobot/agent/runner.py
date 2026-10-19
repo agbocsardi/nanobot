@@ -16,6 +16,7 @@ from loguru import logger
 
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
 from nanobot.agent.tools.base import ToolResult, adapt_legacy_tool_result
+from nanobot.agent.tools.codemode import CODEMODE_EXECUTION, CodemodeExecution
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
@@ -624,12 +625,12 @@ class AgentRunner:
                 tool_events.extend(new_events)
                 tool_event_targets.extend(new_event_targets)
                 tools_used.extend(
-                    tool_call.name
-                    for tool_call, event in zip(response.tool_calls, new_events)
-                    if event.get("status") == "success"
+                    event["name"] for event in new_events if event.get("status") == "success"
                 )
                 context.tool_results = list(results)
-                context.tool_events = list(new_events)
+                # Iteration hooks pair outer calls/results by index; nested
+                # operational events live in the run-level record, not that pairing.
+                context.tool_events = [e for e in new_events if "parent_call_id" not in e]
                 completed_tool_results: list[dict[str, Any]] = []
                 for tool_call, result in zip(response.tool_calls, results):
                     tool_message = {
@@ -1595,36 +1596,107 @@ class AgentRunner:
         external_lookup_counts: dict[str, int],
         workspace_violation_counts: dict[str, int],
     ) -> tuple[list[Any], list[dict[str, Any]], list[list[str]], BaseException | None]:
+        async def run_call(tool_call: ToolCallRequest):
+            if tool_call.name != "codemode":
+                return await self._run_tool(
+                    spec, tool_call, external_lookup_counts, workspace_violation_counts,
+                )
+            children: list[tuple[int, dict[str, Any], list[str]]] = []
+            child_errors: list[BaseException] = []
+            serial = asyncio.Lock()
+
+            async def dispatch(name: str, arguments: dict[str, Any], request_id: int):
+                if not execution.active:
+                    raise RuntimeError("The parent codemode call has ended")
+                child = ToolCallRequest(
+                    id=f"{tool_call.id}/codemode/{request_id}", name=name, arguments=arguments,
+                )
+                async def execute():
+                    return await self._run_tool(
+                        spec, child, external_lookup_counts, workspace_violation_counts,
+                    )
+                try:
+                    if spec.concurrent_tools:
+                        payload, event, error = await execute()
+                    else:
+                        async with serial:
+                            payload, event, error = await execute()
+                except asyncio.CancelledError:
+                    cancelled = self._tool_event(
+                        name, ToolResult.partial("Nested call cancelled; outcome may be unknown"),
+                        execution_succeeded=False,
+                    )
+                    cancelled.update({"parent_call_id": tool_call.id, "call_id": child.id})
+                    children.append((request_id, cancelled, self._event_targets(arguments)))
+                    logger.debug("Codemode child {} {}: cancelled", child.id, name)
+                    raise
+                envelope = {
+                    "content": str(payload) if payload is not None else "",
+                    "status": event["status"],
+                    **{key: event.get(key) for key in (
+                        "data", "evidence", "side_effects", "postcondition", "retryable",
+                        "exit_code", "stdout", "stderr",
+                    )},
+                }
+                # Keep compact operational evidence, not unfiltered tool payloads,
+                # in run records. The full structured result goes only to the script.
+                compact = {key: value for key, value in event.items() if key not in (
+                    "data", "stdout", "stderr",
+                )}
+                compact.update({"parent_call_id": tool_call.id, "call_id": child.id})
+                children.append((request_id, compact, self._event_targets(arguments)))
+                logger.debug("Codemode child {} {}: {}", child.id, name, event["status"])
+                if error is not None:
+                    child_errors.append(error)
+                return envelope
+
+            execution = CodemodeExecution(spec.tools, dispatch)
+            token = CODEMODE_EXECUTION.set(execution)
+            try:
+                result, event, error = await self._run_tool(
+                    spec, tool_call, external_lookup_counts, workspace_violation_counts,
+                )
+            finally:
+                execution.active = False
+                CODEMODE_EXECUTION.reset(token)
+            if children:
+                # Preserve call order and target alignment for the runner's
+                # recovery/verification logic. Caught errors must not create a
+                # second, synthetic failure on the orchestration envelope.
+                children.sort(key=lambda item: item[0])
+                event["_nested_events"] = [child for _, child, _ in children]
+                event["_nested_targets"] = [targets for _, _, targets in children]
+            return result, event, error or (child_errors[0] if child_errors else None)
+
         batches = self._partition_tool_batches(spec, tool_calls)
         tool_results: list[tuple[Any, dict[str, Any], BaseException | None]] = []
         for batch in batches:
             if spec.concurrent_tools and len(batch) > 1:
                 batch_results = await asyncio.gather(*(
-                    self._run_tool(
-                        spec, tool_call, external_lookup_counts, workspace_violation_counts,
-                    )
-                    for tool_call in batch
+                    run_call(tool_call) for tool_call in batch
                 ))
                 tool_results.extend(batch_results)
             else:
                 batch_results = []
                 for tool_call in batch:
-                    result = await self._run_tool(
-                        spec, tool_call, external_lookup_counts, workspace_violation_counts,
-                    )
+                    result = await run_call(tool_call)
                     tool_results.append(result)
                     batch_results.append(result)
 
         results: list[Any] = []
         events: list[dict[str, Any]] = []
-        # Targets stay out of the events: default runs keep the legacy event
-        # shape (see test_runner_events_unchanged_without_flag). Batches keep
-        # tool_calls order, so this list is index-aligned with `events`.
-        event_targets = [self._event_targets(call.arguments) for call in tool_calls]
+        # Targets stay out of persisted events but remain index-aligned,
+        # including every nested call, for cross-tool recovery matching.
+        event_targets: list[list[str]] = []
         fatal_error: BaseException | None = None
-        for result, event, error in tool_results:
+        for call, (result, event, error) in zip(tool_calls, tool_results):
             results.append(result)
+            children = event.pop("_nested_events", [])
+            child_targets = event.pop("_nested_targets", [])
             events.append(event)
+            event_targets.append(self._event_targets(call.arguments))
+            events.extend(children)
+            event_targets.extend(child_targets)
             if error is not None and fatal_error is None:
                 fatal_error = error
         return results, events, event_targets, fatal_error
