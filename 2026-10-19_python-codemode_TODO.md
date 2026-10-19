@@ -9,7 +9,7 @@
 - [x] Document configuration, security boundary, and Python scripting API.
 - [x] Run existing targeted checks plus sandbox/runtime/context-size checks; measure latency.
 - [x] Commit feature, integrate current `main`, and verify newer failure/retention behavior.
-- [ ] Push verified `main` and fast-forward the clean deployment checkout.
+- [x] Push verified `main` and fast-forward the clean deployment checkout.
 
 ## Log
 
@@ -30,3 +30,5 @@
 - User requested merge and deployment-checkout update. Confirmed the clean deployment checkout is `/home/gergo/nanobot`, and the installed `nanobot-ai` tool is editable from there. `main` advanced with retention/false-success/verification/invalid-argument changes while this branch was in progress. No service restart or config change is planned.
 - Committed the feature as `67609ba6f`, then integrated current `main` (`5af6fc661`). Resolved the runner conflict by retaining its four-value execution result and aligning nested targets with events. Child records preserve request order; caught/recovered errors no longer synthesize an unresolved outer failure. Nonzero command exits and ask-user control outcomes remain data/control signals, not Python exceptions.
 - Integration verification: recorded a fresh baseline on clean current `main`; all 1,011 existing targeted tests passed before and after integration (`scripts/test-delta.sh`: NEW 0 / FIXED 0 / KNOWN 0). All 47 codemode tests passed, including five new integration cases for invalid arguments, cross-tool recovery/target alignment, nonzero exits, and ask-user control. Touched-file ruff passed.
+- Merged integration commit `cd2201056` into `main` as `475adbcc8`, verified identical tested trees, and pushed `origin/main`. Fast-forwarded the clean `/home/gergo/nanobot` deployment checkout from `5af6fc661` to the code merge. No reset, reinstall, config change, or restart was needed/performed.
+- Verified from `/home/gergo` with the installed `nanobot-ai` interpreter: imports resolve to `/home/gergo/nanobot`, a fresh sandbox returns `deployment sandbox ready` in 48 ms, and event/target alignment is intact. The existing gateway remains active with its original October 16 start time. A restart and opt-in config setting are still required to activate codemode in that running process.
