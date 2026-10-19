@@ -1644,6 +1644,11 @@ See [Image Generation](./image-generation.md) for WebUI usage, provider examples
 
 nanobot supports [MCP](https://modelcontextprotocol.io/) — connect external tool servers and use them as native agent tools.
 
+To avoid sending every MCP schema in every model request, enable
+[Python codemode](./codemode.md) with `tools.codemode.enable: true`. On supported
+Linux hosts it provides sandboxed Python orchestration and on-demand MCP discovery;
+normal built-in tools stay directly available.
+
 Add MCP servers to your `config.json`:
 
 ```json

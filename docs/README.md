@@ -92,6 +92,7 @@ If a local `nanobot agent` session can already answer normally, you can also ask
 | Add a provider or transcription adapter | [`development.md`](./development.md) | A registry/schema-aligned implementation path |
 | Add a chat channel plugin | [`channel-plugin-guide.md`](./channel-plugin-guide.md) | A packaged channel discovered through entry points |
 | Add custom MCP servers | [`configuration.md#mcp-model-context-protocol`](./configuration.md#mcp-model-context-protocol) | External tools exposed to the agent through MCP |
+| Keep MCP schemas out of prompts | [`codemode.md`](./codemode.md) | Bubblewrap-isolated Python scripts, on-demand discovery, and filtered results |
 | Tune tool safety | [`configuration.md#security`](./configuration.md#security) | Shell sandboxing, workspace restriction, and SSRF policy |
 
 ## Reading Strategy

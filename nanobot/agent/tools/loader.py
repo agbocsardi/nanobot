@@ -9,6 +9,7 @@ from typing import Any
 from loguru import logger
 
 from nanobot.agent.tools.base import Tool
+from nanobot.agent.tools.context import ToolContext
 from nanobot.agent.tools.registry import ToolRegistry
 
 _SKIP_MODULES = frozenset({
@@ -84,6 +85,8 @@ class ToolLoader:
         return plugins
 
     def load(self, ctx: Any, registry: ToolRegistry, *, scope: str = "core") -> list[str]:
+        if isinstance(ctx, ToolContext):
+            ctx.registry = registry
         registered: list[str] = []
         builtin_names: set[str] = set()
         sources = [(self.discover(), False), (self._discover_plugins().values(), True)]
