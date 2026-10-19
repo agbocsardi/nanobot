@@ -18,6 +18,7 @@ from nanobot.agent.tools.policy import (
 )
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.config.schema import ToolPolicyRuleConfig
+from nanobot.providers.base import GenerationSettings
 
 
 def _rule(rule_id: str, outcome: str, **match):
@@ -376,6 +377,7 @@ def _make_loop(tmp_path):
     bus = MessageBus()
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
+    provider.generation = GenerationSettings(max_tokens=4096)
 
     with patch("nanobot.agent.loop.ContextBuilder"), \
          patch("nanobot.agent.loop.SessionManager"), \
@@ -530,6 +532,7 @@ async def test_process_direct_propagates_mode_metadata(tmp_path) -> None:
     bus = MessageBus()
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
+    provider.generation = GenerationSettings(max_tokens=4096)
     loop = AgentLoop(bus=bus, provider=provider, workspace=tmp_path, model="test-model")
 
     tool = _CountingTool("write_state")

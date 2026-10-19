@@ -48,7 +48,10 @@ async def test_exec_exposes_exit_code_127_as_structured_failure() -> None:
         result = await ExecTool().execute(command="missing-command")
 
     assert isinstance(result, ToolResult)
-    assert result.status == "retryable_error"
+    # Structured non-success, but not an unresolved tool failure: the command
+    # ran and returned, and the exit code is payload data.
+    assert result.status == "nonzero_exit"
+    assert result.retryable is True
     assert result.exit_code == 127
     assert result.stdout == "plausible output\n"
     assert result.stderr == "not found\n"

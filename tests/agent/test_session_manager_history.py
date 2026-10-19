@@ -348,7 +348,7 @@ def test_get_history_does_not_annotate_tool_results_with_timestamps():
 
     tool_result = history[-1]
     assert tool_result["role"] == "tool"
-    assert tool_result["content"] == "[tool result omitted: y, 2 chars]"
+    assert tool_result["content"] == "ok"
 
 
 # --- Window cuts mid-group: assistant present but some tool results orphaned ---
@@ -731,9 +731,8 @@ def test_retain_recent_legal_suffix_returns_all_on_zero():
     assert session.messages == []
 
 
-def test_enforce_file_cap_no_duplicate_archive_in_else_branch():
-    """When the tail is assistant-only, enforce_file_cap must not archive
-    messages that are also retained (the bug from issue #4128)."""
+def test_enforce_file_cap_without_checkpoint_preserves_unsummarized_tail():
+    """An assistant-only tail cannot authorize dropping unsummarized context."""
     from unittest.mock import MagicMock
 
     session = Session(key="test:else-archive")
@@ -746,7 +745,8 @@ def test_enforce_file_cap_no_duplicate_archive_in_else_branch():
     archive_fn = MagicMock()
     session.enforce_file_cap(on_archive=archive_fn, limit=6)
 
-    assert len(session.messages) <= 6
+    assert len(session.messages) == 25
+    archive_fn.assert_not_called()
 
     # Verify archived messages have NO overlap with retained
     if archive_fn.called:
@@ -759,9 +759,8 @@ def test_enforce_file_cap_no_duplicate_archive_in_else_branch():
         )
 
 
-def test_enforce_file_cap_no_message_loss_in_else_branch():
-    """In the else branch, no messages should silently disappear — every
-    message must be either retained or archived."""
+def test_enforce_file_cap_no_message_loss_without_checkpoint():
+    """Without a safe checkpoint every original must remain accounted for."""
     from unittest.mock import MagicMock
 
     session = Session(key="test:else-no-loss")
@@ -791,10 +790,8 @@ def test_enforce_file_cap_no_message_loss_in_else_branch():
     )
 
 
-def test_enforce_file_cap_correct_archive_with_last_consolidated_in_else_branch():
-    """When last_consolidated > 0 and the else branch fires, only the
-    unconsolidated dropped messages should be raw-archived.  Messages in the
-    consolidated prefix that are dropped do NOT need raw archiving."""
+def test_enforce_file_cap_preserves_audit_records_after_memory_cursor_advance():
+    """Topic-memory consolidation must not substitute for the original audit trail."""
     from unittest.mock import MagicMock
 
     session = Session(key="test:else-lc-archive")
@@ -803,21 +800,19 @@ def test_enforce_file_cap_correct_archive_with_last_consolidated_in_else_branch(
         session.messages.append({"role": "user", "content": f"u{i}"})
     for i in range(10):
         session.messages.append({"role": "assistant", "content": f"a{i}"})
-    # First 8 messages already consolidated
+    # A legacy memory cursor is not proof that original audit records survived.
     session.last_consolidated = 8
+    from tests.session.test_compaction_retention import checkpoint
 
+    checkpoint(session, 16)
     archive_fn = MagicMock()
     session.enforce_file_cap(on_archive=archive_fn, limit=4)
 
-    if archive_fn.called:
-        archived = archive_fn.call_args.args[0]
-        # Archived messages should NOT include any from the consolidated prefix
-        # (u0..u7). They should only be unconsolidated dropped messages.
-        archived_contents = [m["content"] for m in archived]
-        for c in archived_contents:
-            assert c not in [f"u{i}" for i in range(8)], (
-                f"Consolidated message {c!r} should not be raw-archived"
-            )
+    archive_fn.assert_called_once()
+    assert len(archive_fn.call_args.args[0]) == 16
+    assert archive_fn.call_args.args[0][0]["content"] == "u0"
+    assert session.last_consolidated == 0
+    assert len(session.messages) == 4
 
 
 def test_retain_recent_legal_suffix_last_consolidated_correct_in_else_branch():
@@ -841,7 +836,7 @@ def test_retain_recent_legal_suffix_last_consolidated_correct_in_else_branch():
     assert already_cons == 9
 
 
-def test_session_save_sanitizes_hidden_and_tool_payloads(tmp_path):
+def test_session_save_retains_tool_history_and_removes_hidden_reasoning(tmp_path):
     manager = SessionManager(tmp_path)
     session = manager.get_or_create("telegram:bloated")
     huge_args = "x" * 10_000
@@ -867,19 +862,23 @@ def test_session_save_sanitizes_hidden_and_tool_payloads(tmp_path):
     raw = manager._get_session_path("telegram:bloated").read_text(encoding="utf-8")
 
     assert "reasoning_content" not in raw
-    assert huge_args not in raw
-    assert "y" * 1000 not in raw
+    assert huge_args in raw
+    assert "y" * 1000 in raw
     assert "visible answer" in raw
-    assert "[tool result omitted: read_file, 20000 chars]" in raw
 
+    assert session.messages[1]["tool_calls"][0]["function"]["arguments"] == huge_args
+    assert session.messages[2]["content"] == "y" * 20_000
     manager.invalidate("telegram:bloated")
     reloaded = manager.get_or_create("telegram:bloated")
     assistant_tool = reloaded.messages[1]["tool_calls"][0]
-    assert assistant_tool["function"] == {"name": "read_file", "arguments": "{}"}
-    assert reloaded.messages[2]["content"] == "[tool result omitted: read_file, 20000 chars]"
+    assert assistant_tool["function"] == {"name": "read_file", "arguments": huge_args}
+    assert reloaded.messages[2]["content"] == "y" * 20_000
+    history = reloaded.get_history(max_messages=10)
+    assert history[1]["tool_calls"][0]["function"]["arguments"] == huge_args
+    assert history[2]["content"] == "y" * 20_000
 
 
-def test_get_history_sanitizes_legacy_bloated_messages() -> None:
+def test_get_history_preserves_legacy_tool_history_and_removes_reasoning() -> None:
     session = Session(key="telegram:legacy")
     session.messages = [
         {"role": "user", "content": "hello"},
@@ -895,5 +894,5 @@ def test_get_history_sanitizes_legacy_bloated_messages() -> None:
     history = session.get_history(max_messages=10)
 
     assert "reasoning_content" not in history[1]
-    assert history[1]["tool_calls"][0]["function"]["arguments"] == "{}"
-    assert history[2]["content"] == "[tool result omitted: exec, 5000 chars]"
+    assert history[1]["tool_calls"][0]["function"]["arguments"] == "x" * 5000
+    assert history[2]["content"] == "z" * 5000

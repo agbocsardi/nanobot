@@ -16,6 +16,14 @@ _ToolT = TypeVar("_ToolT", bound="Tool")
 ToolOutcomeStatus = Literal[
     "success",
     "partial",
+    # The operation ran and returned a non-zero exit code. The code is payload
+    # data, not a harness failure: it is reported and retryable, but it must
+    # never read as ``success`` and it must not trip the false-success guard.
+    "nonzero_exit",
+    # The call was rejected on its own arguments before anything was attempted:
+    # a malformed call, not a failed operation. It has no unknown effect, so it
+    # stays out of stop-reason derivation (see AgentRunner._FAILURE_STATUSES).
+    "invalid_arguments",
     "retryable_error",
     "policy_block",
     "fatal_error",
@@ -95,6 +103,28 @@ class ToolResult(str):
     @classmethod
     def retryable_error(cls, content: str, **metadata: Any) -> ToolResult:
         return cls(content, status="retryable_error", **metadata)
+
+    @classmethod
+    def nonzero_exit(cls, content: str, **metadata: Any) -> ToolResult:
+        """A command executed and exited non-zero.
+
+        Distinct from ``retryable_error``: the operation reached a result, so
+        the exit code belongs to the payload. It stays non-success (and
+        retryable) for verification purposes, but a run whose only non-success
+        outcome is a non-zero exit is not an unresolved tool failure.
+        """
+        return cls(content, status="nonzero_exit", retryable=True, **metadata)
+
+    @classmethod
+    def invalid_arguments(cls, content: str, **metadata: Any) -> ToolResult:
+        """The call was rejected on its arguments; nothing was attempted.
+
+        Distinct from ``retryable_error``: no operation ran, so no effect is
+        unknown and nothing is left in doubt. Retrying identical arguments
+        cannot succeed, so it is not retryable either. It is never ``success``,
+        and the rejection text still reaches the model unchanged.
+        """
+        return cls(content, status="invalid_arguments", retryable=False, **metadata)
 
     @classmethod
     def policy_block(cls, content: str, **metadata: Any) -> ToolResult:

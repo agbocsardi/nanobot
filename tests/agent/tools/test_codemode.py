@@ -53,7 +53,10 @@ class _Tool(Tool):
 
     @property
     def parameters(self):
-        return {"type": "object", "properties": {"value": {"type": "string"}}, "additionalProperties": False}
+        return {
+            "type": "object", "properties": {"value": {"type": "string"}, "path": {"type": "string"}},
+            "additionalProperties": False,
+        }
 
     @property
     def read_only(self):
@@ -91,13 +94,14 @@ def sandbox_available():
 
 
 async def _execute(registry, code, *, call_id="outer", concurrent=True, **spec_kwargs):
-    return await AgentRunner(MagicMock())._execute_tools(
+    results, events, _targets, error = await AgentRunner(MagicMock())._execute_tools(
         AgentRunSpec(
             initial_messages=[], tools=registry, model="test", max_iterations=1,
             max_tool_result_chars=16000, concurrent_tools=concurrent, **spec_kwargs,
         ),
         [ToolCallRequest(id=call_id, name="codemode", arguments={"code": code})], {}, {},
     )
+    return results, events, error
 
 
 def test_mcp_schemas_are_deferred_and_cache_tracks_registration(registry):
@@ -260,9 +264,9 @@ class TestSandbox:
             'try:\n    await tools.mcp_private_write(unknown=1)\n'
             'except ToolError as error:\n    text(error.result["status"])'
         ))
-        assert "policy_block" in results[0] and "retryable_error" in results[0]
-        assert events[0]["status"] == "partial"
-        assert [e["status"] for e in events[1:]] == ["policy_block", "retryable_error"]
+        assert "policy_block" in results[0] and "invalid_arguments" in results[0]
+        assert events[0]["status"] == "success"
+        assert [e["status"] for e in events[1:]] == ["policy_block", "invalid_arguments"]
         blocked.handler.assert_not_awaited()
 
     async def test_inner_policy_approval_survives_audit_mode(self, registry):
@@ -314,6 +318,51 @@ class TestSandbox:
         assert seen == ["codemode", "echo"]
         assert len(result.tool_events) == 3
         assert len([m for m in result.messages if m["role"] == "tool"]) == 2
+
+    @pytest.mark.parametrize("status, stop_reason", [("nonzero_exit", None), ("ask_user", "ask_user")])
+    async def test_nonfailure_control_results_are_returned_as_data(self, registry, status, stop_reason):
+        registry.register(_Tool(handler=AsyncMock(return_value=ToolResult("result", status=status))))
+        results, events, error = await _execute(registry, 'return (await tools.echo())["status"]')
+        assert results[0].splitlines()[-1] == status and error is None
+        assert events[0]["status"] == "success"
+        assert AgentRunner._terminal_tool_stop_reason(events) == stop_reason
+
+    @pytest.mark.parametrize("recovered", [False, True])
+    async def test_nested_targets_remain_aligned_and_cross_tool_recovery_is_honored(self, registry, recovered):
+        registry.register(_Tool("first", handler=AsyncMock(return_value=ToolResult.retryable_error("failed"))))
+        registry.register(_Tool("second"))
+        registry.register(_Tool("after"))
+        recovery_path = "/same" if recovered else "/different"
+        code = (
+            'try:\n    await tools.first(path="/same")\nexcept ToolError: pass\n'
+            f'await tools.second(path={recovery_path!r})\nreturn "done"'
+        )
+        runner = AgentRunner(MagicMock())
+        _, events, targets, error = await runner._execute_tools(
+            AgentRunSpec(initial_messages=[], tools=registry, model="test", max_iterations=1,
+                         max_tool_result_chars=16000),
+            [ToolCallRequest(id="outer", name="codemode", arguments={"code": code}),
+             ToolCallRequest(id="after", name="after", arguments={"path": "/other"})], {}, {},
+        )
+        assert error is None
+        assert [event["name"] for event in events] == ["codemode", "first", "second", "after"]
+        assert targets == [[], ["/same"], [recovery_path], ["/other"]]
+        assert runner._terminal_tool_stop_reason(events, targets) == (None if recovered else "partial_completion")
+
+    async def test_caught_bad_arguments_do_not_trigger_a_verification_turn(self, registry):
+        registry.register(_Tool())
+        code = 'try:\n    await tools.echo(unknown=1)\nexcept ToolError: pass\nreturn "handled"'
+        provider = MagicMock()
+        provider.chat_with_retry = AsyncMock(side_effect=[
+            LLMResponse(content="", tool_calls=[ToolCallRequest(id="outer", name="codemode", arguments={"code": code})]),
+            LLMResponse(content="Done."),
+        ])
+        result = await AgentRunner(provider).run(AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "go"}], tools=registry, model="test",
+            max_iterations=3, max_tool_result_chars=16000,
+        ))
+        assert result.stop_reason == "completed" and provider.chat_with_retry.await_count == 2
+        assert [event["status"] for event in result.tool_events] == ["success", "invalid_arguments"]
 
     async def test_read_calls_overlap_and_writes_are_ordering_barriers(self, registry):
         order = []
@@ -496,7 +545,7 @@ class TestSandbox:
             'asyncio.create_task(tools.wait())\nawait asyncio.sleep(0.1)\nreturn "early"'
         )), 3)
         assert "early" in results[0] and cancelled.is_set()
-        assert events[0]["status"] == "partial"
+        assert events[0]["status"] == "success" and events[1]["status"] == "partial"
         assert registry.receipt_store.get("outer/codemode/1").status == "unknown"
 
     async def test_host_files_environment_network_processes_and_root_writes_are_blocked(self, registry, monkeypatch):

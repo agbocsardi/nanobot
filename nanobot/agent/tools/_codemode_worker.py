@@ -59,7 +59,7 @@ class _Tools:
     def __getitem__(self, name):
         async def call(**arguments):
             result = await _request("call", name=name, arguments=arguments)
-            if result["status"] != "success":
+            if result["status"] not in ("success", "nonzero_exit", "ask_user"):
                 raise ToolError(result)
             return result
         return call

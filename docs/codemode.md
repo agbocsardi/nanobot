@@ -102,8 +102,12 @@ and `isError` when present. Many MCP servers return only text blocks, so do not
 assume `structuredContent` exists. When a tool documents JSON text output, parse
 `json.loads(result["content"])` explicitly. Legacy tools may have only textual data.
 
-Unsuccessful outcomes, including partial results and policy blocks, raise
-`ToolError`. Its `result` attribute retains the entire result dict:
+A completed command's `nonzero_exit` is returned as data, not a script error.
+The `ask_user` status is also returned as a control result; end the script when
+user input is requested so the normal turn boundary can suspend the run.
+
+Unsuccessful outcomes, including partial results, invalid arguments, and policy
+blocks, raise `ToolError`. Its `result` attribute retains the entire result dict:
 
 ```python
 try:
@@ -158,8 +162,10 @@ artifact mechanism, with a bounded preview and file reference.
   Writes/unknown tools are ordering barriers. MCP tools are treated conservatively
   unless their server declares `readOnlyHint: true`.
 - Nested calls have stable child IDs and compact operational events, but are not
-  inserted as separate transcript tool results. Catching an error cannot erase its
-  recorded outcome or bypass fail-on-tool-error behavior.
+  inserted as separate transcript tool results. Event targets remain aligned for
+  same-target/cross-tool recovery and verification. Catching an error cannot erase
+  its recorded outcome or bypass fail-on-tool-error behavior; recovered failures
+  and rejected arguments do not become synthetic failures on the outer script.
 - Completed side effects are **not rolled back** on failure. On script completion,
   failure, deadline, or cancellation, the worker is killed/reaped and pending
   calls receive asyncio cancellation. A parent-side tool that suppresses

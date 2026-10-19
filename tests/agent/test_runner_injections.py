@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from nanobot.config.schema import AgentDefaults
-from nanobot.providers.base import LLMResponse, ToolCallRequest
+from nanobot.providers.base import GenerationSettings, LLMResponse, ToolCallRequest
 
 _MAX_TOOL_RESULT_CHARS = AgentDefaults().max_tool_result_chars
 
@@ -420,6 +420,7 @@ async def test_loop_injected_followup_preserves_image_media(tmp_path):
     bus = MessageBus()
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
+    provider.generation = GenerationSettings(max_tokens=4096)
     captured_messages: list[list[dict]] = []
     call_count = {"n": 0}
 
@@ -1015,6 +1016,7 @@ async def test_pending_queue_preserves_overflow_for_next_injection_cycle(tmp_pat
     bus = MessageBus()
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
+    provider.generation = GenerationSettings(max_tokens=4096)
     captured_messages: list[list[dict]] = []
     call_count = {"n": 0}
 

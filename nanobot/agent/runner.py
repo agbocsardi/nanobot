@@ -7,8 +7,8 @@ import inspect
 import json
 import os
 from contextlib import suppress
-from copy import deepcopy
-from dataclasses import dataclass, field
+from copy import copy, deepcopy
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -20,6 +20,16 @@ from nanobot.agent.tools.codemode import CODEMODE_EXECUTION, CodemodeExecution
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from nanobot.providers.errors import is_context_overflow
+from nanobot.session.compaction import (
+    CompactionEngine,
+    CompactionError,
+    RequestBudget,
+    UsageEstimate,
+    ensure_ids,
+    project,
+)
+from nanobot.session.microcompaction import microcompact
 from nanobot.utils.file_edit_events import (
     StreamingFileEditTracker,
     build_file_edit_end_event,
@@ -37,8 +47,8 @@ from nanobot.utils.helpers import (
     estimate_prompt_tokens_chain,
     estimate_request_bytes,
     extract_reasoning,
-    find_legal_message_start,
     maybe_persist_tool_result,
+    strip_private_fields,
     strip_reasoning_tags,
     strip_think,
     truncate_text,
@@ -70,18 +80,10 @@ _MAX_EMPTY_RETRIES = 2
 _MAX_LENGTH_RECOVERIES = 3
 _MAX_INJECTIONS_PER_TURN = 3
 _MAX_INJECTION_CYCLES = 5
-_SNIP_SAFETY_BUFFER = 1024
 _MAX_REQUEST_BYTES = 16 * 1024 * 1024
 # Upper bound on provider-chain walks; guards duck-typed stand-ins that mint a
 # fresh object per attribute access and would otherwise loop forever.
 _MAX_PROVIDER_CHAIN_DEPTH = 8
-_MICROCOMPACT_KEEP_RECENT = 10
-_MICROCOMPACT_KEEP_RECENT_IMAGES = 1
-_MICROCOMPACT_MIN_CHARS = 500
-_COMPACTABLE_TOOLS = frozenset({
-    "read_file", "exec", "grep", "find_files",
-    "web_search", "web_fetch", "list_dir", "list_exec_sessions",
-})
 # read_file is the recovery path for persisted results; exempting it prevents persist->read->persist loops.
 _TOOL_RESULT_OFFLOAD_EXEMPT_TOOLS = frozenset({"read_file"})
 _BACKFILL_CONTENT = "[Tool result unavailable — call was interrupted or lost]"
@@ -167,10 +169,20 @@ class AgentRunSpec:
     goal_active_predicate: Callable[[], bool] | None = None
     goal_continue_message: str | None = None
     finalize_on_max_iterations: bool = True
+    # When a reply would otherwise be prefixed as a false success, spend one
+    # bounded turn letting the model retry the failed operation or state
+    # plainly what did not happen. Set False to keep the old prefix-only
+    # behaviour (one fewer LLM call on failing turns).
+    verify_tool_failures: bool = True
     vision_handoff: Any = None  # nanobot.agent.vision_handoff.VisionHandoff | None
     # Persisted-run observability: enrich every tool event with a compact
     # args map and a rendered-result preview (see _tool_event).
     record_tool_details: bool = False
+    compaction_callback: Any | None = None
+    precompaction_callback: Any | None = None
+    compaction_engine_factory: Any | None = None
+    continuity_checkpoint: dict[str, Any] | None = None
+    microcompact_through: str | None = None
 
 
 @dataclass(slots=True)
@@ -348,13 +360,20 @@ class AgentRunner:
         return True
 
     async def run(self, spec: AgentRunSpec) -> AgentRunResult:
+        # Freeze the output allowance with model/window before any await. Never
+        # combine a hot-reloaded provider default with an older run's window.
+        if spec.context_window_tokens:
+            budget = RequestBudget.freeze(self.provider, spec.model, spec.context_window_tokens,
+                                          spec.max_tokens, spec.context_block_limit)
+            spec = replace(spec, max_tokens=budget.output)
         hook = spec.hook or AgentHook()
-        messages = list(spec.initial_messages)
+        messages = deepcopy(spec.initial_messages)
         context = AgentRunHookContext(messages=deepcopy(messages))
+        frozen_runner = copy(self)  # Provider swaps affect future runs only.
 
         try:
             await hook.before_run(context)
-            result = await self._run_core(spec, hook, messages)
+            result = await frozen_runner._run_core(spec, hook, messages)
         except asyncio.CancelledError as exc:
             context.messages = deepcopy(messages)
             context.stop_reason = "cancelled"
@@ -407,6 +426,11 @@ class AgentRunner:
         error: str | None = None
         stop_reason = "completed"
         tool_events: list[dict[str, Any]] = []
+        # Index-aligned with tool_events: what each call touched, used only to
+        # decide whether a failure was later resolved (never exposed).
+        tool_event_targets: list[list[str]] = []
+        # At most one verification turn per run: it must not become a loop.
+        verification_attempted = False
         external_lookup_counts: dict[str, int] = {}
         # Per-turn throttle for repeated attempts against the same outside target.
         workspace_violation_counts: dict[str, int] = {}
@@ -414,32 +438,63 @@ class AgentRunner:
         length_recovery_count = 0
         had_injections = False
         injection_cycles = 0
+        checkpoint = spec.continuity_checkpoint
+        budget = (RequestBudget.freeze(self.provider, spec.model, spec.context_window_tokens,
+                                       spec.max_tokens, spec.context_block_limit)
+                  if spec.context_window_tokens else None)
+        engine = None
+        usage_estimate = UsageEstimate()
+        self._request_usage_basis = None
+
+        async def compact(recent_tokens):
+            nonlocal checkpoint, engine
+            if engine is None:
+                if spec.compaction_engine_factory is not None:
+                    engine = spec.compaction_engine_factory()
+                elif budget is not None:
+                    engine = CompactionEngine(self.provider, budget)
+                else:
+                    raise CompactionError("No context window configured for compaction")
+            ensure_ids(messages)
+            before_payload = await self._govern_payload(spec, messages, checkpoint)
+            try:
+                self._enforce_context_budget(spec, before_payload)
+            except ContextBudgetExceededError as exc:
+                if exc.unit == "images" or getattr(exc, "reason", "").startswith("Irreducible"):
+                    raise CompactionError(getattr(exc, "reason", str(exc))) from exc
+            if spec.precompaction_callback is not None:
+                await spec.precompaction_callback()
+            # Summaries consume stored tool results, never idle placeholders.
+            # The engine bounds/chunks this larger input independently; progress
+            # is still measured against the actual (microcompacted) chat payload.
+            summary_payload = await self._govern_payload(
+                spec, messages, checkpoint, for_compaction=True,
+            ) if spec.microcompact_through else before_payload
+            candidate = await engine.prepare(
+                summary_payload, previous=checkpoint, recent_tokens=recent_tokens,
+                tools=spec.tools.get_definitions(),
+            )
+            after_payload = await self._govern_payload(spec, messages, candidate)
+            try:
+                self._enforce_context_budget(spec, after_payload)
+            except ContextBudgetExceededError as exc:
+                if exc.unit == "images" or getattr(exc, "reason", "").startswith("Irreducible"):
+                    raise CompactionError(getattr(exc, "reason", str(exc))) from exc
+            definitions = spec.tools.get_definitions()
+            if budget and (
+                budget.estimate(self.provider, after_payload, definitions)
+                >= budget.estimate(self.provider, before_payload, definitions)
+                and estimate_request_bytes(after_payload, definitions)
+                >= estimate_request_bytes(before_payload, definitions)
+            ):
+                raise CompactionError("Compaction made no progress in the transformed request payload")
+            if spec.compaction_callback is not None:
+                await spec.compaction_callback(messages, candidate)
+            checkpoint = candidate
 
         for iteration in range(spec.max_iterations):
-            try:
-                # Keep the persisted conversation untouched. Context governance
-                # may repair or compact historical messages for the model, but
-                # those synthetic edits must not shift the append boundary used
-                # later when the caller saves only the new turn.
-                messages_for_model = self._drop_orphan_tool_results(messages)
-                messages_for_model = self._backfill_missing_tool_results(messages_for_model)
-                messages_for_model = self._microcompact(messages_for_model)
-                messages_for_model = self._apply_tool_result_budget(spec, messages_for_model)
-                messages_for_model = self._snip_history(spec, messages_for_model)
-                # Snipping may have created new orphans; clean them up.
-                messages_for_model = self._drop_orphan_tool_results(messages_for_model)
-                messages_for_model = self._backfill_missing_tool_results(messages_for_model)
-            except Exception:
-                logger.exception(
-                    "Context governance failed on turn {} for {}; applying minimal repair",
-                    iteration,
-                    spec.session_key or "default",
-                )
-                try:
-                    messages_for_model = self._drop_orphan_tool_results(messages)
-                    messages_for_model = self._backfill_missing_tool_results(messages_for_model)
-                except Exception:
-                    messages_for_model = messages
+            if checkpoint is not None:
+                ensure_ids(messages)  # Own newly completed batches before projection.
             context = AgentHookContext(
                 iteration=iteration,
                 messages=messages,
@@ -447,7 +502,46 @@ class AgentRunner:
             )
             await hook.before_iteration(context)
             try:
-                response = await self._request_model(spec, messages_for_model, hook, context)
+                # Recover only this interrupted continuation. Completed tool
+                # batches stay in `messages`; neither tools nor prior streams run again.
+                for recovery in range(4):
+                    try:
+                        messages_for_model = await self._govern_payload(spec, messages, checkpoint)
+                        if recovery == 0 and budget and usage_estimate.estimate(
+                            budget, self.provider, messages_for_model, spec.tools.get_definitions(),
+                        ) >= budget.input_limit - budget.headroom:
+                            previous_checkpoint = checkpoint
+                            try:
+                                await compact(max(1, budget.input_limit // 3))
+                            except CompactionError as exc:
+                                logger.info("Proactive compaction deferred: {}", exc)
+                            if checkpoint is not previous_checkpoint:
+                                messages_for_model = await self._govern_payload(spec, messages, checkpoint)
+                        response = await self._request_model(spec, messages_for_model, hook, context)
+                    except ContextBudgetExceededError as exc:
+                        if exc.unit == "images" or getattr(exc, "reason", "").startswith("Irreducible"):
+                            raise
+                        overflow = exc
+                    else:
+                        if not is_context_overflow(response) or context.streamed_content:
+                            break
+                        overflow = ContextBudgetExceededError(
+                            budget.estimate(self.provider, messages_for_model, spec.tools.get_definitions())
+                            if budget else 0, budget.input_limit if budget else 0,
+                        )
+                    if recovery == 3 or budget is None:
+                        raise overflow
+                    before = budget.estimate(self.provider, messages_for_model, spec.tools.get_definitions())
+                    try:
+                        await compact(max(1, budget.input_limit // (3 * (2 ** recovery))))
+                    except CompactionError as exc:
+                        overflow.reason = str(exc)
+                        raise overflow from exc
+                    messages_for_model = await self._govern_payload(spec, messages, checkpoint)
+                    after = budget.estimate(self.provider, messages_for_model, spec.tools.get_definitions())
+                    if after >= before:
+                        overflow.reason = "Checkpoint did not reduce the actual request payload"
+                        raise overflow
             except ContextBudgetExceededError as exc:
                 if exc.unit == "images":
                     final_content = (
@@ -456,9 +550,10 @@ class AgentRunner:
                         "are in the current unseen batch."
                     )
                 else:
+                    reason = getattr(exc, "reason", "fixed instructions or latest indispensable exchange cannot fit")
                     final_content = (
-                        "I could not send this request because the conversation, including its "
-                        f"images, is too large ({exc.estimate} {exc.unit}; limit {exc.budget})."
+                        f"Context recovery stopped: {reason} "
+                        f"({exc.estimate} {exc.unit}; limit {exc.budget})."
                     )
                 error = final_content
                 stop_reason = "context_budget_exceeded"
@@ -468,6 +563,15 @@ class AgentRunner:
                 self._append_final_message(messages, final_content)
                 await hook.after_iteration(context)
                 break
+            # Fallback wrappers do not identify the physical responder in
+            # LLMResponse, so their usage cannot safely calibrate this model.
+            measured_usage = response.usage if (
+                response.finish_reason != "error" and getattr(self.provider, "_primary", None) is None
+            ) else {}
+            sent_messages, sent_tools = self._request_usage_basis or (
+                messages_for_model, spec.tools.get_definitions(),
+            )
+            usage_estimate.record(spec.model, sent_messages, sent_tools, measured_usage)
             self._mark_images_seen(messages)
             context.response = response
             context.tool_calls = list(response.tool_calls)
@@ -512,13 +616,14 @@ class AgentRunner:
 
                 await hook.before_execute_tools(context)
 
-                results, new_events, fatal_error = await self._execute_tools(
+                results, new_events, new_event_targets, fatal_error = await self._execute_tools(
                     spec,
                     response.tool_calls,
                     external_lookup_counts,
                     workspace_violation_counts,
                 )
                 tool_events.extend(new_events)
+                tool_event_targets.extend(new_event_targets)
                 tools_used.extend(
                     event["name"] for event in new_events if event.get("status") == "success"
                 )
@@ -716,10 +821,48 @@ class AgentRunner:
                     continue
                 break
 
-            terminal_tool_reason = self._terminal_tool_stop_reason(tool_events)
+            terminal_tool_reason = self._terminal_tool_stop_reason(
+                tool_events, tool_event_targets,
+            )
+            if (
+                terminal_tool_reason == "partial_completion"
+                and spec.verify_tool_failures
+                and not verification_attempted
+                # Only when a retry or a plainer statement could change the
+                # outcome; an unverifiable side effect is not fixable here.
+                and self._actionable_failures(
+                    self._unresolved_events(tool_events, tool_event_targets)
+                )
+                # Leave a slot for the verification call, otherwise the loop
+                # would fall through to max_iterations handling instead.
+                and iteration + 1 < spec.max_iterations
+            ):
+                verification_attempted = True
+                unresolved = self._unresolved_events(tool_events, tool_event_targets)
+                actionable = self._actionable_failures(unresolved)
+                # Record what the model actually said, unprefixed: the reply is
+                # on hold, not rewritten, and the transcript stays honest.
+                messages.append(assistant_message or build_assistant_message(
+                    clean,
+                    reasoning_content=response.reasoning_content,
+                    thinking_blocks=response.thinking_blocks,
+                ))
+                self._append_injected_messages(
+                    messages,
+                    [self._tool_failure_verification_message(actionable)],
+                )
+                logger.info(
+                    "Requesting one verification turn after {} unresolved tool failure(s) for {}",
+                    len(actionable),
+                    spec.session_key or "default",
+                )
+                await hook.after_iteration(context)
+                continue
             if terminal_tool_reason is not None:
                 stop_reason = terminal_tool_reason
-                clean = self._suppress_false_success(clean, stop_reason)
+                clean = self._suppress_false_success(
+                    clean, stop_reason, tool_events, tool_event_targets,
+                )
                 assistant_message = build_assistant_message(
                     clean,
                     reasoning_content=response.reasoning_content,
@@ -761,10 +904,12 @@ class AgentRunner:
                 had_injections = True
             final_content = None
             if spec.finalize_on_max_iterations:
+                if checkpoint is not None:
+                    ensure_ids(messages)
                 final_content = await self._try_finalize_after_max_iterations(
                     spec,
                     hook,
-                    messages,
+                    project(messages, checkpoint),
                     usage,
                 )
             if final_content is None:
@@ -790,34 +935,173 @@ class AgentRunner:
             had_injections=had_injections,
         )
 
-    @staticmethod
-    def _terminal_tool_stop_reason(tool_events: list[dict[str, Any]]) -> str | None:
-        latest_by_tool: dict[str, str] = {}
-        for event in tool_events:
-            name = str(event.get("name") or "")
+    # Statuses that mean a material operation may not have landed.
+    # ``nonzero_exit`` is deliberately absent: the command ran and returned, so
+    # its exit code is data rather than an unresolved failure.
+    # ``invalid_arguments`` is absent for the same reason at the other end: the
+    # call was rejected before it touched anything, so no effect is unknown.
+    _FAILURE_STATUSES = frozenset({"partial", "retryable_error"})
+    # Failures a later success can supersede. Policy blocks participate so a
+    # blocked call that is then satisfied by another route stops being terminal.
+    _RESOLVABLE_STATUSES = frozenset({"partial", "retryable_error", "policy_block"})
+    # How many unresolved failures the notice names before it elides the rest.
+    _MAX_NOTICE_DETAILS = 3
+
+    @classmethod
+    def _unresolved_events(
+        cls,
+        tool_events: list[dict[str, Any]],
+        event_targets: list[list[str]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Failures that no later success resolved, in call order."""
+        unresolved: list[dict[str, Any]] = []
+        for index, event in enumerate(tool_events):
             status = str(event.get("status") or "")
-            if name and status:
-                latest_by_tool[name] = status
-        statuses = set(latest_by_tool.values())
+            if status not in cls._RESOLVABLE_STATUSES:
+                continue
+            if cls._superseded(index, event, tool_events, event_targets):
+                continue
+            unresolved.append(event)
+        return unresolved
+
+    @staticmethod
+    def _targets_at(
+        event_targets: list[list[str]] | None,
+        index: int,
+    ) -> set[str]:
+        if not event_targets or index >= len(event_targets):
+            return set()
+        return {t for t in event_targets[index] if isinstance(t, str)}
+
+    @classmethod
+    def _superseded(
+        cls,
+        index: int,
+        event: dict[str, Any],
+        tool_events: list[dict[str, Any]],
+        event_targets: list[list[str]] | None = None,
+    ) -> bool:
+        """True when a later success cleared this failure.
+
+        Two ways to clear: the same tool succeeded again (a retry that worked),
+        or another tool succeeded on the same target -- apply_patch failing and
+        edit_file then writing that same file is a recovery, not a failure. An
+        unrelated success never launders a failure.
+        """
+        name = str(event.get("name") or "")
+        targets = cls._targets_at(event_targets, index)
+        for later_index in range(index + 1, len(tool_events)):
+            later = tool_events[later_index]
+            if str(later.get("status") or "") != "success":
+                continue
+            if str(later.get("name") or "") == name:
+                return True
+            if targets & cls._targets_at(event_targets, later_index):
+                return True
+        return False
+
+    @classmethod
+    def _terminal_tool_stop_reason(
+        cls,
+        tool_events: list[dict[str, Any]],
+        event_targets: list[list[str]] | None = None,
+    ) -> str | None:
+        statuses = {
+            str(event.get("status") or "")
+            for event in cls._unresolved_events(tool_events, event_targets)
+        }
         if "policy_block" in statuses:
             return "policy_block"
-        if "partial" in statuses:
+        if statuses & cls._FAILURE_STATUSES:
             return "partial_completion"
-        if "retryable_error" in statuses:
-            return "partial_completion"
-        if "ask_user" in statuses:
+        if any(str(event.get("status") or "") == "ask_user" for event in tool_events):
             return "ask_user"
         return None
 
-    @staticmethod
-    def _suppress_false_success(content: str, stop_reason: str) -> str:
+    @classmethod
+    def _suppress_false_success(
+        cls,
+        content: str,
+        stop_reason: str,
+        tool_events: list[dict[str, Any]] | None = None,
+        event_targets: list[list[str]] | None = None,
+    ) -> str:
         # Only false-success outcomes get a prefix; ask_user (a deliberate
         # wait-for-user pause) and other terminal reasons pass content through.
+        # The first line stays byte-identical so log fingerprinting and the
+        # error ledger keep tracking this class; the specifics follow on their
+        # own lines, which is what makes the notice actionable.
         if stop_reason == "policy_block":
-            return f"{_POLICY_BLOCK_PREFIX}\n\n{content}" if content else _POLICY_BLOCK_PREFIX
-        if stop_reason == "partial_completion":
-            return f"{_PARTIAL_COMPLETION_PREFIX}\n\n{content}" if content else _PARTIAL_COMPLETION_PREFIX
-        return content
+            prefix = _POLICY_BLOCK_PREFIX
+        elif stop_reason == "partial_completion":
+            prefix = _PARTIAL_COMPLETION_PREFIX
+        else:
+            return content
+        details = cls._failure_details(tool_events or [], event_targets)
+        if details:
+            prefix = "\n".join([prefix, *details])
+        return f"{prefix}\n\n{content}" if content else prefix
+
+    @classmethod
+    def _actionable_failures(
+        cls,
+        unresolved: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Unresolved failures a retry or a clearer statement could resolve.
+
+        An unchecked postcondition is excluded: the side effect may well have
+        happened and no tool can confirm it, so an extra turn is churn and the
+        notice alone guards the claim. A failure the model can actually act on
+        -- the operation could not run, or it ran and the intended effect did
+        not happen -- earns the turn.
+        """
+        return [
+            event
+            for event in unresolved
+            if str(event.get("status") or "") == "retryable_error"
+            or str(event.get("postcondition") or "") == "failed"
+            or (
+                str(event.get("status") or "") == "partial"
+                and not event.get("postcondition")
+            )
+        ]
+
+    @classmethod
+    def _tool_failure_verification_message(
+        cls,
+        unresolved: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """The single follow-up asking the model to verify before replying."""
+        failures = cls._format_failure_lines(unresolved)
+        content = render_template(
+            "agent/tool_failure_verification.md",
+            strip=True,
+            failures="\n".join(failures),
+        )
+        return {"role": "user", "content": content}
+
+    @classmethod
+    def _format_failure_lines(cls, unresolved: list[dict[str, Any]]) -> list[str]:
+        lines: list[str] = []
+        for event in unresolved[: cls._MAX_NOTICE_DETAILS]:
+            name = str(event.get("name") or "tool")
+            detail = str(event.get("detail") or "").strip()
+            lines.append(f"- {name}: {detail}" if detail else f"- {name}")
+        remaining = len(unresolved) - len(lines)
+        if remaining > 0:
+            lines.append(f"- and {remaining} more")
+        return lines
+
+    @classmethod
+    def _failure_details(
+        cls,
+        tool_events: list[dict[str, Any]],
+        event_targets: list[list[str]] | None = None,
+    ) -> list[str]:
+        """Name the unresolved failures, bounded to keep the notice scannable."""
+        return cls._format_failure_lines(
+            cls._unresolved_events(tool_events, event_targets)
+        )
 
     def _build_request_kwargs(
         self,
@@ -827,7 +1111,7 @@ class AgentRunner:
         tools: list[dict[str, Any]] | None,
     ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
-            "messages": messages,
+            "messages": strip_private_fields(messages),
             "tools": tools,
             "model": spec.model,
             "retry_mode": spec.provider_retry_mode,
@@ -846,9 +1130,20 @@ class AgentRunner:
     ) -> None:
         """Reject oversized prompts immediately before any provider call."""
         tools = spec.tools.get_definitions() if include_tools else None
+        messages = strip_private_fields(messages)
         request_bytes = estimate_request_bytes(messages, tools)
         if request_bytes > _MAX_REQUEST_BYTES:
-            raise ContextBudgetExceededError(request_bytes, _MAX_REQUEST_BYTES)
+            exc = ContextBudgetExceededError(request_bytes, _MAX_REQUEST_BYTES, unit="bytes")
+            fixed = [m for m in messages if m.get("role") == "system"]
+            if estimate_request_bytes(fixed, tools) > _MAX_REQUEST_BYTES:
+                exc.reason = "Irreducible fixed instructions/tool schemas exceed request-byte limit"
+            else:
+                latest = next((i for i in range(len(messages) - 1, -1, -1)
+                               if messages[i].get("role") in {"user", "assistant"}), len(messages))
+                minimal = fixed + messages[latest:]
+                if estimate_request_bytes(minimal, tools) > _MAX_REQUEST_BYTES:
+                    exc.reason = "Irreducible latest request/tool exchange exceeds request-byte limit"
+            raise exc
         if not spec.context_window_tokens and not spec.context_block_limit:
             return
         provider_max_tokens = getattr(getattr(self.provider, "generation", None), "max_tokens", 4096)
@@ -856,7 +1151,7 @@ class AgentRunner:
             provider_max_tokens if isinstance(provider_max_tokens, int) else 4096
         )
         window_budget = (
-            spec.context_window_tokens - max_output - _SNIP_SAFETY_BUFFER
+            RequestBudget.freeze(self.provider, spec.model, spec.context_window_tokens, max_output).input_limit
             if spec.context_window_tokens else 0
         )
         budget = min(spec.context_block_limit, window_budget) if (
@@ -867,7 +1162,20 @@ class AgentRunner:
             self.provider, spec.model, messages, tools
         )
         if estimate > budget:
-            raise ContextBudgetExceededError(estimate, budget)
+            exc = ContextBudgetExceededError(estimate, budget)
+            fixed, _ = estimate_prompt_tokens_chain(
+                self.provider, spec.model, [m for m in messages if m.get("role") == "system"], tools,
+            )
+            if fixed > budget:
+                exc.reason = "Irreducible fixed instructions/tool schemas exceed input-token budget"
+            else:
+                latest = next((i for i in range(len(messages) - 1, -1, -1)
+                               if messages[i].get("role") in {"user", "assistant"}), len(messages))
+                minimal = [m for m in messages[:latest] if m.get("role") == "system"] + messages[latest:]
+                minimal_tokens, _ = estimate_prompt_tokens_chain(self.provider, spec.model, minimal, tools)
+                if minimal_tokens > budget:
+                    exc.reason = "Irreducible latest request/tool exchange (including attached images) is too large"
+            raise exc
 
     async def _request_model(
         self,
@@ -889,16 +1197,16 @@ class AgentRunner:
         if timeout_s is not None and timeout_s <= 0:
             timeout_s = None
 
-        messages = await self._maybe_vision_handoff(spec, messages)
-        messages = self._prepare_umans_image_budget(messages)
-        # Vision handoff can add image blocks after history snipping. Recheck
-        # the complete payload, including those blocks, before calling provider.
+        # Input is the governed payload built by the owning request seam.
         self._enforce_context_budget(spec, messages)
         kwargs = self._build_request_kwargs(
             spec,
             messages,
             tools=spec.tools.get_definitions(),
         )
+        # Calibrate against exactly the transformed messages and schemas sent,
+        # not a later registry/config snapshot or pre-handoff image context.
+        self._request_usage_basis = (deepcopy(kwargs["messages"]), deepcopy(kwargs["tools"]))
         wants_streaming = hook.wants_streaming()
         wants_progress_streaming = (
             not wants_streaming
@@ -1084,20 +1392,32 @@ class AgentRunner:
         spec: AgentRunSpec,
         messages: list[dict[str, Any]],
     ) -> LLMResponse:
-        # Finalization is a model call too: apply the same governance and hard
-        # preflight as the normal path before vision handoff/serialization.
-        messages = self._drop_orphan_tool_results(messages)
-        messages = self._backfill_missing_tool_results(messages)
-        messages = self._microcompact(messages)
-        messages = self._apply_tool_result_budget(spec, messages)
-        messages = self._snip_history(spec, messages)
-        messages = self._drop_orphan_tool_results(messages)
-        messages = self._backfill_missing_tool_results(messages)
-        messages = await self._maybe_vision_handoff(spec, messages)
-        messages = self._prepare_umans_image_budget(messages)
+        messages = await self._govern_payload(spec, messages)
         self._enforce_context_budget(spec, messages, include_tools=False)
         kwargs = self._build_request_kwargs(spec, messages, tools=None)
         return await self.provider.chat_with_retry(**kwargs)
+
+    async def _govern_payload(self, spec, messages, checkpoint=None, *, for_compaction=False):
+        """One projection: checkpoint → idle microcompact → repair → vision → images.
+
+        Full summaries bypass only idle microcompaction, retaining stored results.
+
+        Synthetic repair never changes the owning transcript/append boundary.
+        Retry a transient repair failure once; never send an ungoverned fallback.
+        """
+        projected = project(messages, checkpoint)
+        if not for_compaction:
+            projected = microcompact(projected, spec.microcompact_through)
+        for attempt in range(2):
+            try:
+                repaired = self._backfill_missing_tool_results(self._drop_orphan_tool_results(projected))
+                break
+            except Exception:
+                if attempt:
+                    raise
+                logger.warning("Context repair failed for {}; retrying", spec.session_key or "default")
+        transformed = await self._maybe_vision_handoff(spec, repaired)
+        return self._prepare_umans_image_budget(transformed)
 
     def _is_umans_provider(self) -> bool:
         """Return whether the active provider (including fallback primary) is Umans.
@@ -1275,13 +1595,13 @@ class AgentRunner:
         tool_calls: list[ToolCallRequest],
         external_lookup_counts: dict[str, int],
         workspace_violation_counts: dict[str, int],
-    ) -> tuple[list[Any], list[dict[str, Any]], BaseException | None]:
+    ) -> tuple[list[Any], list[dict[str, Any]], list[list[str]], BaseException | None]:
         async def run_call(tool_call: ToolCallRequest):
             if tool_call.name != "codemode":
                 return await self._run_tool(
                     spec, tool_call, external_lookup_counts, workspace_violation_counts,
                 )
-            children: list[dict[str, Any]] = []
+            children: list[tuple[int, dict[str, Any], list[str]]] = []
             child_errors: list[BaseException] = []
             serial = asyncio.Lock()
 
@@ -1307,7 +1627,7 @@ class AgentRunner:
                         execution_succeeded=False,
                     )
                     cancelled.update({"parent_call_id": tool_call.id, "call_id": child.id})
-                    children.append(cancelled)
+                    children.append((request_id, cancelled, self._event_targets(arguments)))
                     logger.debug("Codemode child {} {}: cancelled", child.id, name)
                     raise
                 envelope = {
@@ -1324,7 +1644,7 @@ class AgentRunner:
                     "data", "stdout", "stderr",
                 )}
                 compact.update({"parent_call_id": tool_call.id, "call_id": child.id})
-                children.append(compact)
+                children.append((request_id, compact, self._event_targets(arguments)))
                 logger.debug("Codemode child {} {}: {}", child.id, name, event["status"])
                 if error is not None:
                     child_errors.append(error)
@@ -1340,10 +1660,12 @@ class AgentRunner:
                 execution.active = False
                 CODEMODE_EXECUTION.reset(token)
             if children:
-                event["_nested_events"] = children
-                if event["status"] == "success" and any(c["status"] != "success" for c in children):
-                    result = str(result) + "\nOne or more nested tool calls failed or were blocked; inspect their outcomes."
-                    event.update({"status": "partial", "operational_success": False, "verified": False})
+                # Preserve call order and target alignment for the runner's
+                # recovery/verification logic. Caught errors must not create a
+                # second, synthetic failure on the orchestration envelope.
+                children.sort(key=lambda item: item[0])
+                event["_nested_events"] = [child for _, child, _ in children]
+                event["_nested_targets"] = [targets for _, _, targets in children]
             return result, event, error or (child_errors[0] if child_errors else None)
 
         batches = self._partition_tool_batches(spec, tool_calls)
@@ -1363,15 +1685,21 @@ class AgentRunner:
 
         results: list[Any] = []
         events: list[dict[str, Any]] = []
+        # Targets stay out of persisted events but remain index-aligned,
+        # including every nested call, for cross-tool recovery matching.
+        event_targets: list[list[str]] = []
         fatal_error: BaseException | None = None
-        for result, event, error in tool_results:
+        for call, (result, event, error) in zip(tool_calls, tool_results):
             results.append(result)
             children = event.pop("_nested_events", [])
+            child_targets = event.pop("_nested_targets", [])
             events.append(event)
+            event_targets.append(self._event_targets(call.arguments))
             events.extend(children)
+            event_targets.extend(child_targets)
             if error is not None and fatal_error is None:
                 fatal_error = error
-        return results, events, fatal_error
+        return results, events, event_targets, fatal_error
 
     async def _run_tool(
         self,
@@ -1411,7 +1739,9 @@ class AgentRunner:
                 if isinstance(prepared, tuple) and len(prepared) == 3:
                     tool, params, prep_error = prepared
         if prep_error:
-            outcome = ToolResult.retryable_error(prep_error)
+            # Schema/parameter rejection: the call never reached the tool, so it
+            # is a malformed call rather than a failed operation.
+            outcome = ToolResult.invalid_arguments(prep_error)
             event = self._tool_event(
                 tool_call.name,
                 outcome,
@@ -1583,6 +1913,45 @@ class AgentRunner:
         return payload, self._tool_event(
             tool_call.name, outcome, arguments=recorded_args,
         ), None
+
+    # Argument keys that identify what a call touched. Matched across tools so
+    # that a failure recovered through a different tool on the same target
+    # (apply_patch -> edit_file on one file) resolves instead of lingering.
+    _EVENT_TARGET_KEYS: tuple[str, ...] = (
+        "path",
+        "file_path",
+        "file",
+        "session_id",
+        "job_id",
+        "intent_id",
+    )
+    _EVENT_TARGET_MAX_ITEMS = 4
+
+    @classmethod
+    def _event_targets(cls, arguments: Any) -> list[str]:
+        """Identifying values this call touched, in a bounded, JSON-safe form."""
+        if not isinstance(arguments, dict):
+            return []
+        targets: list[str] = []
+
+        def _add(value: Any) -> None:
+            if isinstance(value, str) and value.strip():
+                cleaned = value.strip()[:_RECORDED_ARG_MAX_CHARS]
+                if cleaned not in targets:
+                    targets.append(cleaned)
+
+        for key in cls._EVENT_TARGET_KEYS:
+            _add(arguments.get(key))
+        edits = arguments.get("edits")
+        if isinstance(edits, list):
+            for item in edits:
+                if isinstance(item, dict):
+                    _add(item.get("path"))
+        channel = arguments.get("channel")
+        chat_id = arguments.get("chat_id")
+        if isinstance(channel, str) and isinstance(chat_id, (str, int)):
+            _add(f"{channel}:{chat_id}")
+        return targets[: cls._EVENT_TARGET_MAX_ITEMS]
 
     @staticmethod
     def _tool_event(
@@ -1853,12 +2222,14 @@ class AgentRunner:
             insert_at = assistant_idx + 1 + offset
             while insert_at < len(updated) and updated[insert_at].get("role") == "tool":
                 insert_at += 1
-            updated.insert(insert_at, {
-                "role": "tool",
-                "tool_call_id": call_id,
-                "name": name,
+            result = {
+                "role": "tool", "tool_call_id": call_id, "name": name,
                 "content": _BACKFILL_CONTENT,
-            })
+            }
+            source_id = messages[assistant_idx].get("_entry_id")
+            if source_id:
+                result["_source_entry_id"] = source_id
+            updated.insert(insert_at, result)
             offset += 1
         return updated
 
@@ -1874,156 +2245,6 @@ class AgentRunner:
                 for block in msg["content"]
             ):
                 msg["_images_seen"] = True
-
-    @staticmethod
-    def _microcompact(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Replace old compactable tool results with one-line summaries."""
-        compactable_indices: list[int] = []
-        for idx, msg in enumerate(messages):
-            if msg.get("role") == "tool" and msg.get("name") in _COMPACTABLE_TOOLS:
-                compactable_indices.append(idx)
-
-        stale = compactable_indices[: max(0, len(compactable_indices) - _MICROCOMPACT_KEEP_RECENT)]
-        image_indices = [
-            idx for idx in compactable_indices
-            if isinstance(messages[idx].get("content"), list)
-            and any(
-                isinstance(block, dict) and block.get("type") == "image_url"
-                for block in messages[idx]["content"]
-            )
-        ]
-        # All images from the newest tool-call batch have not been seen by the
-        # model yet. Never compact them before their first model response.
-        latest_batch_start = max(
-            (idx for idx, msg in enumerate(messages)
-             if msg.get("role") == "assistant" and msg.get("tool_calls")),
-            default=-1,
-        )
-        seen_images = [idx for idx in image_indices
-                       if idx < latest_batch_start or messages[idx].get("_images_seen")]
-        stale_images = set(seen_images[:-_MICROCOMPACT_KEEP_RECENT_IMAGES])
-        # A tool result that still carries an unseen image must not be dropped by
-        # the generic stale rule either; the image budget handles that case and
-        # can report a hard local error instead of silently losing the image.
-        unseen_images = set(image_indices) - set(seen_images)
-        stale = [idx for idx in stale if idx not in unseen_images]
-        updated: list[dict[str, Any]] | None = None
-        for idx in sorted(set(stale) | stale_images):
-            msg = messages[idx]
-            content = msg.get("content")
-            if idx in stale_images:
-                paths = [
-                    block.get("_meta", {}).get("path")
-                    for block in content
-                    if isinstance(block, dict) and block.get("type") == "image_url"
-                    and isinstance(block.get("_meta"), dict)
-                ]
-                path_hint = f"; re-read {', '.join(str(path) for path in paths if path)}" if paths else ""
-                summary = f"[{msg.get('name', 'tool')} image omitted from context{path_hint}]"
-            elif isinstance(content, str) and len(content) >= _MICROCOMPACT_MIN_CHARS:
-                summary = f"[{msg.get('name', 'tool')} result omitted from context]"
-            else:
-                continue
-            if updated is None:
-                updated = [dict(m) for m in messages]
-            updated[idx]["content"] = summary
-
-        return updated if updated is not None else messages
-
-    def _apply_tool_result_budget(
-        self,
-        spec: AgentRunSpec,
-        messages: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        updated = messages
-        for idx, message in enumerate(messages):
-            if message.get("role") != "tool":
-                continue
-            normalized = self._normalize_tool_result(
-                spec,
-                str(message.get("tool_call_id") or f"tool_{idx}"),
-                str(message.get("name") or "tool"),
-                message.get("content"),
-            )
-            if normalized != message.get("content"):
-                if updated is messages:
-                    updated = [dict(m) for m in messages]
-                updated[idx]["content"] = normalized
-        return updated
-
-    def _snip_history(
-        self,
-        spec: AgentRunSpec,
-        messages: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        if not messages or not spec.context_window_tokens:
-            return messages
-
-        provider_max_tokens = getattr(getattr(self.provider, "generation", None), "max_tokens", 4096)
-        max_output = spec.max_tokens if isinstance(spec.max_tokens, int) else (
-            provider_max_tokens if isinstance(provider_max_tokens, int) else 4096
-        )
-        window_budget = spec.context_window_tokens - max_output - _SNIP_SAFETY_BUFFER
-        budget = min(spec.context_block_limit, window_budget) if spec.context_block_limit else window_budget
-        if budget <= 0:
-            return messages
-
-        estimate, _ = estimate_prompt_tokens_chain(
-            self.provider,
-            spec.model,
-            messages,
-            spec.tools.get_definitions(),
-        )
-        if estimate <= budget:
-            return messages
-
-        system_messages = [dict(msg) for msg in messages if msg.get("role") == "system"]
-        non_system = [dict(msg) for msg in messages if msg.get("role") != "system"]
-        if not non_system:
-            return messages
-
-        system_tokens = sum(estimate_message_tokens(msg) for msg in system_messages)
-        fixed_tokens, _ = estimate_prompt_tokens_chain(
-            self.provider,
-            spec.model,
-            system_messages,
-            spec.tools.get_definitions(),
-        )
-        remaining_budget = max(0, budget - max(system_tokens, fixed_tokens))
-        kept: list[dict[str, Any]] = []
-        kept_tokens = 0
-        for message in reversed(non_system):
-            msg_tokens = estimate_message_tokens(message)
-            if kept and kept_tokens + msg_tokens > remaining_budget:
-                break
-            kept.append(message)
-            kept_tokens += msg_tokens
-        kept.reverse()
-
-        if kept:
-            for i, message in enumerate(kept):
-                if message.get("role") == "user":
-                    kept = kept[i:]
-                    break
-            else:
-                # Recover nearest user message from outside the kept window;
-                # GLM rejects system→assistant (error 1214).  Budget is
-                # intentionally exceeded — oversized beats invalid.
-                for idx in range(len(non_system) - 1, -1, -1):
-                    if non_system[idx].get("role") == "user":
-                        kept = non_system[idx:]
-                        break
-                # If no user exists at all, _enforce_role_alternation
-                # will insert a synthetic one as a safety net.
-            start = find_legal_message_start(kept)
-            if start:
-                kept = kept[start:]
-        if not kept:
-            kept = non_system[-min(len(non_system), 4) :]
-            start = find_legal_message_start(kept)
-            if start:
-                kept = kept[start:]
-        return system_messages + kept
 
     def _partition_tool_batches(
         self,

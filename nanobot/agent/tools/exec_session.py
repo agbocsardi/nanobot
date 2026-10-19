@@ -371,8 +371,10 @@ def _poll_outcome(session_id: str, poll: _SessionPoll, text: str) -> ToolResult:
     }
     if not poll.done:
         return ToolResult.partial(text, data=data)
-    if poll.timed_out or poll.terminated or poll.exit_code != 0:
+    if poll.timed_out or poll.terminated:
         return ToolResult.retryable_error(text, data=data, exit_code=poll.exit_code)
+    if poll.exit_code != 0:
+        return ToolResult.nonzero_exit(text, data=data, exit_code=poll.exit_code)
     return ToolResult(text, status="success", data=data, exit_code=0)
 
 

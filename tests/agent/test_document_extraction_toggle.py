@@ -9,12 +9,13 @@ from nanobot.agent.loop import AgentLoop, TurnContext, TurnState
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import ChannelsConfig
-from nanobot.providers.base import LLMResponse
+from nanobot.providers.base import GenerationSettings, LLMResponse
 from nanobot.utils.document import reference_non_image_attachments
 
 
 def _make_loop(tmp_path: Path, channels_config: ChannelsConfig | None = None) -> AgentLoop:
     provider = MagicMock()
+    provider.generation = GenerationSettings(max_tokens=4096)
     provider.get_default_model.return_value = "test-model"
     provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="ok"))
     return AgentLoop(

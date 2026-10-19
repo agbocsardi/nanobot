@@ -1,31 +1,16 @@
-"""Tests for AgentRunner context governance: backfill, orphan cleanup, microcompact, snip_history."""
+"""Live AgentRunner governance: orphan repair, request fallback and append boundaries."""
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from nanobot.config.schema import AgentDefaults
-from nanobot.providers.base import LLMResponse
+from nanobot.providers.base import GenerationSettings, LLMResponse
 
 _MAX_TOOL_RESULT_CHARS = AgentDefaults().max_tool_result_chars
 
-
-def _make_loop(tmp_path):
-    from nanobot.agent.loop import AgentLoop
-    from nanobot.bus.queue import MessageBus
-
-    bus = MessageBus()
-    provider = MagicMock()
-    provider.get_default_model.return_value = "test-model"
-
-    with patch("nanobot.agent.loop.ContextBuilder"), \
-         patch("nanobot.agent.loop.SessionManager"), \
-         patch("nanobot.agent.loop.SubagentManager") as mock_sub_mgr:
-        mock_sub_mgr.return_value.cancel_by_session = AsyncMock(return_value=0)
-        loop = AgentLoop(bus=bus, provider=provider, workspace=tmp_path)
-    return loop
 
 async def test_runner_uses_raw_messages_when_context_governance_fails():
     from nanobot.agent.runner import AgentRunner, AgentRunSpec
@@ -46,7 +31,7 @@ async def test_runner_uses_raw_messages_when_context_governance_fails():
     ]
 
     runner = AgentRunner(provider)
-    runner._snip_history = MagicMock(side_effect=RuntimeError("boom"))  # type: ignore[method-assign]
+    runner._drop_orphan_tool_results = MagicMock(side_effect=[RuntimeError("boom"), initial_messages])
     result = await runner.run(AgentRunSpec(
         initial_messages=initial_messages,
         tools=tools,
@@ -57,107 +42,7 @@ async def test_runner_uses_raw_messages_when_context_governance_fails():
 
     assert result.final_content == "done"
     assert captured_messages == initial_messages
-def test_snip_history_drops_orphaned_tool_results_from_trimmed_slice(monkeypatch):
-    from nanobot.agent.runner import AgentRunner, AgentRunSpec
-
-    provider = MagicMock()
-    tools = MagicMock()
-    tools.get_definitions.return_value = []
-    runner = AgentRunner(provider)
-    messages = [
-        {"role": "system", "content": "system"},
-        {"role": "user", "content": "old user"},
-        {
-            "role": "assistant",
-            "content": "tool call",
-            "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "ls", "arguments": "{}"}}],
-        },
-        {"role": "tool", "tool_call_id": "call_1", "content": "tool output"},
-        {"role": "assistant", "content": "after tool"},
-    ]
-    spec = AgentRunSpec(
-        initial_messages=messages,
-        tools=tools,
-        model="test-model",
-        max_iterations=1,
-        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
-        context_window_tokens=2000,
-        context_block_limit=100,
-    )
-
-    monkeypatch.setattr("nanobot.agent.runner.estimate_prompt_tokens_chain", lambda *_args, **_kwargs: (500, None))
-    token_sizes = {
-        "old user": 120,
-        "tool call": 120,
-        "tool output": 40,
-        "after tool": 40,
-        "system": 0,
-    }
-    monkeypatch.setattr(
-        "nanobot.agent.runner.estimate_message_tokens",
-        lambda msg: token_sizes.get(str(msg.get("content")), 40),
-    )
-
-    trimmed = runner._snip_history(spec, messages)
-
-    # After the fix, the user message is recovered so the sequence is valid
-    # for providers that require system → user (e.g. GLM error 1214).
-    assert trimmed[0]["role"] == "system"
-    non_system = [m for m in trimmed if m["role"] != "system"]
-    assert non_system[0]["role"] == "user", f"Expected user after system, got {non_system[0]['role']}"
-
-
-def test_snip_history_reserves_budget_for_tool_definitions(monkeypatch):
-    from nanobot.agent.runner import AgentRunner, AgentRunSpec
-
-    provider = MagicMock()
-    provider.generation.max_tokens = 0
-    tools = MagicMock()
-    tools.get_definitions.return_value = [{"type": "function", "function": {"name": "large_tool"}}]
-    runner = AgentRunner(provider)
-    messages = [
-        {"role": "system", "content": "system"},
-        {"role": "user", "content": "old user"},
-        {"role": "assistant", "content": "old assistant"},
-        {"role": "user", "content": "recent one"},
-        {"role": "assistant", "content": "recent answer"},
-        {"role": "user", "content": "recent two"},
-    ]
-    spec = AgentRunSpec(
-        initial_messages=messages,
-        tools=tools,
-        model="test-model",
-        max_iterations=1,
-        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
-        context_window_tokens=2000,
-        context_block_limit=500,
-    )
-
-    def _estimate(_provider, _model, estimate_messages, estimate_tools):
-        if estimate_messages == messages:
-            return 1000, None
-        assert estimate_messages == [{"role": "system", "content": "system"}]
-        assert estimate_tools == tools.get_definitions.return_value
-        return 350, None
-
-    monkeypatch.setattr("nanobot.agent.runner.estimate_prompt_tokens_chain", _estimate)
-    token_sizes = {
-        "system": 50,
-        "old user": 200,
-        "old assistant": 200,
-        "recent one": 200,
-        "recent answer": 200,
-        "recent two": 200,
-    }
-    monkeypatch.setattr(
-        "nanobot.agent.runner.estimate_message_tokens",
-        lambda msg: token_sizes.get(str(msg.get("content")), 40),
-    )
-
-    trimmed = runner._snip_history(spec, messages)
-
-    contents = [message.get("content") for message in trimmed]
-    assert contents == ["system", "recent two"]
+    assert runner._drop_orphan_tool_results.call_count == 2
 
 
 async def test_backfill_missing_tool_results_inserts_error():
@@ -290,6 +175,7 @@ async def test_backfill_repairs_model_context_without_shifting_save_turn_boundar
 
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
+    provider.generation = GenerationSettings(max_tokens=4096)
     response = LLMResponse(content="new answer", tool_calls=[], usage={})
     provider.chat_with_retry = AsyncMock(return_value=response)
     provider.chat_stream_with_retry = AsyncMock(return_value=response)
@@ -448,87 +334,12 @@ async def test_runner_backfill_only_mutates_model_context_not_returned_messages(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_microcompact_replaces_old_tool_results():
-    """Tool results beyond _MICROCOMPACT_KEEP_RECENT should be summarized."""
-    from nanobot.agent.runner import _MICROCOMPACT_KEEP_RECENT, AgentRunner
-
-    total = _MICROCOMPACT_KEEP_RECENT + 5
-    long_content = "x" * 600
-    messages: list[dict] = [{"role": "system", "content": "sys"}]
-    for i in range(total):
-        messages.append({
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{"id": f"c{i}", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}],
-        })
-        messages.append({
-            "role": "tool", "tool_call_id": f"c{i}", "name": "read_file",
-            "content": long_content,
-        })
-
-    result = AgentRunner._microcompact(messages)
-    tool_msgs = [m for m in result if m.get("role") == "tool"]
-    stale_count = total - _MICROCOMPACT_KEEP_RECENT
-    compacted = [m for m in tool_msgs if "omitted from context" in str(m.get("content", ""))]
-    preserved = [m for m in tool_msgs if m.get("content") == long_content]
-    assert len(compacted) == stale_count
-    assert len(preserved) == _MICROCOMPACT_KEEP_RECENT
-
-
-@pytest.mark.asyncio
-async def test_microcompact_preserves_short_results():
-    """Short tool results (< _MICROCOMPACT_MIN_CHARS) should not be replaced."""
-    from nanobot.agent.runner import _MICROCOMPACT_KEEP_RECENT, AgentRunner
-
-    total = _MICROCOMPACT_KEEP_RECENT + 5
-    messages: list[dict] = []
-    for i in range(total):
-        messages.append({
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{"id": f"c{i}", "type": "function", "function": {"name": "exec", "arguments": "{}"}}],
-        })
-        messages.append({
-            "role": "tool", "tool_call_id": f"c{i}", "name": "exec",
-            "content": "short",
-        })
-
-    result = AgentRunner._microcompact(messages)
-    assert result is messages  # no copy needed — all stale results are short
-
-
-@pytest.mark.asyncio
-async def test_microcompact_skips_non_compactable_tools():
-    """Non-compactable tools (e.g. 'message') should never be replaced."""
-    from nanobot.agent.runner import _MICROCOMPACT_KEEP_RECENT, AgentRunner
-
-    total = _MICROCOMPACT_KEEP_RECENT + 5
-    long_content = "y" * 1000
-    messages: list[dict] = []
-    for i in range(total):
-        messages.append({
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{"id": f"c{i}", "type": "function", "function": {"name": "message", "arguments": "{}"}}],
-        })
-        messages.append({
-            "role": "tool", "tool_call_id": f"c{i}", "name": "message",
-            "content": long_content,
-        })
-
-    result = AgentRunner._microcompact(messages)
-    assert result is messages  # no compactable tools found
-
-
-def test_governance_repairs_orphans_after_snip():
-    """After _snip_history clips an assistant+tool_calls, the second
-    _drop_orphan_tool_results pass must clean up the resulting orphans."""
+def test_governance_repairs_orphans_in_imported_history():
+    """An imported transcript may contain a tool result without its call."""
     from nanobot.agent.runner import AgentRunner
 
-    # Simulate snipping that keeps only the tail: drop the assistant with
-    # tool_calls but keep its tool result (orphan).
-    snipped = [
+    # Model repair must not assume every stored transcript is well formed.
+    imported = [
         {"role": "system", "content": "system"},
         {"role": "tool", "tool_call_id": "tc_old", "name": "search",
          "content": "old result"},
@@ -536,7 +347,7 @@ def test_governance_repairs_orphans_after_snip():
         {"role": "user", "content": "new msg"},
     ]
 
-    cleaned = AgentRunner._drop_orphan_tool_results(snipped)
+    cleaned = AgentRunner._drop_orphan_tool_results(imported)
     # The orphan tool result should be removed.
     assert not any(
         m.get("role") == "tool" and m.get("tool_call_id") == "tc_old"
@@ -561,127 +372,3 @@ def test_governance_fallback_still_repairs_orphans():
     repaired = AgentRunner._backfill_missing_tool_results(repaired)
     # Orphan tool result should be gone.
     assert not any(m.get("tool_call_id") == "orphan_tc" for m in repaired)
-def test_snip_history_preserves_user_message_after_truncation(monkeypatch):
-    """When _snip_history truncates messages and the only user message ends up
-    outside the kept window, the method must recover the nearest user message
-    so the resulting sequence is valid for providers like GLM (which reject
-    system→assistant with error 1214).
-
-    This reproduces the exact scenario from the bug report:
-    - Normal interaction: user asks, assistant calls tool, tool returns,
-      assistant replies.
-    - Injection adds a phantom user message, triggering more tool calls.
-    - _snip_history activates, keeping only recent assistant/tool pairs.
-    - The injected user message is in the truncated prefix and gets lost.
-    """
-    from nanobot.agent.runner import AgentRunner, AgentRunSpec
-
-    provider = MagicMock()
-    provider.generation.max_tokens = 0
-    tools = MagicMock()
-    tools.get_definitions.return_value = []
-    runner = AgentRunner(provider)
-
-    messages = [
-        {"role": "system", "content": "system"},
-        {"role": "assistant", "content": "previous reply"},
-        {"role": "user", "content": ".nanobot的同目录"},
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [{"id": "tc_1", "type": "function", "function": {"name": "exec", "arguments": "{}"}}],
-        },
-        {"role": "tool", "tool_call_id": "tc_1", "content": "tool output 1"},
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [{"id": "tc_2", "type": "function", "function": {"name": "exec", "arguments": "{}"}}],
-        },
-        {"role": "tool", "tool_call_id": "tc_2", "content": "tool output 2"},
-    ]
-
-    spec = AgentRunSpec(
-        initial_messages=messages,
-        tools=tools,
-        model="test-model",
-        max_iterations=1,
-        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
-        context_window_tokens=2000,
-        context_block_limit=100,
-    )
-
-    # Make estimate_prompt_tokens_chain report above budget so _snip_history activates.
-    monkeypatch.setattr("nanobot.agent.runner.estimate_prompt_tokens_chain", lambda *_a, **_kw: (500, None))
-    # Make kept window small: only the last 2 messages fit the budget.
-    token_sizes = {
-        "system": 0,
-        "previous reply": 200,
-        ".nanobot的同目录": 80,
-        "tool output 1": 80,
-        "tool output 2": 80,
-    }
-    monkeypatch.setattr(
-        "nanobot.agent.runner.estimate_message_tokens",
-        lambda msg: token_sizes.get(str(msg.get("content")), 100),
-    )
-
-    trimmed = runner._snip_history(spec, messages)
-
-    # The first non-system message MUST be user (not assistant).
-    non_system = [m for m in trimmed if m.get("role") != "system"]
-    assert non_system, "trimmed should contain at least one non-system message"
-    assert non_system[0]["role"] == "user", (
-        f"First non-system message must be 'user', got '{non_system[0]['role']}'. "
-        f"Roles: {[m['role'] for m in trimmed]}"
-    )
-
-
-def test_snip_history_no_user_at_all_falls_back_gracefully(monkeypatch):
-    """Edge case: if non_system has zero user messages, _snip_history should
-    still return a valid sequence (not crash or produce system→assistant)."""
-    from nanobot.agent.runner import AgentRunner, AgentRunSpec
-
-    provider = MagicMock()
-    tools = MagicMock()
-    tools.get_definitions.return_value = []
-    runner = AgentRunner(provider)
-
-    messages = [
-        {"role": "system", "content": "system"},
-        {"role": "assistant", "content": "reply"},
-        {"role": "tool", "tool_call_id": "tc_1", "content": "result"},
-        {"role": "assistant", "content": "reply 2"},
-        {"role": "tool", "tool_call_id": "tc_2", "content": "result 2"},
-    ]
-
-    spec = AgentRunSpec(
-        initial_messages=messages,
-        tools=tools,
-        model="test-model",
-        max_iterations=1,
-        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
-        context_window_tokens=2000,
-        context_block_limit=100,
-    )
-
-    monkeypatch.setattr("nanobot.agent.runner.estimate_prompt_tokens_chain", lambda *_a, **_kw: (500, None))
-    monkeypatch.setattr(
-        "nanobot.agent.runner.estimate_message_tokens",
-        lambda msg: 100,
-    )
-
-    trimmed = runner._snip_history(spec, messages)
-
-    # Should not crash.  The result should still be a valid list.
-    assert isinstance(trimmed, list)
-    # Must have at least system.
-    assert any(m.get("role") == "system" for m in trimmed)
-    # The _enforce_role_alternation safety net must be able to fix whatever
-    # _snip_history returns here — verify it produces a valid sequence.
-    from nanobot.providers.base import LLMProvider
-    fixed = LLMProvider._enforce_role_alternation(trimmed)
-    non_system = [m for m in fixed if m["role"] != "system"]
-    if non_system:
-        assert non_system[0]["role"] in ("user", "tool"), (
-            f"Safety net should ensure first non-system is user/tool, got {non_system[0]['role']}"
-        )

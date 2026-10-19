@@ -1856,7 +1856,7 @@ By default, nanobot only allows one spawned subagent at a time. When the limit i
 
 ## Auto Compact
 
-When a user is idle for longer than a configured threshold, nanobot **proactively** compresses the older part of the session context into a summary while keeping a recent legal suffix of live messages. This reduces token cost and first-token latency when the user returns — instead of re-processing a long stale context with an expired KV cache, the model receives a compact summary, the most recent live context, and fresh input.
+After a configured inactivity threshold, nanobot performs **no-LLM microcompaction**: older bulky text tool results are replaced by placeholders in future model inputs. Tool calls and stored results remain intact in the session JSONL. Idle work does not generate a summary, flush personal memory, append searchable history, or trigger Dream.
 
 ```json
 {
@@ -1870,22 +1870,18 @@ When a user is idle for longer than a configured threshold, nanobot **proactivel
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `agents.defaults.idleCompactAfterMinutes` | `0` (disabled) | Minutes of idle time before auto-compaction starts. Set to `0` to disable. Recommended: `15` — close to a typical LLM KV cache expiry window, so stale sessions get compacted before the user returns. |
+| `agents.defaults.idleCompactAfterMinutes` | `0` (disabled) | Minutes of inactivity before no-LLM tool-result microcompaction. Set to `0` to disable; `15` or `30` are reasonable starting points. |
 
 `sessionTtlMinutes` remains accepted as a legacy alias for backward compatibility, but `idleCompactAfterMinutes` is the preferred config key going forward.
 
 How it works:
-1. **Idle detection**: On each idle tick (~1 s), checks all sessions for expiration.
-2. **Background compaction**: Idle sessions summarize the older live prefix via LLM and keep the most recent legal suffix (currently 8 messages).
-3. **Summary injection**: When the user returns, the summary is injected as runtime context (one-shot, not persisted) alongside the retained recent suffix.
-4. **Restart-safe resume**: The summary is also mirrored into session metadata so it can still be recovered after a process restart.
+1. **Idle detection**: Idle ticks exclude active, cron and Dream sessions. Work is serialized, starts at most once per minute, suppresses unchanged activity revisions and backs off local failures.
+2. **Microcompaction**: An atomic session-metadata boundary records which history was idle. Normal model requests keep the ten newest eligible tool results in that range and replace older text results of at least 500 characters with placeholders. Eligible tools are `read_file`, `exec`, `grep`, `find_files`, `web_search`, `web_fetch`, `list_dir` and `list_exec_sessions`. New results after the boundary and image handling are unaffected. The boundary survives restart; `/new` clears it.
+3. **Full compaction**: `/compact`, token/message-count pressure and explicit context-overflow recovery still use the checkpoint engine. Summaries consume stored results, not idle placeholders, through bounded summarizer inputs. Pressure estimates and before/after progress checks use the actual microcompacted model view.
+4. **Transcript versus projection**: The authoritative session transcript keeps bounded text tool results and tool-call arguments (subject to the existing output-size limits) in RAM and session JSONL. `reasoning_content` is removed; provider-native `thinking_blocks` required for replay are retained. Embedded image bytes are replaced with safe local references, but arbitrary base64-looking text is not specially classified. A full checkpoint stores an evolving structured summary and references a token-sized recent suffix. Tool calls/results stay paired; a split-turn summary preserves the original request and early work. Searchable `memory/history.jsonl` is a separate bounded archive that prunes tool payloads to placeholders; Dream consumes that archive separately.
+5. **Restart-safe continuation and recovery**: Checkpoints and any referenced pending tool batches are saved atomically. Reload rebuilds the same projection. Failed, cancelled, empty, or length-truncated summaries never advance continuity. The runner checks the transformed payload, including tool schemas, against a frozen model/window/output budget. Full compaction pauses only between completed tool batches and retries only the interrupted continuation, not completed tools or answers. Irreducible fixed instructions and exchanges produce specific errors.
 
-> [!NOTE]
-> Mental model: "summarize older context, keep the freshest live turns, **and overwrite the session file with the compact form.**" It is not a full `session.clear()`, but it is a write — not a soft cursor move.
->
-> Concretely, auto compact rewrites `sessions/<key>.jsonl` in place: older messages (including their structured `tool_calls` / `tool_call_id` / `reasoning_content`) are replaced by just the retained recent suffix (currently 8 messages), while the archived prefix is preserved only as a plain-text summary appended to `memory/history.jsonl` (or a `[RAW] ...` flattened dump if LLM summarization fails). The original structured JSON of those turns is no longer recoverable from the session file.
->
-> This differs from the **token-driven soft consolidation** that fires when a prompt exceeds the context budget: that path only advances an internal `last_consolidated` cursor and leaves the session file untouched, so the raw tool-call trail stays on disk and can still be replayed or audited. If you rely on that trail for debugging or auditing, leave `idleCompactAfterMinutes` at the default `0` and let only the token-driven path run.
+Compaction does not discard original transcript records, write a fallback topic-memory archive, or advance `last_consolidated`. When an active session file exceeds 2,000 messages, checkpoint-hidden records may move into lossless, redacted audit batches under `sessions/archive/<session>/`; the projected context is unchanged. System messages and everything at or after the retained entry are never removed by this cap. If no safe hidden prefix exists, continuity takes priority over the cap; message-count pressure requests a checkpoint at the next turn. Existing explicit pre-compaction personal-memory flushing remains separate; checkpoint continuity does not depend on Dream/topic-memory extraction. `agents.defaults.maxMessages` is a **legacy/no-op compatibility field**: old JSON configs still load, but its value has no effect on model replay. Direct `AgentLoop(max_messages=...)` overrides and the internal idle/manual count overrides are retired. Checkpoints retain a token-sized legal suffix; the separate legacy `Session.get_history(max_messages=...)` browsing limit applies only without projection/checkpoints. The nine-raw-image handoff policy is unchanged.
 
 ## Timezone
 

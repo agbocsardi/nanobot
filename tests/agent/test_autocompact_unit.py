@@ -38,7 +38,7 @@ def _make_autocompact(
         sessions = MagicMock(spec=SessionManager)
     if consolidator is None:
         consolidator = MagicMock()
-        consolidator.compact_idle_session = AsyncMock(return_value="Summary.")
+        consolidator.microcompact_idle_session = AsyncMock(return_value=0)
     return AutoCompact(
         sessions=sessions,
         consolidator=consolidator,
@@ -280,82 +280,71 @@ class TestCheckExpired:
 
 
 class TestArchiveDelegates:
-    """_archive should delegate all session mutation to Consolidator."""
+    """Idle work delegates only no-LLM projection changes to Consolidator."""
 
     @pytest.mark.asyncio
-    async def test_calls_compact_idle_session(self):
+    async def test_calls_microcompact_idle_session(self):
         ac = _make_autocompact()
-        mock_sm = MagicMock(spec=SessionManager)
-        ac.sessions = mock_sm
-        ac.consolidator.compact_idle_session = AsyncMock(return_value="Summary.")
 
         await ac._archive("cli:test")
 
-        ac.consolidator.compact_idle_session.assert_awaited_once_with(
-            "cli:test", ac._RECENT_SUFFIX_MESSAGES,
-        )
+        ac.consolidator.microcompact_idle_session.assert_awaited_once_with("cli:test")
+        ac.consolidator.compact_idle_session.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_dream_session_is_ignored(self):
         ac = _make_autocompact()
-        ac.consolidator.compact_idle_session = AsyncMock(return_value="Summary.")
         ac._archiving.add("dream:20260602-155256")
 
         await ac._archive("dream:20260602-155256")
 
-        ac.consolidator.compact_idle_session.assert_not_awaited()
+        ac.consolidator.microcompact_idle_session.assert_not_awaited()
         assert "dream:20260602-155256" not in ac._archiving
 
     @pytest.mark.asyncio
-    async def test_populates_summaries_from_metadata(self):
+    async def test_idle_does_not_generate_a_legacy_summary(self):
         ac = _make_autocompact()
-        mock_sm = MagicMock(spec=SessionManager)
-        session = _make_session(
-            metadata={"_last_summary": {"text": "Hello.", "last_active": "2026-05-13T10:00:00"}}
-        )
-        mock_sm.get_or_create.return_value = session
-        ac.sessions = mock_sm
-        ac.consolidator.compact_idle_session = AsyncMock(return_value="Hello.")
+        session = _make_session()
+        ac.sessions.get_or_create.return_value = session
+        ac.consolidator.microcompact_idle_session.return_value = 3
 
         await ac._archive("cli:test")
 
-        entry = ac._summaries.get("cli:test")
-        assert entry is not None
-        assert entry[0] == "Hello."
+        assert ac._summaries == {}
+        assert "_last_summary" not in session.metadata
 
     @pytest.mark.asyncio
-    async def test_no_summary_when_compact_returns_empty(self):
+    async def test_noop_marks_activity_revision_completed(self):
         ac = _make_autocompact()
-        mock_sm = MagicMock(spec=SessionManager)
-        ac.sessions = mock_sm
-        ac.consolidator.compact_idle_session = AsyncMock(return_value="")
+        session = _make_session()
+        ac.sessions.get_or_create.return_value = session
 
         await ac._archive("cli:test")
 
-        assert "cli:test" not in ac._summaries
+        assert ac._completed[session.key] == session.updated_at.isoformat()
+        assert session.key not in ac._failures
 
     @pytest.mark.asyncio
-    async def test_no_summary_when_compact_returns_nothing(self):
+    async def test_microcompact_preserves_activity_timestamp(self):
         ac = _make_autocompact()
-        mock_sm = MagicMock(spec=SessionManager)
-        ac.sessions = mock_sm
-        ac.consolidator.compact_idle_session = AsyncMock(return_value="(nothing)")
+        session = _make_session(updated_at=datetime(2026, 1, 1))
+        ac.sessions.get_or_create.return_value = session
 
         await ac._archive("cli:test")
 
-        assert "cli:test" not in ac._summaries
+        assert session.updated_at == datetime(2026, 1, 1)
+        assert ac._summaries == {}
 
     @pytest.mark.asyncio
     async def test_exception_still_removes_from_archiving(self):
         ac = _make_autocompact()
-        mock_sm = MagicMock(spec=SessionManager)
-        ac.sessions = mock_sm
-        ac.consolidator.compact_idle_session = AsyncMock(side_effect=RuntimeError("fail"))
+        ac.consolidator.microcompact_idle_session.side_effect = RuntimeError("fail")
 
         ac._archiving.add("cli:test")
         await ac._archive("cli:test")
 
         assert "cli:test" not in ac._archiving
+        assert ac._failures["cli:test"][0] == 1
 
 
 # ---------------------------------------------------------------------------

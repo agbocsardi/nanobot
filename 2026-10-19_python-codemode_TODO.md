@@ -8,7 +8,7 @@
 - [x] Inspect Pi's codemode tests at the user's request; add focused Python equivalents.
 - [x] Document configuration, security boundary, and Python scripting API.
 - [x] Run existing targeted checks plus sandbox/runtime/context-size checks; measure latency.
-- [ ] Commit feature, integrate current `main`, and verify newer failure/retention behavior.
+- [x] Commit feature, integrate current `main`, and verify newer failure/retention behavior.
 - [ ] Push verified `main` and fast-forward the clean deployment checkout.
 
 ## Log
@@ -27,4 +27,6 @@
 - Final local startup benchmark: 20 fresh `return 1` calls, median 51.1 ms, p95 54.0 ms (min 50.1, max 75.2). This includes runner/bridge/worker startup, not external tool latency. No `uhl` benchmark or live LLM request was run.
 - Context benchmark: 500 synthetic MCP tools produce 1,842,890 direct schema characters; codemode stays at 1,564 characters, identical to its no-MCP baseline (no other built-ins in that synthetic registry).
 - Documentation: `docs/codemode.md`, linked from the configuration reference and docs index. Runtime remains opt-in; user's live config was not changed. Initial implementation was left uncommitted on `feat/python-codemode`.
-- User requested merge and deployment-checkout update. Confirmed the clean deployment checkout is `/home/gergo/nanobot`, and the installed `nanobot-ai` tool is editable from there. `main` advanced with retention/false-success/verification/invalid-argument changes while this branch was in progress; integration must preserve those semantics. No service restart or config change is planned.
+- User requested merge and deployment-checkout update. Confirmed the clean deployment checkout is `/home/gergo/nanobot`, and the installed `nanobot-ai` tool is editable from there. `main` advanced with retention/false-success/verification/invalid-argument changes while this branch was in progress. No service restart or config change is planned.
+- Committed the feature as `67609ba6f`, then integrated current `main` (`5af6fc661`). Resolved the runner conflict by retaining its four-value execution result and aligning nested targets with events. Child records preserve request order; caught/recovered errors no longer synthesize an unresolved outer failure. Nonzero command exits and ask-user control outcomes remain data/control signals, not Python exceptions.
+- Integration verification: recorded a fresh baseline on clean current `main`; all 1,011 existing targeted tests passed before and after integration (`scripts/test-delta.sh`: NEW 0 / FIXED 0 / KNOWN 0). All 47 codemode tests passed, including five new integration cases for invalid arguments, cross-tool recovery/target alignment, nonzero exits, and ask-user control. Touched-file ruff passed.
