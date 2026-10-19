@@ -15,7 +15,12 @@ from typing import Any, Awaitable, Callable
 
 from pydantic import Field
 
-from nanobot.agent.tools._codemode_sandbox import sandbox_command
+from nanobot.agent.tools._codemode_sandbox import (
+    DEFAULT_BWRAP_PATH,
+    sandbox_command,
+    validate_bwrap,
+    worker_exit_error,
+)
 from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
 from nanobot.agent.tools.context import ToolContext, current_request_session_key
 from nanobot.config_base import Base
@@ -42,6 +47,7 @@ _active_workers = 0
 
 class CodemodeConfig(Base):
     enable: bool = False
+    bwrap_path: str = Field(default=DEFAULT_BWRAP_PATH, description="Absolute Bubblewrap path; PATH is never searched")
     timeout_s: float = Field(default=60, ge=1, le=600)
     memory_mb: int = Field(default=256, ge=64, le=2048)
     max_output_chars: int = Field(default=16000, ge=1000, le=100000)
@@ -264,7 +270,8 @@ class CodemodeTool(Tool):
             return bytes(captured)
 
         try:
-            with sandbox_command() as (argv, seccomp_fd):
+            binary = await validate_bwrap(self.config.bwrap_path)
+            with sandbox_command(binary) as (argv, seccomp_fd):
                 proc = await asyncio.create_subprocess_exec(
                     *argv, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE, pass_fds=(seccomp_fd,),
@@ -317,10 +324,7 @@ class CodemodeTool(Tool):
                     raise ValueError("Unknown worker message")
             await proc.wait()
             stderr = (await stderr_task).decode(errors="replace").strip()
-            raise RuntimeError(
-                f"Sandbox worker exited without completing (exit {proc.returncode}): {stderr or 'no diagnostics'}. "
-                "Check Bubblewrap/user-namespace permissions, including AppArmor. No unsandboxed fallback was used."
-            )
+            raise worker_exit_error(binary, proc.returncode, stderr)
         finally:
             for task in tasks:
                 task.cancel()

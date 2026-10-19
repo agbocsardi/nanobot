@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -18,7 +17,11 @@ from mcp.types import Tool as MCPTool
 from nanobot.agent.hook import AgentHook
 from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.agent.tools import codemode
-from nanobot.agent.tools._codemode_sandbox import sandbox_command
+from nanobot.agent.tools._codemode_sandbox import (
+    DEFAULT_BWRAP_PATH,
+    sandbox_command,
+    validate_bwrap,
+)
 from nanobot.agent.tools.action_receipts import ActionReceiptStore
 from nanobot.agent.tools.approval import ApprovalStore
 from nanobot.agent.tools.base import Tool, ToolResult
@@ -77,10 +80,16 @@ def registry(tmp_path: Path):
 
 
 @pytest.fixture(scope="module")
-def sandbox_available():
-    if sys.platform != "linux" or shutil.which("bwrap") is None:
-        pytest.skip("Bubblewrap integration requires Linux and bwrap")
-    with sandbox_command() as (argv, fd):
+async def sandbox_available():
+    if sys.platform != "linux" or not Path(DEFAULT_BWRAP_PATH).is_file():
+        pytest.skip("Bubblewrap integration requires Linux and /usr/bin/bwrap")
+    try:
+        binary = await validate_bwrap(DEFAULT_BWRAP_PATH)
+    except RuntimeError as exc:
+        if "no user-namespace-authorized AppArmor profile" in str(exc):
+            pytest.skip(str(exc))
+        raise
+    with sandbox_command(binary) as (argv, fd):
         result = subprocess.run(
             argv, pass_fds=(fd,), input=json.dumps({"code": "return 1", "memory_mb": 256, "timeout_s": 3}),
             text=True, capture_output=True, timeout=5,
@@ -165,12 +174,25 @@ async def test_direct_registry_use_fails_closed(registry):
 
 async def test_missing_sandbox_never_runs_native(registry, monkeypatch):
     monkeypatch.setattr(sys, "platform", "linux")
-    monkeypatch.setattr(shutil, "which", lambda _: None)
+    registry.get("codemode").config.bwrap_path = "/nonexistent/nanobot-bwrap"
     spawn = AsyncMock()
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
     results, events, _ = await _execute(registry, "return 1")
-    assert "requires Bubblewrap" in results[0]
+    assert "Bubblewrap executable /nonexistent/nanobot-bwrap is unavailable" in results[0]
     assert events[0]["status"] != "success"
+    spawn.assert_not_awaited()
+    assert codemode._active_workers == 0
+
+
+@pytest.mark.parametrize("reason", ["no user-namespace-authorized AppArmor profile", "Unsupported Bubblewrap 0.8.0"])
+async def test_broken_binary_validation_never_starts_a_worker(registry, monkeypatch, reason):
+    validation = AsyncMock(side_effect=RuntimeError(reason))
+    spawn = AsyncMock()
+    monkeypatch.setattr(codemode, "validate_bwrap", validation)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    results, events, _ = await _execute(registry, "return 1")
+    assert reason in results[0] and events[0]["status"] != "success"
+    validation.assert_awaited_once_with(DEFAULT_BWRAP_PATH)
     spawn.assert_not_awaited()
     assert codemode._active_workers == 0
 
@@ -513,7 +535,7 @@ class TestSandbox:
         )))
         await asyncio.wait_for(started.wait(), 3)
         descendants = []
-        todo = [processes[0].pid]
+        todo = [processes[-1].pid]
         while todo:
             pid = todo.pop()
             children = Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
@@ -547,6 +569,28 @@ class TestSandbox:
         assert "early" in results[0] and cancelled.is_set()
         assert events[0]["status"] == "success" and events[1]["status"] == "partial"
         assert registry.receipt_store.get("outer/codemode/1").status == "unknown"
+
+    @pytest.mark.parametrize("exec_again", [False, True])
+    async def test_setup_capabilities_are_gone_before_user_code_and_cannot_return_on_exec(self, registry, exec_again):
+        state = (
+            '{key: value.strip() for key, value in '
+            '(line.split(":", 1) for line in Path("/proc/self/status").read_text().splitlines()) '
+            'if key in ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb", "NoNewPrivs")}'
+        )
+        if exec_again:
+            probe = (
+                f'from pathlib import Path; import json; state = {state}; '
+                'print(json.dumps({"type": "output", "text": json.dumps(state) + "\\n"})); '
+                'print(json.dumps({"type": "finished", "ok": True}))'
+            )
+            code = f'import os, sys\nos.execv(sys.executable, [sys.executable, "-I", "-S", "-c", {probe!r}])'
+        else:
+            code = f'from pathlib import Path\nreturn {state}'
+        results, events, _ = await _execute(registry, code)
+        assert events[0]["status"] == "success", results[0]
+        values = json.loads(results[0].splitlines()[-1])
+        assert len(values) == 6 and values["NoNewPrivs"] == "1"
+        assert all(int(value, 16) == 0 for key, value in values.items() if key.startswith("Cap"))
 
     async def test_host_files_environment_network_processes_and_root_writes_are_blocked(self, registry, monkeypatch):
         secret = registry.get("codemode").workspace / "secret.txt"

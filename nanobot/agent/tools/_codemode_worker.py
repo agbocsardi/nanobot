@@ -2,6 +2,8 @@
 
 import ast
 import asyncio
+import ctypes
+import errno
 import json
 import math
 import resource
@@ -128,7 +130,42 @@ async def _main(payload):
         transport.close()
 
 
+def _drop_setup_capabilities():
+    """Modern bwrap needs NET_ADMIN for lo; generated Python must retain none.
+
+    SETPCAP is used only by this trusted bootstrap to empty the bounding set.
+    Clearing bounding/permitted/effective/inheritable/ambient sets prevents
+    regaining setup privileges through exec, including when running as uid 0.
+    """
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+    libc.prctl.restype = ctypes.c_int
+    for cap in range(64):
+        if libc.prctl(24, cap, 0, 0, 0) != 0:  # PR_CAPBSET_DROP
+            error = ctypes.get_errno()
+            if error != errno.EINVAL:  # Capabilities beyond this kernel's last cap.
+                raise OSError(error, "Cannot drop sandbox setup capability bounding set")
+    if libc.prctl(47, 4, 0, 0, 0) != 0:  # PR_CAP_AMBIENT / CLEAR_ALL
+        raise OSError(ctypes.get_errno(), "Cannot clear sandbox ambient capabilities")
+    if libc.prctl(38, 1, 0, 0, 0) != 0:  # PR_SET_NO_NEW_PRIVS
+        raise OSError(ctypes.get_errno(), "Cannot set sandbox no_new_privs")
+
+    class Header(ctypes.Structure):
+        _fields_ = [("version", ctypes.c_uint32), ("pid", ctypes.c_int)]
+
+    class Data(ctypes.Structure):
+        _fields_ = [("effective", ctypes.c_uint32), ("permitted", ctypes.c_uint32), ("inheritable", ctypes.c_uint32)]
+
+    header = Header(0x20080522, 0)  # _LINUX_CAPABILITY_VERSION_3
+    data = (Data * 2)()
+    libc.capset.argtypes = [ctypes.POINTER(Header), ctypes.POINTER(Data)]
+    libc.capset.restype = ctypes.c_int
+    if libc.capset(ctypes.byref(header), data) != 0:
+        raise OSError(ctypes.get_errno(), "Cannot clear sandbox setup capabilities")
+
+
 if __name__ == "__main__":
+    _drop_setup_capabilities()
     # This first message is supplied only by the parent, before any generated code.
     config = json.loads(sys.stdin.buffer.readline())
     for kind, limit in (

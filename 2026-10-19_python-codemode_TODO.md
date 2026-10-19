@@ -11,9 +11,23 @@
 - [x] Commit feature, integrate current `main`, and verify newer failure/retention behavior.
 - [x] Push verified `main` and fast-forward the clean deployment checkout.
 
+## Sandbox binary follow-up
+
+- [x] Reproduce distro/linuxbrew behavior and capability requirements before editing.
+- [x] Add deterministic, configurable, validated binary selection and precise diagnostics.
+- [x] Support modern Bubblewrap setup while dropping all worker capabilities before user code.
+- [x] Add focused tests, run targeted checks, commit on `main`, and push (no deploy/restart).
+
 ## Log
 
 ### 2026-10-19
+
+- Follow-up defect: bare PATH selection can choose unprofiled linuxbrew 0.11.2 instead of profiled `/usr/bin/bwrap` 0.9.0. Reproduced distro sandbox success, linuxbrew RTM_NEWADDR denial, denied loopback ioctl without CAP_NET_ADMIN, and successful ioctl with it. Confirmed actual exec labels (`nanobot-bwrap (unconfined)` vs `unconfined`) using a pipe-paused `--args` version probe. User requires direct `main` changes, tests, commit/push only; no profile/package/deployment/service changes.
+- Follow-up fix: `tools.codemode.bwrapPath` defaults to `/usr/bin/bwrap`, never searches PATH, resolves symlinks, checks executability and Bubblewrap >= 0.9.0, and performs a bounded/cancellable probe of the actual exec AppArmor label via `/proc/<pid>/attr/apparmor/current`. Restricted hosts reject unconfined/uninspectable labels before namespace setup; errors identify the selected canonical binary, version, and actual policy/setup stage rather than blaming every exit on AppArmor.
+- Modern setup now retains CAP_NET_ADMIN for loopback initialization and CAP_SETPCAP only for trusted bootstrap. Before generated code is compiled, the worker empties bounding/permitted/effective/inheritable/ambient capabilities and enforces no_new_privs. Real worker tests verify all sets remain empty after exec. Existing private namespaces/seccomp/resource limits are retained; startup failures never run unsandboxed.
+- Real follow-up probes: with linuxbrew first in PATH, default codemode still uses profiled `/usr/bin/bwrap` and completes. Explicit unprofiled linuxbrew 0.11.2 now fails early with its exact path/version/unconfined label. The same modern binary succeeds under the existing `nanobot-bwrap` profile using a process-local `aa-exec -p nanobot-bwrap` probe; all five capability sets are zero and no_new_privs=1. Each profiled runtime probe took about 56 ms. This does NOT authorize the ordinary unprofiled linuxbrew invocation or modify the profile.
+- Follow-up verification: touched-file ruff and `git diff --check` pass. Final targeted run: **1,086 passed, 1 pre-existing audioop deprecation warning, 37.30s**. Exact command: `scripts/run-tests.sh tests/tools tests/security tests/agent/tools/test_codemode.py tests/agent/tools/test_codemode_sandbox.py tests/agent/test_runner*.py tests/agent/test_mcp*.py tests/agent/tools/test_action_receipts.py tests/config tests/test_tool_contextvars.py tests/agent/test_subagent*.py tests/agent/tools/test_subagent_tools.py -q`.
+- Remaining boundary: executable/runtime files remain trusted dependencies, not cryptographically authenticated or pinned across probe/exec; AppArmor/outer container policy may still deny required setup operations, now reported precisely. A chosen alternative still needs an authorized profile on restricted Ubuntu. No live configuration, deployment checkout, gateway process, system package, or AppArmor profile was changed for this fix.
 
 - User approved Python codemode on a new branch. Primary goal: keep MCP schemas out of the model context, discovering tools on demand.
 - Plan: opt-in codemode, normal built-ins stay declared, MCP tools remain registered but are omitted from model definitions. Fresh Bubblewrap worker per script; parent owns tools and policies. No unsandboxed fallback.

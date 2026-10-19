@@ -7,7 +7,7 @@ their names/descriptions/schemas are **not** in the codemode tool description.
 
 ## Enable
 
-Requires Linux, Python 3.11+, Bubblewrap, and libseccomp. On Debian/Ubuntu:
+Requires Linux, Python 3.11+, Bubblewrap **0.9.0 or newer**, and libseccomp. On Debian/Ubuntu:
 
 ```bash
 sudo apt-get install bubblewrap libseccomp2
@@ -19,7 +19,8 @@ Merge this into `~/.nanobot/config.json`, then restart Nanobot:
 {
   "tools": {
     "codemode": {
-      "enable": true
+      "enable": true,
+      "bwrapPath": "/usr/bin/bwrap"
     }
   }
 }
@@ -30,6 +31,30 @@ schemas. There is no unsandboxed fallback: if the sandbox cannot start, codemode
 returns an error and does not execute generated Python on the host. Enabling it
 on an unsupported machine therefore leaves deferred MCP tools unavailable until
 the sandbox is fixed or codemode is disabled.
+
+### Binary selection and validation
+
+`bwrapPath` defaults to `/usr/bin/bwrap` and must be absolute. PATH is **never**
+searched, so login-shell/Linuxbrew PATH changes cannot silently change the sandbox.
+Other installations require an explicit override. Symlinks are resolved to the
+actual executable; diagnostics name that resolved path and its version.
+
+Before launching each worker, a bounded, cancellable `--args`/`--version` probe
+checks the executable, minimum version, and actual kernel AppArmor exec label.
+On hosts with `apparmor_restrict_unprivileged_userns=1`, an unconfined binary is
+rejected before namespace setup, with instructions to select/authorize the exact
+binary. An existing profile for `/usr/bin/bwrap` does **not** cover an unprofiled
+Linuxbrew binary. Neither profiles nor packages are changed automatically.
+
+A named label is not proof that every setup operation is allowed: AppArmor and
+outer container policy can still deny namespace/capability operations. Those
+failures report the selected path, version, active label, and failed setup stage;
+resource/signal exits are not automatically blamed on AppArmor. If the kernel
+policy label cannot be inspected on a restricted host, validation fails closed.
+
+The configured executable/runtime must be trusted. These checks are not binary
+signature verification, and replacement or policy changes between the probe and
+launch are not pinned/locked; the real launch can still fail closed afterward.
 
 ### Ubuntu blocks user namespaces
 
@@ -143,8 +168,13 @@ artifact mechanism, with a bounded preview and file reference.
   state, installed packages, or writable files survive to another script.
 - The worker sees read-only system/Python runtime files and its worker module,
   not the workspace, home contents, config, credentials, or host sockets. Its
-  environment is replaced, its network/PID/user/IPC/UTS namespaces are isolated,
-  and capabilities are dropped. A 16 MiB private `/tmp` is the only writable tree.
+  environment is replaced and its network/PID/user/IPC/UTS namespaces are isolated.
+  Bubblewrap setup temporarily retains `CAP_NET_ADMIN` for modern versions' loopback
+  initialization and `CAP_SETPCAP` so the trusted worker bootstrap can drop the
+  entire bounding set. Before compiling generated code, all bounding, permitted,
+  effective, inheritable, and ambient capabilities are cleared, with `no_new_privs`
+  enforced. They cannot return through exec. Failure to drop them aborts startup.
+  A 16 MiB private `/tmp` is the only writable tree.
 - Seccomp denies new processes/threads and sensitive kernel operations. Hard
   process limits cap address space, CPU, file size, and open descriptors. This
   prevents forking around the per-process memory limit. This is a shared-kernel
@@ -188,6 +218,7 @@ JSON uses camelCase aliases; snake_case is also accepted.
 | `tools.codemode` field | Default | Meaning |
 | --- | --- | --- |
 | `enable` | `false` | Enable codemode and defer MCP schemas |
+| `bwrapPath` | `/usr/bin/bwrap` | Explicit absolute Bubblewrap executable; never resolved from PATH |
 | `timeoutS` | `60` | Whole-script deadline, including startup/tool waits (1–600s) |
 | `memoryMb` | `256` | Worker address-space limit (64–2048 MiB) |
 | `maxOutputChars` | `16000` | Emitted output threshold for artifact offloading |
@@ -213,3 +244,6 @@ scripts/run-tests.sh tests/agent/tools/test_codemode.py -q
 
 The real sandbox checks skip on unsupported hosts or when OS policy blocks user
 namespaces. Pure discovery/config/fail-closed checks do not require Bubblewrap.
+Binary/version/profile/argv validation has focused coverage in
+`tests/agent/tools/test_codemode_sandbox.py`; the real-worker tests check that no
+setup capabilities remain, including after an exec.
