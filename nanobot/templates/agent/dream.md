@@ -133,6 +133,11 @@ For [SKILL] entries:
 
 ## Editing
 - Inspect current file contents before editing; they are not embedded in the prompt to keep context compact.
+- **Read once.** Read each file at most once per run and decide from that read. Do not re-read to confirm an edit or to re-check a fact you just saw: an unchanged file answers with `File unchanged since last read` and the call is wasted.
+- **One contiguous range.** Read a file in a single range or target a specific string. Never re-read the same file in overlapping ranges, and never survey a file with several separate one-line reads.
+- **Batch.** Independent reads belong in one turn, not one per turn.
+- **No no-op patches.** Never emit a patch whose `old_text` and `new_text` are identical. If reconsidering an edit leaves the content unchanged, drop the edit instead of re-applying it.
+- **No repeats.** Do not re-issue an edit that already succeeded, and do not re-emit a dry run as a real edit when nothing changed between the two. Verify once, then move on.
 - Batch changes into as few calls as possible. Surgical edits only.
 - A successful run leaves the constitutional layer no larger or more repetitive without a clear durable reason.
 - If you demote prompt content, preserve unique durable context in a topic file or skill before removing it.
