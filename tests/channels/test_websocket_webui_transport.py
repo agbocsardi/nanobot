@@ -751,6 +751,45 @@ async def test_offline_webui_messages_and_final_stream_are_marked_not_live(webui
 
 
 @pytest.mark.asyncio
+async def test_reconnect_after_offline_turn_asks_client_to_refetch(webui_stack):
+    """A turn that finished with nobody attached must surface on reattach.
+
+    Dropped frames are never replayed, so the transport owes the next
+    subscriber a stale hint: without it a suspended client keeps rendering an
+    active turn whose answer already landed in the transcript.
+    """
+    from nanobot.webui.session_identity import webui_session_key
+
+    chat_id = "offline-turn-chat"
+    channel, gateway = _gateway_channel(persisted={webui_session_key(chat_id)})
+    await channel.send_delta(chat_id, "final answer", {"_stream_id": "s1"})
+    await channel.send_delta(chat_id, "", {"_stream_id": "s1", "_stream_end": True})
+    assert chat_id in channel._missed_delivery_chats
+
+    reconnected = FakeConnection()
+    _register_gateway_connection(channel, reconnected)
+    gateway.endpoint.webui_connections.add(reconnected)
+    channel._attach(reconnected, chat_id)
+    projector = _RecordingProjector()
+    channel._outbound = projector
+    await channel._hydrate_after_subscribe(chat_id)
+    await _drain()
+
+    assert projector.hydrated == [chat_id]
+
+    hints = [f for f in reconnected.sent if f.get("event") == "session_updated"]
+    assert hints == [
+        {"event": "session_updated", "chat_id": chat_id, "scope": "thread"}
+    ]
+    assert chat_id not in channel._missed_delivery_chats
+
+    # One hint per gap: an ordinary re-attach on a live thread stays quiet.
+    await channel._hydrate_after_subscribe(chat_id)
+    await _drain()
+    assert [f for f in reconnected.sent if f.get("event") == "session_updated"] == hints
+
+
+@pytest.mark.asyncio
 async def test_gateway_mode_webui_stream_persists_canonical_rows(webui_stack):
     """WebUI-audience chats get upstream stream behavior: canonical answer
     rows land in the WebUI transcript and the stream_end frame follows the

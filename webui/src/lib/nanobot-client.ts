@@ -234,6 +234,8 @@ export class NanobotClient {
   private sendQueue: Outbound[] = [];
   private reconnectAttempts = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Pending liveness probe: cleared by any ``attached`` frame. */
+  private attachProbeTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly shouldReconnect: boolean;
   private readonly maxBackoffMs: number;
   private maxFrameBytes: number | undefined;
@@ -1010,6 +1012,53 @@ export class NanobotClient {
     }
   }
 
+  /**
+   * Check that the connection is actually alive, not just ``readyState`` open.
+   *
+   * A suspended page (iOS PWA backgrounded for a while) resumes holding a
+   * socket the browser still calls OPEN while the peer is long gone. Nothing
+   * fires ``close``, so no status change triggers the reconnect + canonical
+   * refresh, and a turn that finished meanwhile looks stuck forever. Reading
+   * anything back from the server is the only reliable tell: the probe
+   * re-attaches and expects an ``attached`` frame, otherwise it drops the
+   * socket and lets the normal reconnect path recover.
+   */
+  probeLiveness(timeoutMs: number = 5_000): void {
+    if (this.intentionallyClosed || !this.shouldReconnect) return;
+    const socket = this.socket;
+    if (socket === null || socket.readyState !== WS_OPEN) {
+      if (this.status_ === "idle" || this.reconnectTimer !== null) return;
+      this.handleClose({});
+      return;
+    }
+    if (this.attachProbeTimer !== null) return;
+    const chatId = this.readyChatId ?? [...this.knownChats][0] ?? null;
+    if (chatId === null) return;
+    this.attachProbeTimer = setTimeout(() => {
+      this.attachProbeTimer = null;
+      const dead = this.socket;
+      if (dead !== null && dead.readyState === WS_OPEN) {
+        try {
+          dead.close();
+        } catch {
+          // Already dead; the reconnect below is what matters.
+        }
+      }
+      this.handleClose({});
+    }, timeoutMs);
+    try {
+      socket.send(JSON.stringify({ type: "attach", chat_id: chatId }));
+    } catch {
+      // A throwing send proves the socket is dead; the probe timer recovers it.
+    }
+  }
+
+  private clearAttachProbe(): void {
+    if (this.attachProbeTimer === null) return;
+    clearTimeout(this.attachProbeTimer);
+    this.attachProbeTimer = null;
+  }
+
   sendMessage(
     chatId: string,
     content: string,
@@ -1243,6 +1292,7 @@ export class NanobotClient {
     }
 
     if (parsed.event === "attached") {
+      this.clearAttachProbe();
       if (parsed.temporary === true) {
         this.temporaryChatIds.add(parsed.chat_id);
       } else {
@@ -1371,6 +1421,7 @@ export class NanobotClient {
 
   private handleClose(event?: { code?: number }): void {
     this.socket = null;
+    this.clearAttachProbe();
     this.clearTemporaryChats();
     const willReconnect = !this.intentionallyClosed && this.shouldReconnect;
     if (this.pendingNewChat) {
