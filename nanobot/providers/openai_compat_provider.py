@@ -94,6 +94,12 @@ _MODEL_THINKING_STYLES: dict[str, str] = {
     **dict.fromkeys(_KIMI_THINKING_MODELS, "thinking_type"),
     **dict.fromkeys(_MIMO_THINKING_MODELS, "thinking_type"),
 }
+# Model-id markers for checkpoints that always reason, so a history turn
+# without reasoning_content is rejected rather than treated as non-thinking.
+_NATIVE_REASONING_MODEL_MARKERS: tuple[str, ...] = (
+    "deepseek-v4",
+    "deepseek-reasoner",
+)
 
 
 def _model_slug(model_name: str) -> str:
@@ -114,6 +120,17 @@ def _requires_max_completion_tokens(model_name: str) -> bool:
 
 def _model_thinking_style(model_name: str) -> str:
     return _MODEL_THINKING_STYLES.get(_model_slug(model_name), "")
+
+
+def _model_reasons_natively(model_name: str) -> bool:
+    """True for models that always think, so history must carry reasoning_content.
+
+    Matched on the model id rather than the provider: the same checkpoints are
+    served by direct APIs and by gateways, and every one of them enforces
+    DeepSeek's "thinking history must be passed back" rule.
+    """
+    slug = _model_slug(model_name)
+    return any(marker in slug for marker in _NATIVE_REASONING_MODEL_MARKERS)
 
 
 def _thinking_styles_for(spec: ProviderSpec | None, model_name: str) -> list[str]:
@@ -734,8 +751,11 @@ class OpenAICompatProvider(LLMProvider):
 
         # Backfill reasoning_content="" on assistants missing it: DeepSeek
         # thinking mode rejects history otherwise (#3554, #3584); "" reads
-        # as "no thinking that turn". DeepSeek-V4/reasoner reason natively,
-        # so backfill even without explicit reasoning_effort.
+        # as "no thinking that turn". The trigger keys off the model, not the
+        # provider name: gateways (opencode_go, umans, OpenRouter, ...) serve
+        # the same DeepSeek checkpoints and enforce the same rule, so a
+        # provider-name match leaves them rejected. DeepSeek-V4/reasoner
+        # reason natively, so backfill even without explicit reasoning_effort.
         explicit_thinking = (
             reasoning_effort is not None
             and semantic_effort not in ("none", "minimal")
@@ -745,10 +765,8 @@ class OpenAICompatProvider(LLMProvider):
             )
         )
         implicit_deepseek_thinking = (
-            spec is not None
-            and spec.name == "deepseek"
-            and semantic_effort not in ("none", "minimal", "minimum")
-            and any(t in model_name.lower() for t in ("deepseek-v4", "deepseek-reasoner"))
+            semantic_effort not in ("none", "minimal", "minimum")
+            and _model_reasons_natively(model_name)
         )
         if explicit_thinking or implicit_deepseek_thinking:
             for msg in kwargs["messages"]:

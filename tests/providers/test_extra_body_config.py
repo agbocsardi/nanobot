@@ -267,6 +267,108 @@ class TestBuildResponsesBodyExtraBody:
 
 
 # ---------------------------------------------------------------------------
+# DeepSeek thinking history backfill
+# ---------------------------------------------------------------------------
+
+
+def _assistant_history() -> list[dict[str, Any]]:
+    return [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
+        {"role": "user", "content": "again"},
+    ]
+
+
+class TestReasoningContentBackfill:
+    """DeepSeek thinking checkpoints reject history missing reasoning_content.
+
+    The rule follows the model, not the provider: gateways serve the same
+    checkpoints and enforce the same rejection, so detection must not depend
+    on the provider being literally named "deepseek".
+    """
+
+    def test_gateway_served_deepseek_gets_backfill(self) -> None:
+        provider = OpenAICompatProvider(
+            api_key="test-key",
+            default_model="deepseek-v4.1-flash",
+            spec=find_by_name("opencode_go"),
+        )
+        kwargs = provider._build_kwargs(
+            messages=_assistant_history(),
+            tools=None, model=None, max_tokens=100,
+            temperature=0.1, reasoning_effort="high", tool_choice=None,
+        )
+        assert kwargs["messages"][1]["reasoning_content"] == ""
+
+    def test_backfill_applies_without_explicit_reasoning_effort(self) -> None:
+        provider = OpenAICompatProvider(
+            api_key="test-key",
+            default_model="deepseek-v4.1-flash",
+            spec=find_by_name("opencode_go"),
+        )
+        kwargs = provider._build_kwargs(
+            messages=_assistant_history(),
+            tools=None, model=None, max_tokens=100,
+            temperature=0.1, reasoning_effort=None, tool_choice=None,
+        )
+        assert kwargs["messages"][1]["reasoning_content"] == ""
+
+    def test_reasoner_slug_without_provider_prefix(self) -> None:
+        provider = OpenAICompatProvider(
+            api_key="test-key",
+            default_model="deepseek-reasoner",
+            spec=find_by_name("umans"),
+        )
+        kwargs = provider._build_kwargs(
+            messages=_assistant_history(),
+            tools=None, model=None, max_tokens=100,
+            temperature=0.1, reasoning_effort="medium", tool_choice=None,
+        )
+        assert kwargs["messages"][1]["reasoning_content"] == ""
+
+    def test_existing_reasoning_content_is_preserved(self) -> None:
+        provider = OpenAICompatProvider(
+            api_key="test-key",
+            default_model="deepseek-v4.1-flash",
+            spec=find_by_name("opencode_go"),
+        )
+        messages = _assistant_history()
+        messages[1]["reasoning_content"] = "step by step"
+        kwargs = provider._build_kwargs(
+            messages=messages,
+            tools=None, model=None, max_tokens=100,
+            temperature=0.1, reasoning_effort="high", tool_choice=None,
+        )
+        assert kwargs["messages"][1]["reasoning_content"] == "step by step"
+
+    def test_non_deepseek_model_is_untouched(self) -> None:
+        provider = OpenAICompatProvider(
+            api_key="test-key",
+            default_model="gpt-4.1",
+            spec=find_by_name("openai"),
+        )
+        kwargs = provider._build_kwargs(
+            messages=_assistant_history(),
+            tools=None, model=None, max_tokens=100,
+            temperature=0.1, reasoning_effort="high", tool_choice=None,
+        )
+        assert "reasoning_content" not in kwargs["messages"][1]
+
+    def test_thinking_disabled_skips_backfill(self) -> None:
+        provider = OpenAICompatProvider(
+            api_key="test-key",
+            default_model="deepseek-v4.1-flash",
+            spec=find_by_name("opencode_go"),
+        )
+        kwargs = provider._build_kwargs(
+            messages=_assistant_history(),
+            tools=None, model=None, max_tokens=100,
+            temperature=0.1, reasoning_effort="none", tool_choice=None,
+        )
+        assert "reasoning_content" not in kwargs["messages"][1]
+
+
+# ---------------------------------------------------------------------------
 # Schema validation
 # ---------------------------------------------------------------------------
 
