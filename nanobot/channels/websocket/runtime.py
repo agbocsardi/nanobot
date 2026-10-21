@@ -452,6 +452,10 @@ class WebSocketChannel(BaseChannel):
         self._connection_outbound: dict[Any, _ConnectionOutbound] = {}
         self._outbound_retire_tasks: set[asyncio.Task[None]] = set()
         self._retired_connections: WeakSet[Any] = WeakSet()
+        # WebUI chats that lost a persisted event because nobody was attached.
+        # The wire has no frame replay, so the recovery signal is a stale hint
+        # sent to the next subscriber (see ``_flush_stale_thread_hint``).
+        self._missed_delivery_chats: dict[str, None] = {}
         if gateway is not None:
             self._init_webui(gateway)
 
@@ -689,6 +693,36 @@ class WebSocketChannel(BaseChannel):
         if self.gateway is None:
             return
         await self._outbound.hydrate(chat_id)
+        await self._flush_stale_thread_hint(chat_id)
+
+    def note_unattached_delivery(self, chat_id: str) -> None:
+        """Remember that a persisted WebUI event reached no subscriber.
+
+        Nothing replays dropped frames on attach, so a client that was away
+        (suspended PWA, dropped socket) would otherwise never learn that the
+        turn it started has finished. The next subscriber gets a
+        ``session_updated`` hint and refetches the canonical transcript.
+        """
+        self._missed_delivery_chats.pop(chat_id, None)
+        self._missed_delivery_chats[chat_id] = None
+        while len(self._missed_delivery_chats) > 512:
+            self._missed_delivery_chats.pop(next(iter(self._missed_delivery_chats)))
+
+    async def _flush_stale_thread_hint(self, chat_id: str) -> None:
+        """Tell a chat's new subscribers that events were missed while away."""
+        if chat_id not in self._missed_delivery_chats:
+            return
+        self._missed_delivery_chats.pop(chat_id, None)
+        conns = self.webui_subscribers(chat_id)
+        if not conns:
+            self.note_unattached_delivery(chat_id)
+            return
+        raw = json.dumps(
+            {"event": "session_updated", "chat_id": chat_id, "scope": "thread"},
+            ensure_ascii=False,
+        )
+        for connection in conns:
+            await self._safe_send_to(connection, raw, label=" session_updated ")
 
     async def _send_event(self, connection: Any, event: str, **fields: Any) -> None:
         """Send a control event (attached, error, ...) to a single connection."""
@@ -1609,6 +1643,7 @@ class WebSocketChannel(BaseChannel):
             # must never touch legacy chats sharing the gateway listener.
             if not conns:
                 payload["delivery_status"] = "no_subscriber"
+                self.note_unattached_delivery(msg.chat_id)
             self._enrich_and_persist_message(msg, payload)
         raw = json.dumps(payload, ensure_ascii=False)
         if not conns:
@@ -1718,6 +1753,7 @@ class WebSocketChannel(BaseChannel):
             body["merge_next"] = True
         if stream_end and webui_chat and not conns:
             body["delivery_status"] = "no_subscriber"
+            self.note_unattached_delivery(chat_id)
         if webui_chat:
             self._persist_turn_stream_event(
                 chat_id,
@@ -1883,6 +1919,7 @@ class WebSocketChannel(BaseChannel):
         phase = "activity" if payload.get("kind") in ("tool_hint", "progress") else "answer"
         if not conns:
             payload["delivery_status"] = "no_subscriber"
+            self.note_unattached_delivery(msg.chat_id)
         self._persist_turn_transcript_event(
             msg.chat_id,
             payload,

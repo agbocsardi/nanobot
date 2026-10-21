@@ -2,6 +2,7 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useRef,
   type ReactNode,
@@ -36,6 +37,25 @@ export function ClientProvider({
   const tokenRef = useRef(token);
   tokenRef.current = token;
   const getToken = useCallback(() => tokenRef.current, []);
+
+  // Resuming a backgrounded page is the moment a dead socket has to be caught:
+  // the browser may keep reporting it OPEN after the peer is gone, so nothing
+  // else would ever trigger the reconnect that recovers a missed turn.
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    const revive = () => {
+      if (document.visibilityState === "hidden") return;
+      // Hosts may supply a partial client double; probing is best-effort.
+      if (typeof client.probeLiveness === "function") client.probeLiveness();
+    };
+    document.addEventListener("visibilitychange", revive);
+    window.addEventListener("online", revive);
+    return () => {
+      document.removeEventListener("visibilitychange", revive);
+      window.removeEventListener("online", revive);
+    };
+  }, [client]);
+
   const value = useMemo(
     () => ({ client, token, getToken, modelName, ingressLimits }),
     [client, getToken, ingressLimits, modelName, token],

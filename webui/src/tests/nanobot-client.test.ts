@@ -256,6 +256,64 @@ describe("NanobotClient", () => {
     });
   });
 
+  it("drops a socket the browser still reports open when the probe goes unanswered", async () => {
+    // iOS keeps a backgrounded PWA's socket OPEN after the peer is gone; the
+    // probe is the only way to notice, and missing it strands the turn.
+    const client = new NanobotClient({
+      url: "ws://test",
+      reconnect: true,
+      maxBackoffMs: 10,
+      socketFactory: (url) => new FakeSocket(url) as unknown as WebSocket,
+    });
+    const statuses: string[] = [];
+    client.onStatus((status) => statuses.push(status));
+    client.connect();
+    const zombie = lastSocket();
+    zombie.fakeOpen();
+    client.attach("chat-zombie");
+    zombie.sent.length = 0;
+
+    client.probeLiveness(1_000);
+    expect(JSON.parse(zombie.sent[0])).toEqual({ type: "attach", chat_id: "chat-zombie" });
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(zombie.readyState).toBe(FakeSocket.CLOSED);
+    expect(statuses).toContain("reconnecting");
+
+    await vi.advanceTimersByTimeAsync(20);
+    const revived = lastSocket();
+    revived.fakeOpen();
+    expect(revived).not.toBe(zombie);
+    // Recovery re-attaches so the stale-thread hint can reach this client.
+    expect(revived.sent.map((frame) => JSON.parse(frame))).toContainEqual({
+      type: "attach",
+      chat_id: "chat-zombie",
+    });
+    client.close();
+  });
+
+  it("keeps a live socket when the probe is answered", async () => {
+    const client = new NanobotClient({
+      url: "ws://test",
+      reconnect: true,
+      maxBackoffMs: 10,
+      socketFactory: (url) => new FakeSocket(url) as unknown as WebSocket,
+    });
+    client.connect();
+    const socket = lastSocket();
+    socket.fakeOpen();
+    client.attach("chat-live");
+
+    client.probeLiveness(1_000);
+    socket.fakeMessage({ event: "attached", chat_id: "chat-live" });
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(socket.readyState).toBe(FakeSocket.OPEN);
+    expect(FakeSocket.instances).toHaveLength(1);
+    expect(client.status).toBe("open");
+    client.close();
+  });
+
   it("replays the exact serialized mutation frame after reconnect", async () => {
     const client = new NanobotClient({
       url: "ws://test",
