@@ -61,6 +61,10 @@ class EmailConfig(Base):
     max_body_chars: int = 12000
     subject_prefix: str = "Re: "
     allow_from: list[str] = Field(default_factory=list)
+    # A progress message is a separate mail, not an edit: the agent's text that
+    # precedes a tool call would arrive as its own email and the real answer as a
+    # second one. Keep text progress off by default; opt in with ``send_progress``.
+    send_progress: bool = False
 
     # Email authentication verification (anti-spoofing)
     verify_dkim: bool = True   # Require Authentication-Results with dkim=pass

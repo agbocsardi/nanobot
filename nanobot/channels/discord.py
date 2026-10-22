@@ -108,6 +108,13 @@ class DiscordConfig(Base):
     working_emoji: str = "🔧"
     working_emoji_delay: float = 2.0
     streaming: bool = True
+    # Discord has no ephemeral progress affordance: a "progress" message is an
+    # ordinary chat message that stays in the transcript. The agent emits the
+    # model's text that precedes a tool call as progress, so leaving this on
+    # posts that commentary as its own message and the final answer then repeats
+    # it — a visible double reply whenever streaming is off. Tool-call hints stay
+    # separately opt-in via ``send_tool_hints``.
+    send_progress: bool = False
     proxy: str | None = None
     proxy_username: str | None = None
     proxy_password: str | None = None

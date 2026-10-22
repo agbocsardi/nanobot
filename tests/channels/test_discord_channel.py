@@ -734,6 +734,19 @@ def test_supports_streaming_enabled_by_default() -> None:
     assert channel.supports_streaming is True
 
 
+def test_config_disables_text_progress_by_default() -> None:
+    """Pre-tool commentary must not land as a second chat message (double reply)."""
+    config = DiscordConfig(enabled=True, allow_from=["*"])
+
+    assert config.send_progress is False
+
+
+def test_config_allows_text_progress_opt_in() -> None:
+    config = DiscordConfig(enabled=True, allow_from=["*"], send_progress=True)
+
+    assert config.send_progress is True
+
+
 @pytest.mark.asyncio
 async def test_send_delta_streams_by_editing_message(monkeypatch) -> None:
     owner = DiscordChannel(DiscordConfig(enabled=True, allow_from=["*"]), MessageBus())
