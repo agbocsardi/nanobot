@@ -1638,3 +1638,131 @@ def test_channel_runtime_line_reaches_the_context_builder(tmp_path) -> None:
 
     assert "Discord guild roster: member-a (@handle-a, id=1)" in lines
     assert runtime_lines(state, SimpleNamespace(content="hello", metadata={}), tmp_path) == []
+
+
+@pytest.mark.asyncio
+async def test_reply_pulls_in_attachments_from_the_quoted_message(tmp_path, monkeypatch) -> None:
+    # A reply carries no attachments of its own, so a quoted image must be
+    # fetched from the referenced message or the bot cannot see it at all.
+    channel = _open_channel()
+    handled: list[dict] = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle  # type: ignore[method-assign]
+    monkeypatch.setattr("nanobot.channels.discord.get_media_dir", lambda _name: tmp_path)
+
+    quoted = SimpleNamespace(
+        author=SimpleNamespace(id=321, display_name="member-b", name="handle-b"),
+        attachments=[_FakeAttachment(77, "quoted.png")],
+    )
+    message = _make_message(
+        author_display_name="member-a",
+        author_name="handle-a",
+        guild_id=GUILD_ID,
+        content="what is this?",
+        reply_to=900,
+    )
+    # Resolved through the client cache: no extra fetch needed.
+    message.reference.resolved = quoted
+
+    await channel._on_message(message)
+
+    assert handled[0]["content"] == (
+        "[member-a]: what is this?\n"
+        "[from replied message by member-b] [attachment: 77_quoted.png]"
+    )
+    assert handled[0]["media"] == [str(tmp_path / "77_quoted.png")]
+
+
+@pytest.mark.asyncio
+async def test_reply_fetches_the_quoted_message_when_not_cached(tmp_path, monkeypatch) -> None:
+    channel = _open_channel()
+    handled: list[dict] = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle  # type: ignore[method-assign]
+    monkeypatch.setattr("nanobot.channels.discord.get_media_dir", lambda _name: tmp_path)
+
+    quoted = SimpleNamespace(
+        author=SimpleNamespace(id=321, display_name="member-b", name="handle-b"),
+        attachments=[_FakeAttachment(88, "fetched.png")],
+    )
+    fetched: list[int] = []
+
+    async def _fetch(message_id: int):
+        fetched.append(message_id)
+        return quoted
+
+    message = _make_message(
+        author_display_name="member-a",
+        guild_id=GUILD_ID,
+        content="look",
+        reply_to=901,
+    )
+    message.reference.resolved = None
+    message.channel.fetch_message = _fetch
+
+    await channel._on_message(message)
+
+    assert fetched == [901]
+    assert "[from replied message by member-b] [attachment: 88_fetched.png]" in handled[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_reply_without_quoted_attachments_adds_nothing(tmp_path, monkeypatch) -> None:
+    channel = _open_channel()
+    handled: list[dict] = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle  # type: ignore[method-assign]
+    monkeypatch.setattr("nanobot.channels.discord.get_media_dir", lambda _name: tmp_path)
+
+    message = _make_message(
+        author_display_name="member-a",
+        guild_id=GUILD_ID,
+        content="just text",
+        reply_to=902,
+    )
+    message.reference.resolved = SimpleNamespace(
+        author=SimpleNamespace(id=321, display_name="member-b", name="handle-b"),
+        attachments=[],
+    )
+
+    await channel._on_message(message)
+
+    assert handled[0]["content"] == "[member-a]: just text"
+    assert not handled[0].get("media")
+
+
+@pytest.mark.asyncio
+async def test_failed_quote_fetch_is_not_fatal(tmp_path, monkeypatch) -> None:
+    channel = _open_channel()
+    handled: list[dict] = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle  # type: ignore[method-assign]
+    monkeypatch.setattr("nanobot.channels.discord.get_media_dir", lambda _name: tmp_path)
+
+    async def _fetch(_message_id: int):
+        raise RuntimeError("gone")
+
+    message = _make_message(
+        author_display_name="member-a",
+        guild_id=GUILD_ID,
+        content="still works",
+        reply_to=903,
+    )
+    message.reference.resolved = None
+    message.channel.fetch_message = _fetch
+
+    await channel._on_message(message)
+
+    assert handled[0]["content"] == "[member-a]: still works"

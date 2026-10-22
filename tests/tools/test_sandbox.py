@@ -18,7 +18,9 @@ class TestBwrapBackend:
         result = wrap_command("bwrap", "echo hi", ws, ws)
         tokens = _parse(result)
 
-        assert tokens[0] == "bwrap"
+        # A pinned distro path is preferred over whatever PATH resolves, so an
+        # unprofiled build cannot shadow the one the AppArmor profile covers.
+        assert tokens[0].endswith("bwrap")
         assert "--new-session" in tokens
         assert "--die-with-parent" in tokens
         assert "--ro-bind" in tokens
@@ -130,3 +132,25 @@ class TestUnknownBackend:
         ws = str(tmp_path / "project")
         with pytest.raises(ValueError):
             wrap_command("", "ls", ws, ws)
+
+
+def test_bwrap_binary_prefers_the_distro_path(monkeypatch):
+    """The distro binary is the one an AppArmor profile can cover.
+
+    A second, unprofiled build earlier on PATH fails with "setting up uid map:
+    Permission denied", which looks like a kernel restriction but is really
+    binary identity, so PATH order must not decide this.
+    """
+    from nanobot.agent.tools import sandbox as sandbox_module
+
+    monkeypatch.setattr(sandbox_module.Path, "is_file", lambda self: str(self) == "/usr/bin/bwrap")
+    monkeypatch.setattr(sandbox_module.shutil, "which", lambda name: "/opt/other/bwrap")
+    assert sandbox_module._resolve_bwrap() == "/usr/bin/bwrap"
+
+
+def test_bwrap_binary_falls_back_to_path_when_distro_path_is_missing(monkeypatch):
+    from nanobot.agent.tools import sandbox as sandbox_module
+
+    monkeypatch.setattr(sandbox_module.Path, "is_file", lambda self: False)
+    monkeypatch.setattr(sandbox_module.shutil, "which", lambda name: "/opt/other/bwrap")
+    assert sandbox_module._resolve_bwrap() == "/opt/other/bwrap"

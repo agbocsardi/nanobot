@@ -16,6 +16,7 @@ from nanobot.agent.tools.context import ToolContext  # noqa: E402
 from nanobot.agent.tools.discord_history import (  # noqa: E402
     DiscordHistoryTool,
     DiscordRuntimeHandle,
+    _parse_iso,
 )
 from nanobot.agent.tools.loader import ToolLoader  # noqa: E402
 from nanobot.bus.queue import MessageBus  # noqa: E402
@@ -699,3 +700,107 @@ def test_is_channel_allowed_empty_allowlist_allows_all():
     ch = DiscordChannel(DiscordConfig(), MessageBus())
     src = SimpleNamespace(id=999, parent_id=None, parent=None)
     assert ch.is_channel_allowed(src) is True
+
+
+# ---------------------------------------------------------------------------
+# Channel-name selection and relative time windows
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_channel_name_resolves_and_fetches():
+    tc = _make_text(10, "general", guild=None)
+    guild = _make_guild(text_channels=[tc])
+    tc.guild = guild
+    tc.history = _history_factory([_make_msg(5, "hello", channel=tc)])
+    tool, _ = _make_setup(guilds=[guild])
+
+    data = json.loads(await tool.execute(channel="#General"))
+    assert data["messages"][0]["content"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_unknown_channel_name_is_reported():
+    guild = _make_guild(text_channels=[_make_text(10, "general", guild=None)])
+    tool, _ = _make_setup(guilds=[guild])
+
+    result = await tool.execute(channel="nonexistent")
+    assert "no channel named" in result
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_channel_name_requires_id():
+    a = _make_text(10, "general", guild=None)
+    b = _make_text(11, "General", guild=None)
+    guild = _make_guild(text_channels=[a, b])
+    a.guild = guild
+    b.guild = guild
+    tool, _ = _make_setup(guilds=[guild])
+
+    result = await tool.execute(channel="general")
+    assert "ambiguous" in result
+    assert "channel_id" in result
+
+
+@pytest.mark.asyncio
+async def test_channel_and_channel_id_together_rejected():
+    guild = _make_guild(text_channels=[_make_text(10, "general", guild=None)])
+    tool, _ = _make_setup(guilds=[guild])
+
+    result = await tool.execute(channel="general", channel_id="10")
+    assert "not both" in result
+
+
+def test_relative_since_today_is_local_midnight():
+    now = datetime(2026, 10, 22, 14, 30, tzinfo=timezone.utc)
+    parsed = _parse_iso("today", "since", now=now)
+    assert isinstance(parsed, datetime)
+    assert parsed.hour == 0 and parsed.minute == 0
+
+
+def test_relative_yesterday_is_previous_midnight():
+    now = datetime(2026, 10, 22, 14, 30, tzinfo=timezone.utc)
+    today = _parse_iso("today", "since", now=now)
+    yesterday = _parse_iso("yesterday", "since", now=now)
+    assert isinstance(today, datetime) and isinstance(yesterday, datetime)
+    assert (today - yesterday).total_seconds() == 86400
+
+
+def test_relative_duration_forms():
+    now = datetime(2026, 10, 22, 14, 30, tzinfo=timezone.utc)
+    for raw, seconds in (("6h", 6 * 3600), ("-6h", 6 * 3600), ("30m", 1800), ("2d", 172800), ("1w", 604800)):
+        parsed = _parse_iso(raw, "since", now=now)
+        assert isinstance(parsed, datetime), raw
+        assert (now - parsed).total_seconds() == seconds, raw
+
+
+def test_relative_forms_are_case_insensitive_and_trimmed():
+    now = datetime(2026, 10, 22, 14, 30, tzinfo=timezone.utc)
+    assert _parse_iso("  TODAY ", "since", now=now) == _parse_iso("today", "since", now=now)
+    assert isinstance(_parse_iso("NOW", "until", now=now), datetime)
+
+
+def test_unknown_relative_form_names_the_accepted_forms():
+    result = _parse_iso("sometime yesterday-ish", "since")
+    assert isinstance(result, str)
+    assert "today" in result and "ISO-8601" in result
+
+
+@pytest.mark.asyncio
+async def test_relative_window_reaches_the_history_call():
+    tc = _make_text(10, "general", guild=None)
+    guild = _make_guild(text_channels=[tc])
+    tc.guild = guild
+    captured: dict[str, object] = {}
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return _history_factory([])(**kwargs)
+
+    tc.history = MagicMock(side_effect=_capture)
+    tool, _ = _make_setup(guilds=[guild])
+
+    await tool.execute(channel="general", since="6h", until="now")
+    assert captured["after"] is not None
+    assert captured["before"] is not None
+    assert captured["after"] < captured["before"]

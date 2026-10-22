@@ -6,9 +6,26 @@ and register it in _BACKENDS below.
 """
 
 import shlex
+import shutil
 from pathlib import Path
 
 from nanobot.config.paths import get_media_dir
+
+
+def _resolve_bwrap() -> str:
+    """Return the bubblewrap binary to exec.
+
+    Ubuntu's unprivileged-userns restriction is lifted per binary through an
+    AppArmor profile pinned to ``/usr/bin/bwrap``. A second, unprofiled build
+    earlier on PATH (Linuxbrew ships one) is then unusable: it fails with
+    "setting up uid map: Permission denied", which reads like a kernel problem
+    but is an identity problem. Prefer the distro path so the sandbox keeps
+    working no matter what a login shell put in front of it.
+    """
+    if Path("/usr/bin/bwrap").is_file():
+        return "/usr/bin/bwrap"
+    found = shutil.which("bwrap")
+    return found or "bwrap"
 
 
 def _bwrap(command: str, workspace: str, cwd: str) -> str:
@@ -37,7 +54,7 @@ def _bwrap(command: str, workspace: str, cwd: str) -> str:
         "/etc/ld.so.cache",
     ]
 
-    args = ["bwrap", "--new-session", "--die-with-parent", "--setenv", "HOME", str(ws)]
+    args = [_resolve_bwrap(), "--new-session", "--die-with-parent", "--setenv", "HOME", str(ws)]
     for p in required:
         args += ["--ro-bind", p, p]
     for p in optional:

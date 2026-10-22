@@ -42,6 +42,7 @@ MAX_SENDER_NAME_LEN = 64  # caps the "[name]:" speaker prefix
 MAX_ROSTER_MEMBERS = 25  # roster entries exposed to the model per guild
 MAX_INDEXED_MEMBERS_PER_GUILD = 200  # bounded member index, oldest evicted first
 MAX_PREVIOUS_NAMES = 5  # remembered former display names per member
+MAX_REFERENCED_ATTACHMENTS = 4  # attachments pulled from a replied-to message
 MAX_REPLY_TARGETS = 256  # bounded per-chat reply-target cache
 _MENTION_RE = re.compile(r"<@!?(\d+)>")
 
@@ -756,6 +757,12 @@ class DiscordChannel(BaseChannel):
             return
 
         media_paths, attachment_markers = await self._download_attachments(message.attachments)
+        # A reply does not carry the quoted message's attachments, so an image
+        # sent earlier is invisible to a turn that merely answers it. Pull them
+        # in from the referenced message so "reply + tag" sees the picture.
+        reply_media, reply_markers = await self._download_referenced_attachments(message)
+        media_paths.extend(reply_media)
+        attachment_markers.extend(reply_markers)
         self._remember_reply_target(channel_id, str(message.id))
         identity = self._identity_for(guild_id, sender_id)
         sender_name = (
@@ -886,11 +893,59 @@ class DiscordChannel(BaseChannel):
             return False
         return True
 
+    async def _download_referenced_attachments(
+        self,
+        message: Any,
+    ) -> tuple[list[str], list[str]]:
+        """Download attachments of the message this one replies to.
+
+        Discord keeps ``attachments`` per message, so a reply whose own body is
+        text only loses the quoted image entirely. The referenced message is
+        resolved from the client cache when available and fetched otherwise,
+        bounded by ``MAX_REFERENCED_ATTACHMENTS`` and skipped for messages from
+        other bots (no attribution value, and bots can post many files).
+        """
+        reference = getattr(message, "reference", None)
+        if reference is None:
+            return [], []
+        referenced = getattr(reference, "resolved", None) or getattr(
+            reference, "cached_message", None
+        )
+        message_id = getattr(reference, "message_id", None)
+        if referenced is None and message_id is not None:
+            channel = getattr(message, "channel", None)
+            fetch = getattr(channel, "fetch_message", None)
+            if fetch is None:
+                return [], []
+            try:
+                referenced = await fetch(int(message_id))
+            except Exception as e:
+                self.logger.debug("could not resolve replied-to message {}: {}", message_id, e)
+                return [], []
+        attachments = list(getattr(referenced, "attachments", None) or [])
+        if not attachments:
+            return [], []
+        author = getattr(referenced, "author", None)
+        author_name = self._sanitize_sender_name(
+            getattr(author, "display_name", None) or getattr(author, "name", None),
+            str(getattr(author, "id", "unknown")),
+        )
+        media_paths, markers = await self._download_attachments(
+            attachments[:MAX_REFERENCED_ATTACHMENTS]
+        )
+        if not markers:
+            return media_paths, markers
+        # Label the block so the model attributes the image to the quoted
+        # message rather than to the reply itself.
+        labelled = [f"[from replied message by {author_name}] {marker}" for marker in markers]
+        return media_paths, labelled
+
     async def _download_attachments(
         self,
         attachments: list[discord.Attachment],
     ) -> tuple[list[str], list[str]]:
         """Download supported attachments and return paths + display markers."""
+
         media_paths: list[str] = []
         markers: list[str] = []
         media_dir = get_media_dir("discord")

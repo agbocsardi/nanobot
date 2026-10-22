@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
-from datetime import datetime, timezone
+import re
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 from nanobot.agent.tools.base import Tool, tool_parameters
@@ -61,14 +62,63 @@ class DiscordRuntimeHandle:
         return client
 
 
-def _parse_iso(value: str | None, field: str) -> datetime | None | str:
-    """Parse an ISO-8601 datetime; return None, or an error string."""
+_RELATIVE_UNITS = {
+    "m": 60,
+    "h": 3600,
+    "d": 86400,
+    "w": 604800,
+}
+
+
+def _resolve_relative(value: str, *, now: datetime) -> str | None:
+    """Resolve a keyword or duration to an ISO timestamp, or None if not one.
+
+    Accepted forms (case-insensitive, surrounding whitespace ignored):
+    ``now``, ``today``, ``yesterday``, and ``<n><unit>`` durations with an
+    optional leading ``-`` (``30m``, ``6h``, ``2d``, ``1w``) meaning "that long
+    before now". Week starts are irrelevant here: ``today``/``yesterday`` are
+    local midnights, which is what a "summarise today" request means.
+    """
+    token = value.strip().lower()
+    if not token:
+        return None
+    if token == "now":
+        return now.isoformat()
+    if token in {"today", "yesterday"}:
+        local_now = now
+        offset_days = 0 if token == "today" else 1
+        midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return (midnight - timedelta(days=offset_days)).isoformat()
+    match = re.fullmatch(r"-?(\d+)([mhdw])", token)
+    if match is None:
+        return None
+    amount = int(match.group(1))
+    if amount <= 0:
+        return None
+    return (now - timedelta(seconds=amount * _RELATIVE_UNITS[match.group(2)])).isoformat()
+
+
+def _parse_iso(
+    value: str | None,
+    field: str,
+    *,
+    now: datetime | None = None,
+) -> datetime | None | str:
+    """Parse an ISO-8601 datetime or a relative keyword; return None, or an error string."""
     if value is None:
         return None
+    reference = now or datetime.now().astimezone()
+    if isinstance(value, str):
+        relative = _resolve_relative(value, now=reference)
+        if relative is not None:
+            value = relative
     try:
         dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
-        return f"Error: {field} must be ISO-8601; got {value!r}"
+        return (
+            f"Error: {field} must be ISO-8601, or one of "
+            f"'now', 'today', 'yesterday', '<n>m', '<n>h', '<n>d', '<n>w'; got {value!r}"
+        )
     if dt.tzinfo is None:
         return f"Error: {field} must be timezone-aware; got {value!r}"
     return dt.astimezone(timezone.utc)
@@ -97,17 +147,35 @@ def _valid_snowflake(value: str | None, field: str) -> str | None:
             "channel_id": {
                 "type": "string",
                 "description": (
-                    "Fetch only this text channel, forum post/thread, or thread. "
-                    "When omitted, scan eligible configured sources in the guild."
+                    "Fetch only this text channel, forum post/thread, or thread, "
+                    "by numeric id. When omitted, scan eligible configured "
+                    "sources in the guild. Use 'channel' to select by name."
+                ),
+            },
+            "channel": {
+                "type": "string",
+                "description": (
+                    "Fetch only the channel with this name (with or without a "
+                    "leading '#', case-insensitive; 'category/name' also works). "
+                    "Use this for a human-named channel like '#general' instead "
+                    "of guessing an id."
                 ),
             },
             "since": {
                 "type": "string",
-                "description": "ISO-8601 lower bound (exclusive, UTC normalized).",
+                "description": (
+                    "ISO-8601 lower bound (exclusive, UTC normalized), or one of "
+                    "'now', 'today', 'yesterday', '<n>m|h|d|w' (that long before "
+                    "now, e.g. '6h'). 'today' is local midnight, so "
+                    "since='today' means today's conversation so far."
+                ),
             },
             "until": {
                 "type": "string",
-                "description": "ISO-8601 upper bound (exclusive, UTC normalized).",
+                "description": (
+                    "ISO-8601 upper bound (exclusive, UTC normalized), or the "
+                    "same relative forms as 'since'."
+                ),
             },
             "limit": {
                 "type": "integer",
@@ -171,9 +239,13 @@ class DiscordHistoryTool(Tool):
     def description(self) -> str:
         return (
             "Fetch past Discord messages from one configured guild as a bounded, "
-            "read-only structured result. Respects the bot's allow_channels and "
-            "effective view_channel + read_message_history permissions. Requires "
-            "the MESSAGE_CONTENT intent for text content."
+            "read-only structured result. Narrow it with 'channel' (a channel "
+            "name like '#general') or 'channel_id', and with 'since'/'until' "
+            "which accept ISO-8601 or 'today', 'yesterday', 'now', '6h'. Use it "
+            "before answering questions about earlier discussion or about who "
+            "said what. Respects the bot's allow_channels and effective "
+            "view_channel + read_message_history permissions. Requires the "
+            "MESSAGE_CONTENT intent for text content."
         )
 
     @property
@@ -210,6 +282,11 @@ class DiscordHistoryTool(Tool):
                 "This tool only works in the gateway with Discord enabled."
             )
 
+        # ``channel`` is the bound DiscordChannel here, so the model-facing
+        # channel *name* argument arrives through **kwargs; keep it under a
+        # distinct local name rather than shadowing the handler.
+        channel_name = kwargs.pop("channel", None)
+
         # Some providers serialize omitted optional string parameters as "".
         # Treat blank Discord ids as omitted instead of rejecting an otherwise
         # valid guild-wide discovery request.
@@ -217,6 +294,10 @@ class DiscordHistoryTool(Tool):
             guild_id = None
         if isinstance(channel_id, str) and not channel_id.strip():
             channel_id = None
+        if isinstance(channel_name, str) and not channel_name.strip():
+            channel_name = None
+        if channel_name is not None and channel_id is not None:
+            return "Error: pass either channel or channel_id, not both"
 
         # --- parameter validation ---
         err = _valid_snowflake(guild_id, "guild_id")
@@ -248,6 +329,11 @@ class DiscordHistoryTool(Tool):
             return guild
 
         # --- source collection ---
+        if channel_name is not None:
+            name_error, resolved_id = self._resolve_channel_name(guild, channel_name)
+            if name_error is not None:
+                return name_error
+            channel_id = resolved_id
         if channel_id is not None:
             sources = await self._resolve_explicit_sources(
                 channel, client, guild, channel_id,
@@ -305,6 +391,44 @@ class DiscordHistoryTool(Tool):
         return self._serialize_result(result, max_chars)
 
     # --- guild / source resolution ---
+
+    def _resolve_channel_name(self, guild: Any, wanted: str) -> tuple[str | None, str | None]:
+        """Resolve a human channel name; return ``(error, channel_id)``.
+
+        Matches case-insensitively against the channel name, a leading '#'
+        trimmed, and the Discord display form ``category/name``. Ambiguity is
+        reported with the candidates rather than silently picking one, because
+        two channels sharing a name live in different categories. Returns a
+        pair rather than a bare string: a resolved id is also a string, so a
+        single return value could not distinguish success from a refusal.
+        """
+        needle = wanted.strip().lstrip("#").strip()
+        if not needle:
+            return "Error: channel name is empty", None
+        folded = needle.casefold()
+        matches: list[Any] = []
+        for candidate in getattr(guild, "channels", []) or []:
+            name = (getattr(candidate, "name", None) or "").casefold()
+            if not name:
+                continue
+            category = getattr(getattr(candidate, "category", None), "name", None)
+            display = f"{category}/{name}".casefold() if category else name
+            last_segment = folded.rsplit("/", 1)[-1]
+            if folded == name or folded == display or (
+                category is not None and last_segment == name
+            ):
+                matches.append(candidate)
+        if not matches:
+            return (
+                f"Error: no channel named {wanted!r} in this guild. "
+                "Call without channel/channel_id to scan every permitted channel."
+            ), None
+        if len(matches) > 1:
+            listed = ", ".join(
+                f"#{getattr(m, 'name', '?')} (id {getattr(m, 'id', '?')})" for m in matches[:5]
+            )
+            return f"Error: {wanted!r} is ambiguous: {listed}. Retry with channel_id.", None
+        return None, str(matches[0].id)
 
     def _resolve_guild(self, client: Any, guild_id: str | None) -> Any | str:
         if guild_id is not None:
