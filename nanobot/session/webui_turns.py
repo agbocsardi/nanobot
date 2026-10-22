@@ -59,7 +59,7 @@ from nanobot.webui.metadata import (
     WEBSOCKET_TURN_OWNER_METADATA_KEY,
     WEBUI_TURN_METADATA_KEY,
 )
-from nanobot.webui.session_identity import is_webui_session_key
+from nanobot.webui.session_identity import is_webui_session_key, webui_session_key
 from nanobot.webui.star_prompt import update_star_prompt
 from nanobot.webui.transcript import append_session_message_input
 
@@ -213,12 +213,16 @@ async def maybe_generate_webui_title(
     so pass ``target_session_key`` to project the title onto that per-chat
     session instead of storing it on the shared one.
     """
-    routed_session = sessions.get_or_create(session_key)
+    routed_session = sessions.get_existing(session_key)
+    if routed_session is None:
+        return False
     target_is_routed = target_session_key is None or target_session_key == session_key
-    if target_is_routed or target_session_key is None:
+    if target_is_routed:
         target_session = routed_session
     else:
-        target_session = sessions.get_or_create(target_session_key)
+        target_session = sessions.get_existing(target_session_key)
+        if target_session is None:
+            return False
     if (
         routed_session.metadata.get(WEBUI_SESSION_METADATA_KEY) is not True
         and target_session.metadata.get(WEBUI_SESSION_METADATA_KEY) is not True
@@ -312,7 +316,12 @@ async def maybe_generate_webui_title_after_turn(
 ) -> bool:
     if channel != "websocket" or metadata.get(WEBUI_SESSION_METADATA_KEY) is not True:
         return False
-    origin_session_key = f"{channel}:{chat_id}"
+    # The per-chat projection is the WebUI-namespace session, never the
+    # channel-derived ``websocket:<chat_id>`` key. Deriving it from ``channel``
+    # creates a metadata-only legacy session, which the cross-audience binding
+    # guard then reads as proof that this chat id belongs to the legacy
+    # audience — permanently refusing the WebUI bind it was meant to title.
+    origin_session_key = webui_session_key(chat_id)
     return await maybe_generate_webui_title(
         sessions=sessions,
         session_key=session_key,

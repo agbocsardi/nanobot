@@ -1155,6 +1155,26 @@ class SessionManager:
         """Return a cached session without creating or loading one from disk."""
         return self._cache.get(key)
 
+    def get_existing(self, key: str) -> Session | None:
+        """Return a session (cache or disk) without ever creating one.
+
+        Fork addition (WebUI integration): background projections such as title
+        generation must never materialize a session as a side effect of reading
+        it. Creating one writes a metadata-only file, which other subsystems
+        legitimately read as evidence that the session exists — for a
+        ``websocket:`` key that evidence blocks every future WebUI bind of the
+        same chat id. Callers that only need to read should use this instead of
+        ``get_or_create``.
+        """
+        with self._session_files_lock:
+            session = self._cache.get(key)
+            if session is not None:
+                return session
+            session = self._load(key)
+            if session is not None:
+                self._cache[key] = session
+            return session
+
     @contextmanager
     def locked_session_files(self):
         """Guard exceptional direct access to canonical session files."""

@@ -12,6 +12,7 @@ from nanobot.session.manager import (
     _metadata_title,  # pyright: ignore[reportPrivateUsage]
 )
 from nanobot.triggers.local_types import LocalTrigger
+from nanobot.webui.session_identity import webui_session_key
 
 AutomationJob = CronJob | LocalTrigger
 
@@ -268,7 +269,7 @@ def _origin_payload(
             "preview": preview,
         }
 
-    session_key = f"{channel}:{chat_id}"
+    session_key = webui_session_key(chat_id)
     return _websocket_origin_payload(
         session_key=session_key,
         channel=channel,
@@ -293,7 +294,7 @@ def _trigger_origin_payload(
         }
 
     return _websocket_origin_payload(
-        session_key=trigger.session_key or f"{channel}:{chat_id}",
+        session_key=trigger.session_key or webui_session_key(chat_id),
         channel=channel,
         chat_id=chat_id,
         session_manager=session_manager,
