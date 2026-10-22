@@ -97,6 +97,11 @@ class DiscordConfig(Base):
     token: str = ""
     allow_from: list[str] = Field(default_factory=list)
     allow_channels: list[str] = Field(default_factory=list)  # Allowed channel IDs (empty = all)
+    # Direct messages bypass the guild mention policy entirely, so an open
+    # ``allow_from`` would otherwise grant anyone who shares a server a private
+    # 1:1 channel to the bot. An empty list leaves DMs governed by
+    # ``allow_from`` alone (upstream behaviour); "*" opens them to everyone.
+    dm_allow_from: list[str] = Field(default_factory=list)
     intents: int = 37377
     group_policy: Literal["mention", "open"] = "mention"
     read_receipt_emoji: str = "👀"
@@ -874,6 +879,20 @@ class DiscordChannel(BaseChannel):
         await self._stop_typing(chat_id)
         await self._clear_reactions(chat_id)
 
+    def _dm_allowed(self, sender_id: str) -> bool:
+        """Whether *sender_id* may talk to the bot in a direct message.
+
+        An unset ``dm_allow_from`` keeps the upstream behaviour (governed by
+        ``allow_from`` only). When it is set, it is the sole authority for DMs
+        — ``allow_from`` still has to pass first, so this can only narrow.
+        """
+        allow = getattr(self.config, "dm_allow_from", None) or []
+        if not allow:
+            return True
+        if "*" in allow:
+            return True
+        return str(sender_id) in allow
+
     def _should_accept_inbound(
         self,
         message: discord.Message,
@@ -882,6 +901,11 @@ class DiscordChannel(BaseChannel):
     ) -> bool:
         """Check if inbound Discord message should be processed."""
         if not self.is_allowed(sender_id):
+            return False
+        # Direct messages have no guild, so the mention policy below never runs.
+        # A separate DM allowlist keeps "answer anyone in the server" from also
+        # meaning "answer anyone privately".
+        if message.guild is None and not self._dm_allowed(sender_id):
             return False
         # Channel-based filtering: only respond in allowed channels
         allow_channels = self.config.allow_channels

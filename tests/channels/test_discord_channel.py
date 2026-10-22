@@ -1766,3 +1766,126 @@ async def test_failed_quote_fetch_is_not_fatal(tmp_path, monkeypatch) -> None:
     await channel._on_message(message)
 
     assert handled[0]["content"] == "[member-a]: still works"
+
+
+# ---------------------------------------------------------------------------
+# DM allowlist
+# ---------------------------------------------------------------------------
+
+
+def _dm_channel(dm_allow_from: list[str]) -> DiscordChannel:
+    return DiscordChannel(
+        DiscordConfig(
+            enabled=True,
+            allow_from=["*"],
+            group_policy="mention",
+            dm_allow_from=list(dm_allow_from),
+        ),
+        MessageBus(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_dm_from_unlisted_user_is_ignored(monkeypatch, tmp_path) -> None:
+    # A DM has no guild, so the mention policy cannot gate it; without a DM
+    # allowlist anyone in the server could open a private channel to the bot.
+    channel = _dm_channel(["111"])
+    handled: list[dict] = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle  # type: ignore[method-assign]
+    monkeypatch.setattr("nanobot.channels.discord.get_media_dir", lambda _name: tmp_path)
+
+    await channel._on_message(_make_message(author_id=999, content="hi", guild_id=None))
+
+    assert handled == []
+
+
+@pytest.mark.asyncio
+async def test_dm_from_listed_user_is_answered(monkeypatch, tmp_path) -> None:
+    channel = _dm_channel(["111"])
+    handled: list[dict] = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle  # type: ignore[method-assign]
+    monkeypatch.setattr("nanobot.channels.discord.get_media_dir", lambda _name: tmp_path)
+
+    await channel._on_message(
+        _make_message(author_id=111, author_display_name="member-a", content="hi", guild_id=None)
+    )
+
+    assert handled[0]["is_dm"] is True
+    assert handled[0]["content"] == "[member-a]: hi"
+
+
+@pytest.mark.asyncio
+async def test_dm_allowlist_does_not_leak_into_guild_channels(monkeypatch, tmp_path) -> None:
+    # An unlisted user must still get served in a guild channel (where the
+    # mention policy governs) — the DM list only narrows DMs.
+    channel = DiscordChannel(
+        DiscordConfig(
+            enabled=True,
+            allow_from=["*"],
+            group_policy="open",
+            dm_allow_from=["111"],
+        ),
+        MessageBus(),
+    )
+    handled: list[dict] = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle  # type: ignore[method-assign]
+    monkeypatch.setattr("nanobot.channels.discord.get_media_dir", lambda _name: tmp_path)
+
+    await channel._on_message(_make_message(author_id=999, content="hi", guild_id=GUILD_ID))
+
+    assert len(handled) == 1
+
+
+@pytest.mark.asyncio
+async def test_empty_dm_allowlist_keeps_upstream_behaviour(monkeypatch, tmp_path) -> None:
+    channel = _dm_channel([])
+    handled: list[dict] = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle  # type: ignore[method-assign]
+    monkeypatch.setattr("nanobot.channels.discord.get_media_dir", lambda _name: tmp_path)
+
+    await channel._on_message(_make_message(author_id=999, content="hi", guild_id=None))
+
+    assert len(handled) == 1
+
+
+@pytest.mark.asyncio
+async def test_dm_allowlist_wildcard_opens_dms(monkeypatch, tmp_path) -> None:
+    channel = _dm_channel(["*"])
+    handled: list[dict] = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle  # type: ignore[method-assign]
+    monkeypatch.setattr("nanobot.channels.discord.get_media_dir", lambda _name: tmp_path)
+
+    await channel._on_message(_make_message(author_id=999, content="hi", guild_id=None))
+
+    assert len(handled) == 1
+
+
+def test_dm_allowlist_accepts_snake_and_camel_config_keys() -> None:
+    snake = DiscordChannel(
+        DiscordConfig(enabled=True, dm_allow_from=["111"]), MessageBus()
+    )
+    camel = DiscordChannel(
+        DiscordConfig.model_validate({"enabled": True, "dmAllowFrom": ["111"]}), MessageBus()
+    )
+    assert snake.config.dm_allow_from == ["111"]
+    assert camel.config.dm_allow_from == ["111"]
