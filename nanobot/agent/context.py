@@ -14,6 +14,7 @@ from nanobot.agent.tools import mcp as mcp_tools
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.apps.cli import utils as cli_app_utils
 from nanobot.bus.events import InboundMessage
+from nanobot.runtime_context import runtime_context_lines_from_metadata
 from nanobot.session.goal_state import goal_state_runtime_lines
 from nanobot.utils.helpers import (
     current_time_str,
@@ -33,7 +34,14 @@ def session_extra(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
 
 def runtime_lines(state: Any, msg: Any, workspace: Path, *, skip: bool = False) -> list[str]:
     """Return model-visible runtime annotations for turn-attached capabilities."""
+    metadata = getattr(msg, "metadata", None)
+    channel_lines = (
+        []
+        if skip or not isinstance(metadata, Mapping)
+        else runtime_context_lines_from_metadata(metadata)
+    )
     return [
+        *channel_lines,
         *cli_app_utils.runtime_lines(msg, workspace, skip=skip),
         *mcp_tools.runtime_lines(
             msg,

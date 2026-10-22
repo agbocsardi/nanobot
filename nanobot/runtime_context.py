@@ -14,11 +14,15 @@ if TYPE_CHECKING:
 RUNTIME_CONTEXT_HISTORY_META = "_runtime_context"
 RUNTIME_CONTEXT_MESSAGE_META = "runtime_context"
 RUNTIME_CONTEXT_INPUT_META = "_runtime_context_blocks"
+# Channel-produced annotation lines (e.g. a guild roster) that the context
+# builder appends to the runtime block of the current turn only.
+RUNTIME_CONTEXT_LINES_META = "_runtime_context_lines"
 RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
 RUNTIME_CONTEXT_END = "[/Runtime Context]"
 WEBUI_QUOTE_METADATA = "_webui_quote"
 WEBUI_QUOTE_SOURCE = "webui_quote"
 MAX_WEBUI_QUOTE_CHARS = 4_000
+MAX_RUNTIME_CONTEXT_LINES = 8
 
 
 @dataclass(frozen=True)
@@ -104,6 +108,15 @@ def runtime_context_blocks_from_metadata(
     if result is None:
         return []
     return normalize_runtime_context_blocks(result)
+
+
+def runtime_context_lines_from_metadata(metadata: Mapping[str, Any]) -> list[str]:
+    """Read bounded, channel-produced runtime annotation lines from inbound metadata."""
+    result = metadata.get(RUNTIME_CONTEXT_LINES_META)
+    if not isinstance(result, list):
+        return []
+    lines = [line.strip() for line in result if isinstance(line, str) and line.strip()]
+    return lines[:MAX_RUNTIME_CONTEXT_LINES]
 
 
 async def resolve_runtime_context(

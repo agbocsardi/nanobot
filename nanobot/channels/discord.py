@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import re
 import time
+from collections import OrderedDict
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -18,6 +20,7 @@ from nanobot.channels.base import BaseChannel
 from nanobot.command.builtin import build_help_text
 from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import Base
+from nanobot.runtime_context import RUNTIME_CONTEXT_LINES_META
 from nanobot.utils.helpers import safe_filename, split_message
 
 DISCORD_AVAILABLE = importlib.util.find_spec("discord") is not None
@@ -35,6 +38,12 @@ if DISCORD_AVAILABLE:
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20MB
 MAX_MESSAGE_LEN = 2000  # Discord message character limit
 TYPING_INTERVAL_S = 8
+MAX_SENDER_NAME_LEN = 64  # caps the "[name]:" speaker prefix
+MAX_ROSTER_MEMBERS = 25  # roster entries exposed to the model per guild
+MAX_INDEXED_MEMBERS_PER_GUILD = 200  # bounded member index, oldest evicted first
+MAX_PREVIOUS_NAMES = 5  # remembered former display names per member
+MAX_REPLY_TARGETS = 256  # bounded per-chat reply-target cache
+_MENTION_RE = re.compile(r"<@!?(\d+)>")
 
 def _send_failure(exc: Exception) -> DeliveryResult:
     """Only explicit HTTP rejection proves a submitted message wasn't accepted."""
@@ -42,6 +51,23 @@ def _send_failure(exc: Exception) -> DeliveryResult:
     rejected = isinstance(status, int) and 400 <= status < 500
     return DeliveryResult("failed" if rejected else "unknown", str(exc))
 
+
+def _build_reply_context(
+    channel: Messageable,
+    reply_to: str | None,
+    logger: Any,
+) -> tuple[Any | None, Any]:
+    """Build a Discord message reference that does not ping the replied-to author."""
+    mention_settings = discord.AllowedMentions(replied_user=False)
+    if not reply_to:
+        return None, mention_settings
+    try:
+        message_id = int(reply_to)
+    except ValueError:
+        logger.warning("Invalid reply target: {}", reply_to)
+        return None, mention_settings
+
+    return channel.get_partial_message(message_id), mention_settings
 
 
 @dataclass
@@ -52,6 +78,15 @@ class _StreamBuf:
     message: Any | None = None
     last_edit: float = 0.0
     stream_id: str | None = None
+
+
+@dataclass
+class _MemberIdentity:
+    """Attribution facts for one guild member, refreshed from live events."""
+
+    display_name: str
+    handle: str
+    previous_names: list[str] = field(default_factory=list)
 
 
 class DiscordConfig(Base):
@@ -101,6 +136,9 @@ if DISCORD_AVAILABLE:
 
         async def on_message(self, message: discord.Message) -> None:
             await self._channel._handle_discord_message(message)
+
+        async def on_member_update(self, before: discord.Member, after: discord.Member) -> None:
+            self._channel._handle_member_update(before, after)
 
         async def on_thread_delete(self, thread: discord.Thread) -> None:
             self._channel._forget_channel(thread)
@@ -267,7 +305,15 @@ if DISCORD_AVAILABLE:
                     # network/5xx failure leaves the outcome ambiguous.
                     return _send_failure(e)
 
-            reference, mention_settings = self._build_reply_context(channel, msg.reply_to)
+            reply_to = msg.reply_to
+            if reply_to is None and not (msg.metadata or {}).get("_progress"):
+                # The loop never sets reply_to for Discord; answer the newest
+                # inbound message in this chat instead. Consumed so exactly one
+                # outbound message per turn carries the reference.
+                reply_to = self._channel._take_reply_target(msg.chat_id)
+            reference, mention_settings = _build_reply_context(
+                channel, reply_to, self._channel.logger
+            )
             sent_media = False
             failed_media: list[str] = []
             accepted = False
@@ -344,23 +390,6 @@ if DISCORD_AVAILABLE:
             fallback = "\n".join(f"[attachment: {name} - send failed]" for name in failed_media)
             return split_message(fallback, MAX_MESSAGE_LEN)
 
-        def _build_reply_context(
-            self,
-            channel: Messageable,
-            reply_to: str | None,
-        ) -> tuple[discord.PartialMessage | None, discord.AllowedMentions]:
-            """Build reply context for outbound messages."""
-            mention_settings = discord.AllowedMentions(replied_user=False)
-            if not reply_to:
-                return None, mention_settings
-            try:
-                message_id = int(reply_to)
-            except ValueError:
-                self._channel.logger.warning("Invalid reply target: {}", reply_to)
-                return None, mention_settings
-
-            return channel.get_partial_message(message_id), mention_settings
-
 
 class DiscordChannel(BaseChannel):
     """Discord channel using discord.py."""
@@ -410,12 +439,124 @@ class DiscordChannel(BaseChannel):
         self._working_emoji_tasks: dict[str, asyncio.Task[None]] = {}
         self._stream_bufs: dict[str, _StreamBuf] = {}
         self._known_channels: dict[str, Any] = {}
+        # Newest accepted inbound message per chat, so replies can reference it.
+        self._reply_targets: OrderedDict[str, str] = OrderedDict()
+        # guild_id -> member_id -> identity. Bounded per guild (see constants).
+        self._identities: dict[str, dict[str, _MemberIdentity]] = {}
 
     def _remember_channel(self, channel: Any) -> None:
         self._known_channels[self._channel_key(channel)] = channel
 
     def _forget_channel(self, channel_or_id: Any) -> None:
         self._known_channels.pop(self._channel_key(channel_or_id), None)
+
+    def _remember_reply_target(self, chat_id: str, message_id: str) -> None:
+        """Record the newest inbound message id for a chat, bounded and LRU-ordered."""
+        self._reply_targets[chat_id] = message_id
+        self._reply_targets.move_to_end(chat_id)
+        while len(self._reply_targets) > MAX_REPLY_TARGETS:
+            self._reply_targets.popitem(last=False)
+
+    def _take_reply_target(self, chat_id: str) -> str | None:
+        """Return and drop the reply target for a chat (one reply per turn)."""
+        return self._reply_targets.pop(chat_id, None)
+
+    @staticmethod
+    def _sanitize_sender_name(name: Any, fallback: str) -> str:
+        """Strip characters that could forge the ``[name]:`` transcript prefix."""
+        cleaned = re.sub(r"[\[\]]", "", str(name or ""))
+        cleaned = re.sub(r"[\x00-\x1f\x7f]+", " ", cleaned)
+        cleaned = " ".join(cleaned.split())[:MAX_SENDER_NAME_LEN]
+        return cleaned or str(fallback)
+
+    def _identity_for(self, guild_id: str | None, member_id: str) -> _MemberIdentity | None:
+        if not guild_id:
+            return None
+        return self._identities.get(guild_id, {}).get(member_id)
+
+    def _remember_member_identity(
+        self,
+        guild_id: str | None,
+        member: Any,
+        *,
+        previous_display_name: str | None = None,
+    ) -> None:
+        """Index one guild member, appending changed display names to history."""
+        if not guild_id:
+            return
+        member_id = str(getattr(member, "id", "") or "")
+        if not member_id:
+            return
+        raw_name = (
+            getattr(member, "display_name", None) or getattr(member, "name", None) or member_id
+        )
+        display_name = self._sanitize_sender_name(raw_name, member_id)
+        handle = self._sanitize_sender_name(getattr(member, "name", None), member_id)
+
+        guild = self._identities.setdefault(guild_id, {})
+        entry = guild.get(member_id)
+        if entry is None:
+            while len(guild) >= MAX_INDEXED_MEMBERS_PER_GUILD:
+                guild.pop(next(iter(guild)))
+            entry = _MemberIdentity(display_name=display_name, handle=handle)
+            guild[member_id] = entry
+        else:
+            entry.handle = handle
+
+        old_name = (
+            self._sanitize_sender_name(previous_display_name, member_id)
+            if previous_display_name
+            else entry.display_name
+        )
+        if old_name and old_name != display_name and old_name != member_id:
+            history = [name for name in entry.previous_names if name not in (old_name, display_name)]
+            entry.previous_names = [*history, old_name][-MAX_PREVIOUS_NAMES:]
+        entry.display_name = display_name
+
+    def _remember_message_identities(self, guild_id: str | None, message: Any) -> None:
+        """Index the author and anyone they mention from one inbound message."""
+        self._remember_member_identity(guild_id, getattr(message, "author", None))
+        for user in getattr(message, "mentions", None) or []:
+            self._remember_member_identity(guild_id, user)
+
+    def _handle_member_update(self, before: Any, after: Any) -> None:
+        """Refresh the identity index when a member's display name changes."""
+        guild = getattr(after, "guild", None) or getattr(before, "guild", None)
+        guild_id = str(getattr(guild, "id", "") or "") or None
+        previous_name = getattr(before, "display_name", None) or getattr(before, "name", None)
+        self._remember_member_identity(guild_id, after, previous_display_name=previous_name)
+
+    def _resolve_mentions(self, content: str, guild_id: str | None) -> str:
+        """Replace ``<@id>`` / ``<@!id>`` tokens with known names, else the raw id."""
+        if "<@" not in content:
+            return content
+
+        def _replace(match: re.Match[str]) -> str:
+            member_id = match.group(1)
+            identity = self._identity_for(guild_id, member_id)
+            return f"@{identity.display_name}" if identity else f"@{member_id}"
+
+        return _MENTION_RE.sub(_replace, content)
+
+    def _roster_line(self, guild_id: str | None) -> str | None:
+        """Return a deterministic one-line roster of known members, or None."""
+        roster = self._identities.get(guild_id or "") or {}
+        if not roster:
+            return None
+        members = sorted(roster.items())[:MAX_ROSTER_MEMBERS]
+        entries = []
+        for member_id, identity in members:
+            entry = f"{identity.display_name} (@{identity.handle}, id={member_id}"
+            if identity.previous_names:
+                entry += f", was: {', '.join(identity.previous_names)}"
+            entries.append(entry + ")")
+        extra = len(roster) - len(members)
+        suffix = f"; +{extra} more not listed" if extra > 0 else ""
+        return (
+            "Discord guild roster (display names can change; ids are stable): "
+            + "; ".join(entries)
+            + suffix
+        )
 
     @property
     def client(self) -> Any | None:
@@ -561,8 +702,19 @@ class DiscordChannel(BaseChannel):
 
         now = time.monotonic()
         if buf.message is None:
+            kwargs: dict[str, Any] = {"content": buf.text}
+            reply_target = self._take_reply_target(chat_id)
+            if reply_target is not None:
+                reference, mention_settings = _build_reply_context(
+                    target, reply_target, self.logger
+                )
+                if reference is not None:
+                    # Only the first message of the turn carries the reference;
+                    # later chunks and the final edit inherit it from this one.
+                    kwargs["reference"] = reference
+                    kwargs["allowed_mentions"] = mention_settings
             try:
-                buf.message = await target.send(content=buf.text)
+                buf.message = await target.send(**kwargs)
                 buf.last_edit = now
             except Exception as e:
                 self.logger.warning("stream initial send failed: {}", e)
@@ -596,18 +748,35 @@ class DiscordChannel(BaseChannel):
         sender_id = str(message.author.id)
         channel_id = self._channel_key(message.channel)
         self._remember_channel(message.channel)
+        guild_id = str(message.guild.id) if message.guild else None
+        self._remember_message_identities(guild_id, message)
         content = message.content or ""
 
         if not self._should_accept_inbound(message, sender_id, content):
             return
 
         media_paths, attachment_markers = await self._download_attachments(message.attachments)
+        self._remember_reply_target(channel_id, str(message.id))
+        identity = self._identity_for(guild_id, sender_id)
         sender_name = (
-            getattr(message.author, "display_name", None)
-            or getattr(message.author, "name", None)
-            or sender_id
+            identity.display_name
+            if identity is not None
+            else (
+                getattr(message.author, "display_name", None)
+                or getattr(message.author, "name", None)
+                or sender_id
+            )
         )
-        attributed_content = f"[{sender_name}]: {content}" if content else ""
+        sender_name = self._sanitize_sender_name(sender_name, sender_id)
+        resolved_content = self._resolve_mentions(content, guild_id)
+        # Attribution survives attachment-only messages; an empty body still
+        # carries the speaker prefix instead of silently losing the author.
+        if resolved_content:
+            attributed_content = f"[{sender_name}]: {resolved_content}"
+        elif attachment_markers:
+            attributed_content = f"[{sender_name}]:"
+        else:
+            attributed_content = f"[{sender_name}]: [empty message]"
         full_content = self._compose_inbound_content(attributed_content, attachment_markers)
         metadata = self._build_inbound_metadata(message)
         parent_channel_id = self._channel_parent_key(message.channel)
@@ -757,19 +926,23 @@ class DiscordChannel(BaseChannel):
         message_type = getattr(message, "type", discord.MessageType.default)
         return message_type not in {discord.MessageType.default, discord.MessageType.reply}
 
-    @staticmethod
-    def _build_inbound_metadata(message: discord.Message) -> dict[str, str | None]:
+    def _build_inbound_metadata(self, message: discord.Message) -> dict[str, Any]:
         """Build metadata for inbound Discord messages."""
         reply_to = (
             str(message.reference.message_id)
             if message.reference and message.reference.message_id
             else None
         )
-        return {
+        metadata: dict[str, Any] = {
             "message_id": str(message.id),
             "guild_id": str(message.guild.id) if message.guild else None,
             "reply_to": reply_to,
         }
+        # Model-only roster line; the loop appends these to the runtime context
+        # block rather than mixing identity data into the user's message text.
+        if roster_line := self._roster_line(metadata["guild_id"]):
+            metadata[RUNTIME_CONTEXT_LINES_META] = [roster_line]
+        return metadata
 
     def _should_respond_in_group(self, message: discord.Message, content: str) -> bool:
         """Check if the bot should respond in a guild channel based on policy."""
@@ -865,6 +1038,8 @@ class DiscordChannel(BaseChannel):
         await self._cancel_all_typing()
         self._stream_bufs.clear()
         self._known_channels.clear()
+        self._reply_targets.clear()
+        self._identities.clear()
         if close_client and self._client is not None and not self._client.is_closed():
             try:
                 await self._client.close()
