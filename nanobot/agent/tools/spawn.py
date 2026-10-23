@@ -13,6 +13,7 @@ from nanobot.agent.tools.schema import (
     StringSchema,
     tool_parameters_schema,
 )
+from nanobot.cron.session_turns import CRON_SILENT_META, SILENT_TURN_META
 from nanobot.security.workspace_access import current_workspace_scope
 
 if TYPE_CHECKING:
@@ -78,6 +79,11 @@ class SpawnTool(Tool, ContextAware):
         self._origin_sender_id: ContextVar[str | None] = ContextVar(
             "spawn_origin_sender_id", default=None,
         )
+        # True when the spawning turn's output is suppressed (silent cron run,
+        # or any turn already tagged silent). Carried into the subagent origin
+        # so the announcement turn stays silent instead of being published to
+        # the bound chat as a separate reply.
+        self._silent: ContextVar[bool] = ContextVar("spawn_silent", default=False)
 
     @classmethod
     def create(cls, ctx: Any) -> Tool:
@@ -90,6 +96,8 @@ class SpawnTool(Tool, ContextAware):
         self._session_key.set(ctx.session_key or f"{ctx.channel}:{ctx.chat_id}")
         self._origin_message_id.set(ctx.message_id)
         self._origin_sender_id.set(ctx.sender_id)
+        meta = ctx.metadata or {}
+        self._silent.set(bool(meta.get(CRON_SILENT_META) or meta.get(SILENT_TURN_META)))
 
     @property
     def name(self) -> str:
@@ -126,6 +134,7 @@ class SpawnTool(Tool, ContextAware):
                 session_key=self._session_key.get(),
                 origin_message_id=self._origin_message_id.get(),
                 origin_sender_id=self._origin_sender_id.get(),
+                silent=self._silent.get(),
                 temperature=temperature,
                 model_preset=model_preset,
                 max_iterations=max_iterations,

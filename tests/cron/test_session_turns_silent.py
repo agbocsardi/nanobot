@@ -10,6 +10,7 @@ from nanobot.cron.session_turns import (
     CRON_SILENT_MARKER,
     CRON_SILENT_META,
     CRON_TRIGGER_META,
+    SILENT_TURN_META,
     cron_suppress_success_delivery,
 )
 
@@ -47,6 +48,17 @@ def test_non_cron_turn_never_suppressed_even_with_marker() -> None:
 def test_silent_flag_ignored_off_chat() -> None:
     # A stray silent meta on a non-cron turn is not honored.
     assert not cron_suppress_success_delivery({CRON_SILENT_META: True}, "anything")
+
+
+def test_silent_turn_meta_suppresses_non_cron_turn() -> None:
+    # Subagent announcements and other follow-ups carry no cron trigger, but
+    # must stay silent when they inherit silence from their spawning turn.
+    assert cron_suppress_success_delivery({SILENT_TURN_META: True}, "September came back blank.")
+
+
+def test_silent_turn_meta_absent_keeps_delivery() -> None:
+    meta = {"injected_event": "subagent_result", "_silent_turn": False}
+    assert not cron_suppress_success_delivery(meta, "A normal announcement.")
 
 
 def test_empty_marker_constant_is_stable() -> None:

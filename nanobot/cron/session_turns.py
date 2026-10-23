@@ -12,6 +12,11 @@ CRON_HISTORY_META = "_cron_turn"
 # Tagged onto a cron turn's inbound metadata by run_bound_cron_job when the
 # originating job was created with silent=True. See cron_suppress_success_delivery().
 CRON_SILENT_META = "_cron_silent"
+# Marks a non-cron turn whose success output must still stay unpublished
+# because it belongs to a silent origin (e.g. a subagent result announced back
+# into a silent cron run). Cron turns use CRON_SILENT_META; this key is the
+# general form and is honored on any turn.
+SILENT_TURN_META = "_silent_turn"
 # Exact marker a cron job may return to opt out of delivery for a single run,
 # e.g. a periodic check that found nothing worth reporting. Trimmed, exact
 # match only — never substring/fuzzy, never honored on non-cron turns.
@@ -91,13 +96,18 @@ def cron_suppress_success_delivery(
 ) -> bool:
     """True when a cron/background turn's success output should NOT be published.
 
-    Two conditions, cron turns only (normal chat is never suppressed here):
-      1. the job was created with ``silent=True`` (CRON_SILENT_META set), or
-      2. the response body is exactly ``[SILENT]`` (trimmed).
+    Conditions:
+      1. the turn is tagged SILENT_TURN_META, which propagates silence from a
+         silent origin into follow-up turns that carry no cron metadata of
+         their own (subagent announcements, resumed work); or
+      2. a cron turn created with ``silent=True`` (CRON_SILENT_META set); or
+      3. the response body is exactly ``[SILENT]`` (trimmed), cron turns only.
 
     Suppression is success-only; error-path messages are published by the
     caller's except branch and are not affected.
     """
+    if (metadata or {}).get(SILENT_TURN_META):
+        return True
     if not is_cron_turn(metadata):
         return False
     if (metadata or {}).get(CRON_SILENT_META):

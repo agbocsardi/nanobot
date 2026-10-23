@@ -26,6 +26,7 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import AgentDefaults, ToolsConfig
+from nanobot.cron.session_turns import SILENT_TURN_META
 from nanobot.providers.base import LLMProvider
 from nanobot.security.workspace_access import (
     WorkspaceScope,
@@ -266,6 +267,7 @@ class SubagentManager:
         max_tokens: int | None = None,
         workspace_scope: WorkspaceScope | None = None,
         origin_sender_id: str | None = None,
+        silent: bool = False,
         retry_of: str | None = None,
     ) -> tuple[str, str]:
         """Execute one spawn; returns ``(task_id, human confirmation line)``."""
@@ -281,6 +283,11 @@ class SubagentManager:
         origin = {"channel": origin_channel, "chat_id": origin_chat_id, "session_key": session_key}
         if origin_sender_id is not None:
             origin["sender_id"] = str(origin_sender_id)
+        if silent:
+            # The spawning turn's output is suppressed (silent cron run). Every
+            # announcement this subagent makes must inherit that, otherwise the
+            # result is published to the bound chat as a normal reply.
+            origin["silent"] = "1"
 
         provider_override: LLMProvider | None = None
         model_override: str | None = None
@@ -942,6 +949,12 @@ class SubagentManager:
         }
         if origin_message_id:
             metadata["origin_message_id"] = origin_message_id
+        if origin.get("silent"):
+            # Inherited from a silent spawning turn: this announcement turn must
+            # not publish its reply to the origin chat. Cron turns carry
+            # CRON_SILENT_META via their own inbound metadata; announcement
+            # turns have none, so tag the general silent marker instead.
+            metadata[SILENT_TURN_META] = True
         msg = InboundMessage(
             channel="system",
             sender_id="subagent",
