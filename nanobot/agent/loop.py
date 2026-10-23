@@ -410,6 +410,11 @@ class AgentLoop:
             model=self.model,
             tools_config=_tc,
             max_tool_result_chars=self.max_tool_result_chars,
+            context_window_tokens=(
+                subagent_run_snapshot.context_window_tokens
+                if subagent_run_snapshot
+                else context_window_tokens
+            ),
             restrict_to_workspace=restrict_to_workspace,
             disabled_skills=disabled_skills,
             max_iterations=self.max_iterations,
@@ -599,6 +604,11 @@ class AgentLoop:
         self.context_window_tokens = context_window_tokens
         self.runner.provider = provider
         self.subagents.set_provider(provider, model)
+        # A delegated run pinned to its own run preset keeps that preset's
+        # window; otherwise subagents follow the foreground model, so their
+        # window has to follow it too.
+        if self.subagents.run_provider is None:
+            self.subagents.context_window_tokens = context_window_tokens
         self.consolidator.set_provider(provider, model, context_window_tokens)
         self._provider_signature = snapshot.signature
         if publish_update and self._runtime_model_publisher is not None:

@@ -10,6 +10,7 @@ import pytest
 
 from nanobot.agent.hook import AgentHookContext
 from nanobot.agent.runner import AgentRunResult
+from nanobot.providers.base import LLMResponse
 from nanobot.agent.subagent import (
     SubagentManager,
     SubagentStatus,
@@ -17,7 +18,7 @@ from nanobot.agent.subagent import (
 )
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import ToolPolicyRuleConfig, ToolsConfig
-from nanobot.providers.base import LLMProvider
+from nanobot.providers.base import GenerationSettings, LLMProvider
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -913,3 +914,215 @@ class TestSubagentHook:
         ctx = _make_hook_context(error="something broke")
         await hook.after_iteration(ctx)
         assert status.error == "something broke"
+
+
+# ---------------------------------------------------------------------------
+# context window budget
+# ---------------------------------------------------------------------------
+
+
+class TestContextWindowBudget:
+    """A delegated run needs a RequestBudget, or it has no compaction at all.
+
+    Without `context_window_tokens` the runner builds no budget: no proactive
+    compaction, no overflow recovery, and the only ceiling is the request-byte
+    guard, so a chatty subagent grows until the provider rejects the request.
+    """
+
+    @pytest.mark.asyncio
+    async def test_manager_default_window_reaches_the_run_spec(self, tmp_path):
+        sm = _manager(tmp_path, context_window_tokens=1_000_000)
+        specs = []
+
+        async def capture(spec):
+            specs.append(spec)
+            return AgentRunResult(final_content="done", messages=[], stop_reason="completed")
+
+        sm.runner.run = capture
+        await sm.spawn("do something")
+        await _drain_subagent_tasks(sm)
+
+        assert [spec.context_window_tokens for spec in specs] == [1_000_000]
+
+    @pytest.mark.asyncio
+    async def test_spawn_override_beats_the_manager_default(self, tmp_path):
+        sm = _manager(tmp_path, context_window_tokens=1_000_000)
+        specs = []
+
+        async def capture(spec):
+            specs.append(spec)
+            return AgentRunResult(final_content="done", messages=[], stop_reason="completed")
+
+        sm.runner.run = capture
+        await sm.spawn("do something", context_window_tokens=32_768)
+        await _drain_subagent_tasks(sm)
+
+        assert [spec.context_window_tokens for spec in specs] == [32_768]
+
+    @pytest.mark.asyncio
+    async def test_absent_window_stays_absent(self, tmp_path):
+        """No configured window must not be invented — the spec keeps None."""
+        sm = _manager(tmp_path)
+        specs = []
+
+        async def capture(spec):
+            specs.append(spec)
+            return AgentRunResult(final_content="done", messages=[], stop_reason="completed")
+
+        sm.runner.run = capture
+        await sm.spawn("do something")
+        await _drain_subagent_tasks(sm)
+
+        assert [spec.context_window_tokens for spec in specs] == [None]
+
+    @pytest.mark.asyncio
+    async def test_effective_budgets_report_the_window(self, tmp_path):
+        sm = _manager(tmp_path, context_window_tokens=200_000)
+        statuses = []
+        original = sm._write_run_record
+
+        def spy(*args, **kwargs):
+            status = args[7] if len(args) > 7 else kwargs.get("status")
+            if status is not None:
+                statuses.append(status)
+            return original(*args, **kwargs)
+
+        sm._write_run_record = spy
+        sm.runner.run = AsyncMock(return_value=AgentRunResult(
+            final_content="done", messages=[], stop_reason="completed",
+        ))
+        await sm.spawn("do something")
+        await _drain_subagent_tasks(sm)
+
+        assert statuses
+        assert statuses[0].effective_budgets["context_window_tokens"] == 200_000
+
+
+class TestLoopWiresTheSubagentWindow:
+    """The loop owns the default: a run preset's window, else the foreground's."""
+
+    def _snapshot(self, provider, window: int):
+        from nanobot.providers.factory import ProviderSnapshot
+
+        return ProviderSnapshot(
+            provider=provider, model="preset-model", context_window_tokens=window,
+            signature=("preset", window),
+        )
+
+    def _loop(self, tmp_path, **kw):
+        """A minimal real loop — no spec'd mock, so provider internals resolve."""
+        from nanobot.agent.loop import AgentLoop
+
+        provider = kw.pop("provider", None) or MagicMock()
+        provider.get_default_model.return_value = "test-model"
+        provider.estimate_prompt_tokens.return_value = (10_000, "test")
+        provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="ok", tool_calls=[]))
+        provider.generation.max_tokens = 4096
+        loop = AgentLoop(
+            bus=MessageBus(),
+            provider=provider,
+            workspace=tmp_path,
+            model="test-model",
+            session_ttl_minutes=0,
+            **kw,
+        )
+        loop.tools.get_definitions = MagicMock(return_value=[])
+        return loop
+
+    def test_run_preset_window_wins_over_foreground(self, tmp_path):
+        provider = MagicMock()
+        loop = self._loop(
+            tmp_path,
+            context_window_tokens=128_000,
+            provider=provider,
+            subagent_run_snapshot=self._snapshot(provider, 1_000_000),
+        )
+        assert loop.subagents.context_window_tokens == 1_000_000
+
+    def test_foreground_window_used_without_a_run_preset(self, tmp_path):
+        loop = self._loop(tmp_path, context_window_tokens=128_000)
+        assert loop.subagents.context_window_tokens == 128_000
+
+    def test_foreground_preset_switch_tracks_only_without_a_run_preset(self, tmp_path):
+        from nanobot.providers.factory import ProviderSnapshot
+
+        loop = self._loop(tmp_path, context_window_tokens=128_000)
+        loop._apply_provider_snapshot(
+            ProviderSnapshot(
+                provider=loop.provider, model="other", context_window_tokens=64_000,
+                signature=("other",),
+            ),
+            publish_update=False,
+        )
+        assert loop.subagents.context_window_tokens == 64_000
+
+    def test_pinned_run_preset_ignores_a_foreground_switch(self, tmp_path):
+        from nanobot.providers.factory import ProviderSnapshot
+
+        provider = MagicMock()
+        loop = self._loop(
+            tmp_path,
+            context_window_tokens=128_000,
+            provider=provider,
+            subagent_run_snapshot=self._snapshot(provider, 1_000_000),
+        )
+        loop._apply_provider_snapshot(
+            ProviderSnapshot(
+                provider=provider, model="other", context_window_tokens=64_000,
+                signature=("other",),
+            ),
+            publish_update=False,
+        )
+        assert loop.subagents.context_window_tokens == 1_000_000
+
+
+class TestSubagentCompactionIsLive:
+    """With a window, the runner's own compaction path runs for a subagent.
+
+    The runner builds `CompactionEngine(provider, budget)` itself when no
+    factory is supplied, so delegated runs compact without any session
+    machinery — they only need the budget that a window creates.
+    """
+
+    def _provider(self, estimate: int):
+        provider = MagicMock()
+        provider.get_default_model.return_value = "test-model"
+        provider.generation = GenerationSettings(max_tokens=1000)
+        provider.estimate_prompt_tokens = MagicMock(return_value=(estimate, "fake"))
+        provider.chat_with_retry = AsyncMock(
+            return_value=LLMResponse(content="done", tool_calls=[], usage={})
+        )
+        return provider
+
+    async def _run_once(self, tmp_path, monkeypatch, *, window):
+        from nanobot.agent import runner as runner_mod
+        from nanobot.session.compaction import CompactionError
+
+        built: list[str] = []
+
+        class SpyEngine:
+            def __init__(self, *args, **kwargs):
+                built.append("engine")
+
+            async def prepare(self, *args, **kwargs):
+                built.append("prepare")
+                raise CompactionError("spy: stop before summarising")
+
+        monkeypatch.setattr(runner_mod, "CompactionEngine", SpyEngine)
+        sm = _manager(
+            tmp_path,
+            provider=self._provider(20_000),
+            context_window_tokens=window,
+            max_iterations=1,
+        )
+        await sm.spawn("do something")
+        await _drain_subagent_tasks(sm)
+        return built
+
+    @pytest.mark.asyncio
+    async def test_window_builds_a_compaction_engine(self, tmp_path, monkeypatch):
+        assert await self._run_once(tmp_path, monkeypatch, window=10_000) == ["engine"]
+
+    @pytest.mark.asyncio
+    async def test_no_window_never_compacts(self, tmp_path, monkeypatch):
+        assert await self._run_once(tmp_path, monkeypatch, window=None) == []
