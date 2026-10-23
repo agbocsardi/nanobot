@@ -134,6 +134,7 @@ class SubagentManager:
         workspace: Path,
         bus: MessageBus,
         max_tool_result_chars: int,
+        context_window_tokens: int | None = None,
         model: str | None = None,
         tools_config: ToolsConfig | None = None,
         restrict_to_workspace: bool = False,
@@ -155,6 +156,11 @@ class SubagentManager:
         self.model = model or provider.get_default_model()
         self.tools_config = tools_config or ToolsConfig()
         self.max_tool_result_chars = max_tool_result_chars
+        # Default window for delegated runs. Without it a subagent has no
+        # RequestBudget at all: no proactive compaction, no overflow recovery,
+        # and the only ceiling is the request-byte guard, so it grows until the
+        # provider rejects the request. A per-spawn preset overrides this.
+        self.context_window_tokens = context_window_tokens
         self.restrict_to_workspace = restrict_to_workspace
         self.disabled_skills = set(disabled_skills or [])
         self.max_iterations = (
@@ -297,6 +303,8 @@ class SubagentManager:
         effective_provider = provider_override or self.run_provider or self.provider
         effective_model = model_override or self.run_model or self.model
         effective_ctx = context_window_tokens if context_window_tokens is not None else preset_ctx
+        if effective_ctx is None:
+            effective_ctx = self.context_window_tokens
         effective_max_iterations = (
             max_iterations if max_iterations is not None else self.max_iterations
         )
