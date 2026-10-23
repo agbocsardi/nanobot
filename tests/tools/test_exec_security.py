@@ -242,6 +242,92 @@ async def test_exec_ignores_workspace_check_when_not_restricted(tmp_path):
     assert "outside the configured workspace" not in result
 
 
+# --- colon tokens are not paths (POSIX) -------------------------------------
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell syntax")
+@pytest.mark.parametrize(
+    "command",
+    [
+        # python `except Exception as e:` in a heredoc (real-world false positive)
+        "python3 - <<'PY'\nfor i in range(2):\n    try:\n        print(i)\n"
+        "    except Exception as e:\n        print('err', e)\nPY",
+        'python3 -c "import sys\ntry:\n    pass\nexcept Exception as e:\n    print(e)"',
+        "printf '%s: ' hi",
+        "date +%H:%M",
+        "ffmpeg -i in.mp4 -c:v libx264 out.mp4",
+        "git log --format=%h:%s -5",
+        "curl -H 'X: y' example.com",
+        "awk -F: '{print $1}' notes.txt",
+        "(ss -lntp 2>/dev/null || ss -lntp) | head",
+    ],
+)
+def test_exec_allows_shell_colon_tokens(tmp_path, command):
+    """`e:`, `c:`, `%H:` and friends must not be read as drive-letter paths.
+
+    The drive-letter regex is Windows-only; on POSIX it made the guard resolve
+    a pseudo-path against the gateway cwd and hard-block legitimate commands.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    tool = ExecTool(working_dir=str(workspace), restrict_to_workspace=True)
+    assert tool._guard_command(
+        command, str(workspace), workspace_root=str(workspace)
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "command, target",
+    [
+        ("cat /etc/passwd", "/etc/passwd"),
+        ("awk -F: '{print $1}' /etc/passwd", "/etc/passwd"),
+        ("echo pwn > /etc/issue", "/etc/issue"),
+        ("cat ~/.nanobot-szarszo/config.json", "/.nanobot-szarszo/"),
+        ("cat ../outside/secret.txt", "path traversal detected"),
+    ],
+)
+def test_exec_still_blocks_genuinely_outside_paths(tmp_path, command, target):
+    """Tightening the extractor must not weaken the boundary."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    tool = ExecTool(working_dir=str(workspace), restrict_to_workspace=True)
+    error = tool._guard_command(command, str(workspace), workspace_root=str(workspace))
+    assert error is not None
+    assert target in error
+
+
+def test_exec_guard_error_names_the_offending_path(tmp_path):
+    """The guard reports the path that tripped it, not the workspace."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    tool = ExecTool(working_dir=str(workspace), restrict_to_workspace=True)
+
+    error = tool._guard_command(
+        f"cat {workspace / 'notes.md'} && cat /tmp/outside.txt",
+        str(workspace),
+        workspace_root=str(workspace),
+    )
+
+    assert error is not None
+    assert 'target_path="/tmp/outside.txt"' in error
+    assert str(workspace) not in error
+
+
+def test_exec_guard_anchors_relative_paths_to_tool_cwd(tmp_path, monkeypatch):
+    """Extracted relative paths resolve against the tool cwd, not the process cwd."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    tool = ExecTool(working_dir=str(workspace), restrict_to_workspace=True)
+
+    monkeypatch.setattr(
+        ExecTool, "_extract_absolute_paths", staticmethod(lambda _cmd: ["notes.txt"])
+    )
+
+    # The gateway process cwd is the repo root, outside the workspace: resolving
+    # against it would block this command.
+    assert tool._guard_command("cat notes.txt", str(workspace)) is None
+
+
 # --- #3599: stdio redirects to /dev/null must not trip the workspace guard ----
 
 

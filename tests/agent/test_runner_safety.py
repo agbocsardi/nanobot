@@ -247,3 +247,57 @@ async def test_runner_throttles_repeated_workspace_bypass_attempts():
         "expected at least one escalated workspace_violation event, got: "
         f"{result.tool_events}"
     )
+
+
+@pytest.mark.asyncio
+async def test_runner_escalation_names_the_guard_target_not_the_workspace():
+    """The guard's own ``target_path`` drives the throttle signature.
+
+    Before the fix the signature came from the first path-looking token in the
+    command -- usually the agent's workspace -- so the escalation told the model
+    it had tried to reach its own workspace.
+    """
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
+
+    workspace = "/home/u/.nanobot/workspace"
+    guard_error = (
+        "Error: Command blocked by safety guard (path outside working dir)"
+        ' [target_path="/tmp/outside.txt"]'
+    )
+    responses: list[LLMResponse] = [
+        LLMResponse(
+            content=f"try {i}",
+            tool_calls=[ToolCallRequest(
+                id=f"a{i}",
+                name="exec",
+                arguments={"command": f"cat {workspace}/notes.md && cat /tmp/outside.txt"},
+            )],
+        )
+        for i in range(3)
+    ]
+    responses.append(LLMResponse(content="ok telling user", tool_calls=[]))
+
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(side_effect=responses)
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(return_value=guard_error)
+
+    runner = AgentRunner(provider)
+    result = await runner.run(AgentRunSpec(
+        initial_messages=[],
+        tools=tools,
+        model="test-model",
+        max_iterations=10,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    ))
+
+    escalated = [
+        ev for ev in result.tool_events
+        if ev["detail"].startswith("workspace_violation_escalated:")
+    ]
+    assert escalated, f"expected an escalation, got: {result.tool_events}"
+    tool_messages = [m for m in result.messages if m.get("role") == "tool"]
+    escalation_text = tool_messages[-1]["content"]
+    assert "'/tmp/outside.txt'" in escalation_text
+    assert workspace not in escalation_text

@@ -131,12 +131,25 @@ def repeated_external_lookup_error(
 
 _OUTSIDE_PATH_PATTERN = re.compile(r"(?:^|[\s|>'\"])((?:/[^\s\"'>;|<]+)|(?:~[^\s\"'>;|<]+))")
 
+# The shell guard tags its error with the path that actually tripped it
+# (``[target_path="/etc/issue"]``).  That is authoritative: the first
+# path-looking token in the command is often an in-workspace path, which made
+# unrelated failures collapse onto the agent's own workspace signature.
+_GUARD_TARGET_PATTERN = re.compile(r'target_path="(?P<target>[^"]+)"')
+
 
 def workspace_violation_signature(
     tool_name: str,
     arguments: Any,
+    *,
+    raw_text: str | None = None,
 ) -> str | None:
     """Return a stable cross-tool signature for the outside-workspace target."""
+    if raw_text:
+        match = _GUARD_TARGET_PATTERN.search(raw_text)
+        if match:
+            return _normalize_violation_target(match.group("target").strip())
+
     if not isinstance(arguments, dict):
         return None
     for key in ("path", "file_path", "target", "source", "destination"):
@@ -170,9 +183,11 @@ def repeated_workspace_violation_error(
     tool_name: str,
     arguments: Any,
     seen_counts: dict[str, int],
+    *,
+    raw_text: str | None = None,
 ) -> str | None:
     """Return an escalated error after repeated bypass attempts."""
-    signature = workspace_violation_signature(tool_name, arguments)
+    signature = workspace_violation_signature(tool_name, arguments, raw_text=raw_text)
     if signature is None:
         return None
     count = seen_counts.get(signature, 0) + 1

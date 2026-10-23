@@ -222,18 +222,66 @@ async def test_registry_returns_validation_error() -> None:
     assert "Invalid parameters" in result
 
 
-def test_exec_extract_absolute_paths_keeps_full_windows_path() -> None:
+def test_exec_extract_absolute_paths_keeps_full_windows_path(monkeypatch) -> None:
+    import nanobot.agent.tools.shell as shell_mod
+
+    monkeypatch.setattr(shell_mod, "_IS_WINDOWS", True)
     cmd = r"type C:\user\workspace\txt"
     paths = ExecTool._extract_absolute_paths(cmd)
     assert paths == [r"C:\user\workspace\txt"]
 
 
-def test_exec_extract_absolute_paths_captures_windows_drive_root_path() -> None:
+def test_exec_extract_absolute_paths_captures_windows_drive_root_path(monkeypatch) -> None:
     """Windows drive root paths like `E:\\` must be extracted for workspace guarding."""
+    import nanobot.agent.tools.shell as shell_mod
+
+    monkeypatch.setattr(shell_mod, "_IS_WINDOWS", True)
     # Note: raw strings cannot end with a single backslash.
     cmd = "dir E:\\"
     paths = ExecTool._extract_absolute_paths(cmd)
     assert paths == ["E:\\"]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # python `except X as e:` inside a heredoc / -c snippet
+        "python3 - <<'PY'\ntry:\n    pass\nexcept Exception as e:\n    print(e)\nPY",
+        "printf '%s: ' hi",
+        "date +%H:%M",
+        "ffmpeg -i in.mp4 -c:v libx264 out.mp4",
+        "git log --format=%h:%s -5",
+        "curl -H 'X: y' example.com",
+        "awk -F: '{print $1}' notes.txt",
+    ],
+)
+def test_exec_extract_absolute_paths_ignores_colon_tokens_on_posix(
+    monkeypatch, command: str
+) -> None:
+    """`e:` / `c:` / `%H:` are shell/python syntax, not drive letters (POSIX)."""
+    import nanobot.agent.tools.shell as shell_mod
+
+    monkeypatch.setattr(shell_mod, "_IS_WINDOWS", False)
+    assert ExecTool._extract_absolute_paths(command) == []
+
+
+def test_exec_extract_absolute_paths_keeps_windows_paths_on_windows(monkeypatch) -> None:
+    """Gating the drive-letter regex on Windows keeps real Windows paths working."""
+    import nanobot.agent.tools.shell as shell_mod
+
+    monkeypatch.setattr(shell_mod, "_IS_WINDOWS", True)
+    assert ExecTool._extract_absolute_paths(r"dir C:\temp") == [r"C:\temp"]
+    assert ExecTool._extract_absolute_paths(
+        r"copy \\server\share\a.txt D:\backup"
+    ) == [r"\\server\share\a.txt", r"D:\backup"]
+    # A bare colon is not a drive path even on Windows.
+    assert ExecTool._extract_absolute_paths("git log --format=%h:%s -5") == []
+
+
+def test_exec_extract_absolute_paths_strips_trailing_shell_punctuation() -> None:
+    """`/dev/null)` from a subshell must be recognised as `/dev/null`."""
+    paths = ExecTool._extract_absolute_paths("(ss -lntp 2>/dev/null || ss -lntp)")
+    assert paths == ["/dev/null"]
 
 
 def test_exec_extract_absolute_paths_ignores_relative_posix_segments() -> None:
@@ -331,6 +379,8 @@ def test_exec_guard_allows_media_path_outside_workspace(tmp_path, monkeypatch) -
 
 def test_exec_guard_blocks_windows_drive_root_outside_workspace(monkeypatch) -> None:
     import nanobot.agent.tools.shell as shell_mod
+
+    monkeypatch.setattr(shell_mod, "_IS_WINDOWS", True)
 
     class FakeWindowsPath:
         def __init__(self, raw: str) -> None:
