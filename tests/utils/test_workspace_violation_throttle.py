@@ -118,3 +118,58 @@ def test_repeated_workspace_violation_collapses_tool_switching():
     )
     assert third is not None
     assert "refusing repeated workspace-bypass" in third
+
+
+_WS = "/home/u/.nanobot/workspace"
+_GUARD_ERROR = (
+    "Error: Command blocked by safety guard (path outside working dir)"
+    ' [target_path="/tmp/outside.txt"]'
+)
+
+
+def test_signature_prefers_guard_target_over_first_path_in_command():
+    """The guard's own target wins over the first path-looking token.
+
+    The command's first absolute path is often the agent's workspace, which
+    would make the throttle report the workspace as the violation target.
+    """
+    sig = workspace_violation_signature(
+        "exec",
+        {"command": f"cat {_WS}/notes.md && cat /tmp/outside.txt"},
+        raw_text=_GUARD_ERROR,
+    )
+    assert sig is not None
+    assert "/tmp/outside.txt" in sig
+    assert _WS.lower() not in sig
+
+
+def test_signature_ignores_marker_free_text():
+    """Ordinary tool errors still use the argument-based signature."""
+    sig = workspace_violation_signature(
+        "exec",
+        {"command": "cat /Users/x/Downloads/01.md"},
+        raw_text="Error: Command blocked by safety guard (path outside working dir)",
+    )
+    assert sig is not None
+    assert "/users/x/downloads/01.md" in sig
+
+
+def test_escalation_names_the_real_offending_path():
+    """Escalation text and throttle key must name the guard's target."""
+    counts: dict[str, int] = {}
+    arguments = {"command": f"cat {_WS}/notes.md && cat /tmp/outside.txt"}
+
+    assert repeated_workspace_violation_error(
+        "exec", arguments, counts, raw_text=_GUARD_ERROR,
+    ) is None
+    assert repeated_workspace_violation_error(
+        "exec", arguments, counts, raw_text=_GUARD_ERROR,
+    ) is None
+    third = repeated_workspace_violation_error(
+        "exec", arguments, counts, raw_text=_GUARD_ERROR,
+    )
+
+    assert third is not None
+    assert "'/tmp/outside.txt'" in third
+    assert _WS.lower() not in third.lower()
+    assert list(counts) == ["violation:/tmp/outside.txt"]

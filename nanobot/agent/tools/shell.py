@@ -664,7 +664,12 @@ class ExecTool(Tool):
                     # ``Path.resolve()`` would mask the device-file intent.
                     if self._is_benign_device_path(expanded):
                         continue
-                    p = Path(expanded).expanduser().resolve()
+                    p = Path(expanded).expanduser()
+                    # Anything not absolute is relative to the tool's cwd, not
+                    # to the gateway process cwd.
+                    if not p.is_absolute():
+                        p = cwd_path / p
+                    p = p.resolve()
                 except Exception:
                     continue
 
@@ -679,12 +684,23 @@ class ExecTool(Tool):
                 if not allowed and resolved_workspace is not None:
                     allowed = is_path_within(p, resolved_workspace)
                 if p.is_absolute() and not allowed:
-                    return (
-                        "Error: Command blocked by safety guard (path outside working dir)"
-                        + _WORKSPACE_BOUNDARY_NOTE
-                    )
+                    return self._workspace_blocked(p)
 
         return None
+
+    @staticmethod
+    def _workspace_blocked(target: Path | str) -> str:
+        """Workspace-boundary error that names the path which tripped it.
+
+        The ``target_path="..."`` marker is machine-readable: the runner parses
+        it so throttling keys on the real offending path instead of guessing
+        from the command text.
+        """
+        return (
+            "Error: Command blocked by safety guard (path outside working dir)"
+            f' [target_path="{target}"]'
+            + _WORKSPACE_BOUNDARY_NOTE
+        )
 
     @staticmethod
     def _split_shell_segments(command: str) -> list[str]:
@@ -768,12 +784,25 @@ class ExecTool(Tool):
 
     @staticmethod
     def _extract_absolute_paths(command: str) -> list[str]:
-        # Windows: match drive-root paths like `C:\` as well as `C:\path\to\file`, and UNC paths like `\\server\share`
-        # NOTE: `*` is required so `C:\` (nothing after the slash) is still extracted.
-        win_paths = re.findall(
-            r"(?<![A-Za-z])(?:[A-Za-z]:[^\s\"'|><;]*|\\\\[^\s\"'|><;]+(?:\\[^\s\"'|><;]+)*)",
-            command
-        )
+        # Windows only: drive-root paths like `C:\` as well as `C:\path\to\file`,
+        # and UNC paths like `\\server\share`.  A separator must follow the drive
+        # colon, so `C:\` still matches while a bare `e:` (python's `except X as e:`,
+        # `ffmpeg -c:v`, `date +%H:%M`, `awk -F:`) is not mistaken for a path.
+        # On POSIX there are no drive letters, and matching them blocked plenty
+        # of legitimate commands.
+        win_paths: list[str] = []
+        if _IS_WINDOWS:
+            win_paths = re.findall(
+                r"(?<![A-Za-z])(?:[A-Za-z]:[\\/][^\s\"'|><;]*|\\\\[^\s\"'|><;]+(?:\\[^\s\"'|><;]+)*)",
+                command
+            )
         posix_paths = re.findall(r"(?:^|[\s|>'\"])(/[^\s\"'>;|<]+)", command) # POSIX: /absolute only
         home_paths = re.findall(r"(?:^|[\s>'\"])(~[^\s\"'>;|<]*)", command) # POSIX/Windows home shortcut: ~
-        return win_paths + posix_paths + home_paths
+        # Trailing shell punctuation belongs to the syntax, not to the path:
+        # ``(ss -lntp 2>/dev/null || ...)`` yields ``/dev/null)``, which would
+        # otherwise dodge the benign-device exemption.
+        return [
+            path
+            for path in (raw.rstrip("),;:]}") for raw in win_paths + posix_paths + home_paths)
+            if path
+        ]

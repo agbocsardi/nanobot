@@ -408,6 +408,12 @@ class TestExecuteEndToEnd:
 class TestExtractAbsolutePaths:
     """Tests for Windows UNC path extraction in shell commands."""
 
+    @pytest.fixture(autouse=True)
+    def _windows_platform(self):
+        # Drive-letter and UNC extraction only runs on Windows.
+        with patch("nanobot.agent.tools.shell._IS_WINDOWS", True):
+            yield
+
     def test_windows_drive_path(self):
         """Test extraction of standard Windows drive paths."""
         cmd = r"dir C:\Users\Public"
