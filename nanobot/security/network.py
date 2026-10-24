@@ -8,6 +8,7 @@ import socket
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
+from dataclasses import dataclass
 from urllib.parse import urlparse
 
 _BLOCKED_NETWORKS = [
@@ -176,14 +177,62 @@ def validate_resolved_url(url: str) -> tuple[bool, str]:
     return True, ""
 
 
-def contains_internal_url(command: str, *, allow_loopback: bool = False) -> bool:
-    """Return True if the command string contains a URL targeting an internal/private address."""
-    for m in _URL_RE.finditer(command):
-        url = m.group(0)
-        ok, _ = validate_url_target(url, allow_loopback=allow_loopback)
-        if not ok:
-            return True
-    return False
+@dataclass(frozen=True)
+class UnsafeExecUrl:
+    """A URL found in shell-command text that must not be dialled from exec.
+
+    ``reason`` distinguishes *why* the URL was rejected so the caller can report
+    the actual cause instead of always claiming an internal address:
+
+    - ``internal_target`` — the host resolves to a private/internal address.
+    - ``unresolvable`` — the host does not resolve at all (stale or misspelled).
+    - ``invalid`` — the URL is malformed or uses a scheme exec does not accept.
+    """
+
+    url: str
+    reason: str
+    hostname: str = ""
+    address: str = ""
+
+
+def find_unsafe_exec_url(command: str, *, allow_loopback: bool = False) -> UnsafeExecUrl | None:
+    """Return the first URL in *command* that is unsafe to dial, with its cause.
+
+    This is the lexical pre-flight check used by the exec tool: it inspects
+    command *text* only, so it can be defeated by passing the URL through a file
+    or a script. Callers must report it as a command-text rejection, not as a
+    transport-boundary SSRF block.
+    """
+    for match in _URL_RE.finditer(command):
+        url = match.group(0)
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            return UnsafeExecUrl(url=url, reason="invalid")
+        hostname = parsed.hostname or ""
+        if parsed.scheme not in ("http", "https") or not parsed.netloc or not hostname:
+            return UnsafeExecUrl(url=url, reason="invalid", hostname=hostname)
+        try:
+            infos = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        except socket.gaierror:
+            return UnsafeExecUrl(url=url, reason="unresolvable", hostname=hostname)
+        addrs: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+        for info in infos:
+            try:
+                addrs.append(ipaddress.ip_address(info[4][0]))
+            except ValueError:
+                continue
+        if allow_loopback and _is_allowed_loopback_target(hostname, addrs):
+            continue
+        for addr in addrs:
+            if _is_private(addr):
+                return UnsafeExecUrl(
+                    url=url,
+                    reason="internal_target",
+                    hostname=hostname,
+                    address=str(addr),
+                )
+    return None
 
 
 def _is_allowed_loopback_target(

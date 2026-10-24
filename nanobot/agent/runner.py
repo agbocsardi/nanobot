@@ -2143,6 +2143,20 @@ class AgentRunner:
     )
 
     # Non-SSRF boundary markers returned to the LLM as recoverable tool errors.
+    # The exec tool's URL check is lexical command-text scanning, not a transport
+    # guard: nothing is dialled, and a script that reads the URL from disk walks
+    # straight past it. It gets its own marker and its own advice so it is not
+    # reported as a non-bypassable web-SSRF block.
+    _EXEC_URL_MARKER: str = "blocked by exec url guard"
+    _EXEC_URL_NOTE: str = (
+        "This is a lexical check on the exec command text — nothing was fetched. "
+        "If the URL is only data (a sed replacement, an echo line, a comment), "
+        "write it to a file with a file tool and reference the file, or build the "
+        "string inside the command (e.g. from parts), then retry. If you "
+        "deliberately need to reach that address, ask the user to whitelist the "
+        "exact IP/CIDR via tools.ssrfWhitelist."
+    )
+
     _WORKSPACE_VIOLATION_MARKERS: tuple[str, ...] = (
         "outside the configured workspace",
         "outside allowed directory",
@@ -2158,6 +2172,11 @@ class AgentRunner:
             return False
         lowered = text.lower()
         return any(marker in lowered for marker in cls._SSRF_MARKERS)
+
+    @classmethod
+    def _is_exec_url_block(cls, text: str) -> bool:
+        """True for the exec tool's lexical URL rejection (not a web SSRF block)."""
+        return bool(text) and cls._EXEC_URL_MARKER in text.lower()
 
     @classmethod
     def _is_workspace_violation(cls, text: str) -> bool:
@@ -2179,6 +2198,16 @@ class AgentRunner:
         workspace_violation_counts: dict[str, int],
     ) -> tuple[Any, dict[str, Any], BaseException | None] | None:
         """Classify safety-boundary failures, or return ``None`` to pass through."""
+        if self._is_exec_url_block(raw_text):
+            logger.warning(
+                "Tool {} blocked by exec URL guard (lexical command check, no request sent): {}",
+                tool_call.name,
+                raw_text.replace("\n", " ").strip()[:200],
+            )
+            event["detail"] = self._event_detail("exec_url_guard: ", raw_text)
+            event.update({"status": "policy_block", "retryable": True})
+            return self._exec_url_soft_payload(raw_text), event, None
+
         if self._is_ssrf_violation(raw_text):
             logger.warning(
                 "Tool {} blocked by SSRF guard; returning non-retryable tool error: {}",
@@ -2216,6 +2245,11 @@ class AgentRunner:
     def _ssrf_soft_payload(cls, raw_text: str) -> str:
         text = raw_text.strip() or "Error: request blocked by SSRF guard"
         return f"{text}\n\n{cls._SSRF_BOUNDARY_NOTE}"
+
+    @classmethod
+    def _exec_url_soft_payload(cls, raw_text: str) -> str:
+        text = raw_text.strip() or "Error: command blocked by exec URL guard"
+        return f"{text}\n\n{cls._EXEC_URL_NOTE}"
 
     @staticmethod
     def _event_detail(prefix: str, text: str, limit: int = 160) -> str:
