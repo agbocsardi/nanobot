@@ -31,7 +31,8 @@ class ReadonlyWorkerConfig(Base):
     max_concurrency: int = Field(default=4, ge=1, le=8)
     global_max_concurrency: int = Field(default=8, ge=1, le=8,
                                         description="Process-wide child cap, bounded by 8 reserved child sandbox slots")
-    max_model_calls: int = Field(default=8, ge=1, le=128)
+    max_model_calls: int = Field(default=8, ge=1, le=128,
+                                 description="Model calls per worker; the run total is bounded by max_workers * this")
     max_tokens: int = Field(default=64000, ge=4000, le=1_000_000,
                             description="Shared conservative input-byte plus output-token reservations")
     output_tokens: int = Field(default=1024, ge=128, le=4096)
@@ -47,15 +48,19 @@ class ReadonlyWorkerConfig(Base):
 
 
 @dataclass
-class ToolBudget:
-    """Artifact tool allowance for one worker, so a chatty worker cannot starve siblings."""
+class WorkerAllowance:
+    """One worker's allowance for a metered resource, so a chatty worker cannot starve siblings."""
 
     limit: int
+    resource: str
     used: int = 0
+
+    def refusal(self) -> str:
+        return f"Per-worker {self.resource} budget exhausted ({self.used}/{self.limit} calls)"
 
     def charge(self) -> None:
         if self.used >= self.limit:
-            raise ValueError(f"Per-worker tool budget exhausted ({self.used}/{self.limit} calls)")
+            raise ValueError(self.refusal())
         self.used += 1
 
 
@@ -76,7 +81,7 @@ class WorkerRun:
     def __post_init__(self) -> None:
         self.slots = asyncio.Semaphore(self.config.max_concurrency)
 
-    def charge_tool(self, budget: ToolBudget | None = None) -> None:
+    def charge_tool(self, budget: WorkerAllowance | None = None) -> None:
         """Charge this worker's allowance and the run-wide aggregate, without over-counting.
 
         ``budget`` defaults to the current worker's allowance so the codemode bridge
@@ -85,17 +90,36 @@ class WorkerRun:
         budget = budget if budget is not None else WORKER_TOOL_BUDGET.get()
         total_max = self.config.max_workers * self.config.max_tool_calls
         if budget is not None and budget.used >= budget.limit:
-            raise ValueError(f"Per-worker tool budget exhausted ({budget.used}/{budget.limit} calls)")
+            raise ValueError(budget.refusal())
         if self.tool_calls >= total_max:
             raise ValueError(f"Run-wide worker tool budget exhausted ({self.tool_calls}/{total_max} calls)")
         if budget is not None:
             budget.used += 1
         self.tool_calls += 1
 
+    def charge_model_call(self, budget: WorkerAllowance | None = None) -> None:
+        """Charge this worker's model-call allowance and the run-wide aggregate, without over-counting.
+
+        ``budget`` defaults to the current worker's allowance so every provider call
+        inside a worker charges the same per-worker counter.
+        """
+        budget = budget if budget is not None else WORKER_CALL_BUDGET.get()
+        total_max = self.config.max_workers * self.config.max_model_calls
+        if budget is not None and budget.used >= budget.limit:
+            raise WorkerBudgetExceededError(budget.refusal())
+        if self.calls >= total_max:
+            raise WorkerBudgetExceededError(
+                f"Run-wide model-call budget exhausted ({self.calls}/{total_max} calls)")
+        if budget is not None:
+            budget.used += 1
+        self.calls += 1
+
 
 WORKER_RUN: ContextVar[WorkerRun | None] = ContextVar("readonly_worker_run", default=None)
 # The current worker's own tool allowance; None outside a worker.
-WORKER_TOOL_BUDGET: ContextVar[ToolBudget | None] = ContextVar("readonly_worker_tool_budget", default=None)
+WORKER_TOOL_BUDGET: ContextVar[WorkerAllowance | None] = ContextVar("readonly_worker_tool_budget", default=None)
+# The current worker's own model-call allowance; None outside a worker.
+WORKER_CALL_BUDGET: ContextVar[WorkerAllowance | None] = ContextVar("readonly_worker_call_budget", default=None)
 # None = parent. Even an empty set means a child, with no artifact access.
 WORKER_SCOPE: ContextVar[set[str] | None] = ContextVar("readonly_worker_scope", default=None)
 _active_children = 0
@@ -177,10 +201,10 @@ class ArtifactTool(Tool):
 class WorkerRegistry(ToolRegistry):
     """No parent references, bootstrap loader, mutation tools or recursive delegation."""
 
-    def __init__(self, run: WorkerRun, budget: ToolBudget | None = None):
+    def __init__(self, run: WorkerRun, budget: WorkerAllowance | None = None):
         super().__init__()
         self.run = run
-        self.budget = budget if budget is not None else ToolBudget(run.config.max_tool_calls)
+        self.budget = budget if budget is not None else WorkerAllowance(run.config.max_tool_calls, "tool")
 
     def prepare_call(self, name, params):
         self.run.charge_tool(self.budget)
@@ -223,11 +247,10 @@ class BudgetProvider(LLMProvider):
         # UTF-8 bytes conservatively bound tokenized input, unlike a chars/4 guess.
         reservation = len(json.dumps({"messages": messages, "tools": tools},
                                      ensure_ascii=False).encode()) + max_tokens
-        if run.calls >= run.config.max_model_calls:
-            raise WorkerBudgetExceededError("Shared worker model-call budget exhausted")
         if run.reserved_tokens + reservation > run.config.max_tokens:
             raise WorkerBudgetExceededError("Shared worker token reservation budget exhausted")
-        run.calls += 1
+        # Model calls are per-worker, with a separate run-wide aggregate cap.
+        run.charge_model_call()
         run.reserved_tokens += reservation
         response = await self.provider.chat(messages=messages, tools=tools, model=self.model,
                                             max_tokens=max_tokens, **kwargs)
@@ -246,18 +269,20 @@ class BudgetProvider(LLMProvider):
         return response
 
 
-def _budget_snapshot(run: WorkerRun) -> dict[str, Any]:
+def _budget_snapshot(run: WorkerRun, call_budget: WorkerAllowance | None = None) -> dict[str, Any]:
     """Remaining-capacity view attached to every worker result.
 
-    Tool calls report the run aggregate plus the per-worker allowance; the per-worker
-    used count is deliberately not attributed here because a result can be returned
-    from a scope where no worker is current.
+    Tool and model calls report the run aggregate plus the per-worker allowance. The
+    per-worker used count is only attributed when the result is created inside its own
+    worker scope; pre-admission results carry ``None``.
     """
     return {
         "workers_used": run.workers,
         "workers_max": run.config.max_workers,
         "model_calls_used": run.calls,
-        "model_calls_max": run.config.max_model_calls,
+        "model_calls_max": run.config.max_workers * run.config.max_model_calls,
+        "model_calls_per_worker_max": run.config.max_model_calls,
+        "model_calls_this_worker_used": call_budget.used if call_budget is not None else None,
         "tokens_reserved": run.reserved_tokens,
         "tokens_max": run.config.max_tokens,
         "tool_calls_used": run.tool_calls,
@@ -314,9 +339,11 @@ async def _run_request(task, artifacts, material, *, one_shot):
     # Count accepted requests before queueing; fan-out cannot evade the total cap.
     run.workers += 1
     allowed = set(artifacts)
-    worker_budget = ToolBudget(run.config.max_tool_calls)
+    worker_budget = WorkerAllowance(run.config.max_tool_calls, "tool")
+    worker_calls = WorkerAllowance(run.config.max_model_calls, "model-call")
     scope_token = WORKER_SCOPE.set(allowed)
     budget_token = WORKER_TOOL_BUDGET.set(worker_budget)
+    call_token = WORKER_CALL_BUDGET.set(worker_calls)
     provider = None
     evidence = WorkerEvidence()
     try:
@@ -345,7 +372,7 @@ async def _run_request(task, artifacts, material, *, one_shot):
                         "stop_reason": "error" if failed else "partial" if partial else "completed",
                         "content": response.content,
                         "error": response.content if failed else "Incomplete one-shot answer" if partial else None,
-                        "evidence": [], "usage": provider.usage, "budget": _budget_snapshot(run)}
+                        "evidence": [], "usage": provider.usage, "budget": _budget_snapshot(run, worker_calls)}
             registry = WorkerRegistry(run, worker_budget)
             registry.register(ArtifactTool(run, allowed))
             registry.register(ArtifactTool(run, allowed, search=True))
@@ -375,18 +402,19 @@ async def _run_request(task, artifacts, material, *, one_shot):
             return {"status": "success" if result.stop_reason == "completed" else "partial",
                     "stop_reason": result.stop_reason, "content": result.final_content,
                     "error": result.error, "evidence": result.tool_events,
-                    "usage": provider.usage, "budget": _budget_snapshot(run)}
+                    "usage": provider.usage, "budget": _budget_snapshot(run, worker_calls)}
     except TimeoutError:
         return {"status": "timeout", "error": "Worker deadline exceeded",
                 "evidence": evidence.events, "usage": provider.usage if provider else [],
-                "budget": _budget_snapshot(run)}
+                "budget": _budget_snapshot(run, worker_calls)}
     except asyncio.CancelledError:
         raise
     except Exception as exc:
         return {"status": "budget_exhausted" if isinstance(exc, WorkerBudgetExceededError) else "error",
                 "error": f"{type(exc).__name__}: {exc}",
                 "evidence": evidence.events, "usage": provider.usage if provider else [],
-                "budget": _budget_snapshot(run)}
+                "budget": _budget_snapshot(run, worker_calls)}
     finally:
         WORKER_SCOPE.reset(scope_token)
         WORKER_TOOL_BUDGET.reset(budget_token)
+        WORKER_CALL_BUDGET.reset(call_token)
