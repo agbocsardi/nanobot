@@ -183,6 +183,7 @@ class AgentRunSpec:
     compaction_engine_factory: Any | None = None
     continuity_checkpoint: dict[str, Any] | None = None
     microcompact_through: str | None = None
+    worker_usage_callback: Any | None = None
 
 
 @dataclass(slots=True)
@@ -197,6 +198,8 @@ class AgentRunResult:
     error: str | None = None
     tool_events: list[dict[str, Any]] = field(default_factory=list)
     had_injections: bool = False
+    # Child requests are separate from foreground usage to preserve model attribution.
+    worker_usage: list[dict[str, Any]] = field(default_factory=list)
 
 
 class AgentRunner:
@@ -360,6 +363,24 @@ class AgentRunner:
         return True
 
     async def run(self, spec: AgentRunSpec) -> AgentRunResult:
+        from nanobot.agent.tools._readonly_worker import WORKER_RUN, WORKER_SCOPE, WorkerRun
+
+        codemode = spec.tools.get("codemode")
+        if (codemode is None or not codemode.config.workers.enable
+                or WORKER_SCOPE.get() is not None):
+            return await self._run(spec)
+        state = WorkerRun(codemode.config.workers.model_copy(deep=True), codemode.worker_snapshot_loader,
+                          usage_callback=spec.worker_usage_callback)
+        token = WORKER_RUN.set(state)
+        try:
+            result = await self._run(spec)
+            result.worker_usage = list(state.usage)
+            return result
+        finally:
+            WORKER_RUN.reset(token)
+            state.artifacts.close()
+
+    async def _run(self, spec: AgentRunSpec) -> AgentRunResult:
         # Freeze the output allowance with model/window before any await. Never
         # combine a hot-reloaded provider default with an older run's window.
         if spec.context_window_tokens:
@@ -1612,9 +1633,30 @@ class AgentRunner:
                     id=f"{tool_call.id}/codemode/{request_id}", name=name, arguments=arguments,
                 )
                 async def execute():
-                    return await self._run_tool(
-                        spec, child, external_lookup_counts, workspace_violation_counts,
-                    )
+                    from nanobot.agent.tools._readonly_worker import WORKER_RUN, WORKER_SCOPE
+                    from nanobot.utils.helpers import TOOL_RESULT_CAPTURE
+
+                    state = WORKER_RUN.get()
+                    sources = []
+
+                    def retain(text):
+                        reference = state.artifacts.put(text)
+                        sources.append(reference)
+                        scope = WORKER_SCOPE.get()
+                        if scope is not None:
+                            scope.add(reference["artifact"])
+
+                    capture = TOOL_RESULT_CAPTURE.set(retain) if state is not None else None
+                    try:
+                        payload, event, error = await self._run_tool(
+                            spec, child, external_lookup_counts, workspace_violation_counts,
+                        )
+                        if sources:
+                            event["source_artifacts"] = sources
+                        return payload, event, error
+                    finally:
+                        if capture is not None:
+                            TOOL_RESULT_CAPTURE.reset(capture)
                 try:
                     if spec.concurrent_tools:
                         payload, event, error = await execute()
@@ -1638,6 +1680,8 @@ class AgentRunner:
                         "exit_code", "stdout", "stderr",
                     )},
                 }
+                if event.get("source_artifacts"):
+                    envelope["source_artifacts"] = event["source_artifacts"]
                 # Keep compact operational evidence, not unfiltered tool payloads,
                 # in run records. The full structured result goes only to the script.
                 compact = {key: value for key, value in event.items() if key not in (

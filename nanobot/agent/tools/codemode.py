@@ -11,6 +11,7 @@ from collections import deque
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
 
 from pydantic import Field
@@ -20,6 +21,12 @@ from nanobot.agent.tools._codemode_sandbox import (
     sandbox_command,
     validate_bwrap,
     worker_exit_error,
+)
+from nanobot.agent.tools._readonly_worker import (
+    WORKER_RUN,
+    WORKER_SCOPE,
+    ReadonlyWorkerConfig,
+    run_worker,
 )
 from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
 from nanobot.agent.tools.context import ToolContext, current_request_session_key
@@ -43,10 +50,12 @@ _MAX_FRAME_BYTES = 4 * 1024 * 1024
 _MAX_OUTPUT_BYTES = 1024 * 1024
 _MAX_WORKERS = 2
 _active_workers = 0
+_active_child_sandboxes = 0
 
 
 class CodemodeConfig(Base):
     enable: bool = False
+    workers: ReadonlyWorkerConfig = Field(default_factory=ReadonlyWorkerConfig)
     bwrap_path: str = Field(default=DEFAULT_BWRAP_PATH, description="Absolute Bubblewrap path; PATH is never searched")
     timeout_s: float = Field(default=60, ge=1, le=600)
     memory_mb: int = Field(default=256, ge=64, le=2048)
@@ -69,10 +78,11 @@ class CodemodeTool(Tool):
     _scopes = {"core", "subagent"}
     config_key = "codemode"
 
-    def __init__(self, config: CodemodeConfig, registry: Any, workspace: Path):
+    def __init__(self, config: CodemodeConfig, registry: Any, workspace: Path, worker_snapshot_loader=None):
         self.config = config
         self.registry = registry
         self.workspace = workspace
+        self.worker_snapshot_loader = worker_snapshot_loader
 
     @classmethod
     def config_cls(cls) -> type[Base]:
@@ -84,7 +94,16 @@ class CodemodeTool(Tool):
 
     @classmethod
     def create(cls, ctx: ToolContext) -> CodemodeTool:
-        return cls(ctx.config.codemode, ctx.registry, Path(ctx.workspace))
+        manager = ctx.subagent_manager
+        loader = None
+        # Only an explicitly configured background preset; never the foreground model.
+        if manager is not None and manager.run_provider is not None:
+            def loader():
+                return SimpleNamespace(
+                    provider=manager.run_provider, model=manager.run_model,
+                    context_window_tokens=manager.context_window_tokens,
+                )
+        return cls(ctx.config.codemode, ctx.registry, Path(ctx.workspace), loader)
 
     @property
     def name(self) -> str:
@@ -109,6 +128,14 @@ class CodemodeTool(Tool):
             "No recursive codemode calls. Side effects are real, not rolled back on script failure. "
             f"Limits: {self.config.timeout_s:g}s, {self.config.max_tool_calls} discovery/tool requests, "
             f"{self.config.max_concurrency} concurrent safe calls."
+            + (" Read-only workers enabled: await worker(task, artifacts=[id], material='') returns "
+               "status/content/evidence as data, never a chat announcement. Use await artifact_put(text), "
+               "await artifact_read(id, offset=0, limit=8000). Oversized bridge results become "
+               "marked-partial references; their entire JSON is retained for this run. "
+               "Pass result['artifact'] or source_artifacts IDs without copying bulk text. "
+               "Workers see only selected artifacts, not parent history/tools/files. "
+               "The existing script deadline includes awaited workers."
+               if self.config.workers.enable else "")
         )
 
     @property
@@ -162,13 +189,19 @@ class CodemodeTool(Tool):
         return [{"name": name, "description": description[:300]} for _, name, description in matches[offset:offset + limit]]
 
     async def execute(self, code: str, **kwargs: Any) -> ToolResult:
-        global _active_workers
+        global _active_workers, _active_child_sandboxes
+        child = WORKER_SCOPE.get() is not None
         execution = CODEMODE_EXECUTION.get()
         if execution is None or not execution.active or execution.registry is not self.registry:
             return ToolResult.policy_block("Codemode requires an active AgentRunner execution context for this registry")
-        if _active_workers >= _MAX_WORKERS:
+        if (_active_child_sandboxes if child else _active_workers) >= _MAX_WORKERS:
             return ToolResult.retryable_error("Codemode worker capacity reached; retry after an active script ends")
-        _active_workers += 1
+        # Reserved child slots prevent two awaiting parents from occupying every slot.
+        # Globally at most two parent and two child sandboxes, with no recursive workers.
+        if child:
+            _active_child_sandboxes += 1
+        else:
+            _active_workers += 1
         start = time.monotonic()
         output: list[str] = []
         try:
@@ -186,8 +219,17 @@ class CodemodeTool(Tool):
             status = "success"
             summary = "Script completed"
         finally:
-            _active_workers -= 1
+            if child:
+                _active_child_sandboxes -= 1
+            else:
+                _active_workers -= 1
         content = f"{summary}\nWall time: {time.monotonic() - start:.3f}s\n" + "".join(output)
+        if child:
+            state = WORKER_RUN.get()
+            bounded = state.artifacts.bound({"content": content, "status": status})
+            if bounded.get("partial"):
+                WORKER_SCOPE.get().add(bounded["artifact"])
+                return ToolResult(json.dumps(bounded), status=status, data=bounded)
         content = maybe_persist_tool_result(
             current_tool_workspace(self.workspace).project_path,
             current_request_session_key(), f"codemode-{uuid.uuid4().hex}",
@@ -238,7 +280,26 @@ class CodemodeTool(Tool):
             request_id = request["id"]
             try:
                 operation = request.get("operation")
-                if operation == "search":
+                run = WORKER_RUN.get()
+                scope = WORKER_SCOPE.get()
+                if scope is not None:
+                    run.charge_tool()
+                if operation == "worker":
+                    result = await run_worker(**request.get("arguments", {}))
+                elif operation in ("artifact_put", "artifact_read"):
+                    if run is None:
+                        raise ValueError("Artifact operations require read-only workers enabled")
+                    arguments = request.get("arguments", {})
+                    if operation == "artifact_put":
+                        if scope is not None:
+                            raise ValueError("Workers cannot write artifacts through the bridge")
+                        value = arguments.get("text")
+                        if not isinstance(value, str):
+                            raise ValueError("Artifact text must be a string")
+                        result = run.artifacts.put(value)
+                    else:
+                        result = run.artifacts.read(allowed=scope, **arguments)
+                elif operation == "search":
                     result = self._search(request)
                 elif operation == "describe":
                     result = self._describe(request.get("name"))
@@ -250,6 +311,12 @@ class CodemodeTool(Tool):
                     result = await dispatch(name, arguments, request_id)
                 else:
                     raise ValueError("Unknown bridge operation")
+                if run is not None:
+                    result = run.artifacts.bound(result)
+                    if scope is not None and isinstance(result, dict) and "artifact" in result:
+                        # New harness-owned result artifacts are local intermediates, not
+                        # permission to read an unselected parent/sibling artifact.
+                        scope.add(result["artifact"])
                 response = {"id": request_id, "ok": True, "result": result}
                 encoded = json.dumps(response, ensure_ascii=True, allow_nan=False).encode() + b"\n"
                 if len(encoded) > _MAX_FRAME_BYTES:

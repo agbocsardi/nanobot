@@ -536,6 +536,7 @@ async def test_agent_loop_syncs_updated_max_iterations_before_run(tmp_path):
             tool_events=[],
             messages=[],
             usage={},
+            worker_usage=[],
             had_injections=False,
             tools_used=[],
         )
@@ -581,6 +582,7 @@ async def test_drain_pending_blocks_while_subagents_running(tmp_path):
             tool_events=[],
             messages=[],
             usage={},
+            worker_usage=[],
             had_injections=False,
             tools_used=[],
         )
@@ -665,6 +667,7 @@ async def test_drain_pending_no_block_when_no_subagents(tmp_path):
             tool_events=[],
             messages=[],
             usage={},
+            worker_usage=[],
             had_injections=False,
             tools_used=[],
         )
@@ -713,6 +716,7 @@ async def test_drain_pending_timeout(tmp_path):
             tool_events=[],
             messages=[],
             usage={},
+            worker_usage=[],
             had_injections=False,
             tools_used=[],
         )

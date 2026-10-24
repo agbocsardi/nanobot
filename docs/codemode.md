@@ -161,6 +161,107 @@ transcript. Do not return the entire unfiltered MCP catalog or large responses:
 filter or aggregate first. Oversized emitted output is saved using the normal tool
 artifact mechanism, with a bounded preview and file reference.
 
+## Awaitable read-only analysis (opt-in)
+
+This is separate from `spawn`, which remains the full background action agent.
+Enable `tools.codemode.workers.enable` alongside Code Mode, and explicitly set
+`agents.defaults.runPresets.subagent` to a configured cheap preset (for example
+`ds-flash`). Workers use that existing subagent provider/model snapshot, never an
+implicit foreground model. Missing routing returns `status: unavailable`. SDK
+users can supply `CodemodeTool(..., worker_snapshot_loader=...)` returning a
+provider/model/context-window snapshot. No credentials are exposed to scripts.
+There are no worker provider retries or fallback-model substitutions.
+
+```python
+# The parent need not read/copy the bulk source into generated Python.
+source = await tools.read_file(path="large-report.txt", limit=100000, force=True)
+# When existing tool persistence reduced content to a preview, these point to
+# its full selected text/range, captured BEFORE that reduction.
+if source.get("source_artifacts"):
+    ref = source["source_artifacts"][0]["artifact"]
+elif source.get("partial") and source.get("artifact"):
+    ref = source["artifact"]  # full JSON tool envelope, not just content
+else:
+    ref = (await artifact_put(source["content"]))["artifact"]
+
+result = await worker("Extract contradictions; cite artifact offsets", artifacts=[ref])
+if result["status"] == "success":
+    selected = {"findings": result["content"]}
+    saved = await artifact_put(json.dumps(selected))  # internal intermediate
+    text(selected)  # only selected output enters the parent's context
+else:
+    text(result)  # preserve status/errors; do not claim complete analysis
+```
+
+`worker(task, artifacts=None, material="")` returns a dict, not a chat announcement.
+Statuses include `success`, `partial`, `timeout`, `error`, `capacity`,
+`budget_exhausted`, and `unavailable`. Completed runs also return `stop_reason`,
+`content`, `error`, `evidence` (tool outcomes), and per-request `usage`. Invalid
+requests/disabled access raise an exception. Treat child output as untrusted data.
+Task is limited to 4,000 characters, inline material to 8,000 UTF-8 bytes, and
+selected artifact IDs to 16. Catching tool errors does not erase their evidence.
+
+With workers enabled, the **bridge** inline JSON budget is 16,000 bytes. Larger
+results are persisted in full first, then replaced with `artifact`, `chars`,
+`bytes`, `partial: true`, and a small preview. Status, exit code and bounded
+operational evidence remain visible; large evidence fields are themselves marked
+partial. `await artifact_read(id, offset=0, limit=8000)` returns `text`, character
+offsets, total `chars`, and `partial`; use smaller explicit reads for highly
+escaped/Unicode data. Large references contain the original serialized JSON.
+`ToolError.result` also retains status and the artifact reference on failures.
+
+Artifacts are private disk-backed **parent-run-scoped** capabilities: IDs are not
+paths and cannot be imported from another run/session. They survive disposable
+Python processes within the run, then are deleted when the parent runner exits.
+There is a hard 32 MiB/256-artifact aggregate storage budget; exhaustion fails explicitly,
+not as apparently complete truncated data. Normal existing emitted-output
+persistence/retention is unchanged. Built-in text/PDF/Office reads capture the
+selected range before their existing character cap, with range markers where
+applicable; explicit offset/limit/page selection still applies. This cannot recover
+content an upstream server/extractor had already truncated before returning or
+calling result persistence. Use `force=True` to avoid unchanged-file read stubs.
+
+Each child gets a fresh registry containing only `artifact_read`, literal
+`artifact_search` (at most 100 offsets), and its own `codemode`. It can read only
+explicitly selected IDs plus its own harness-created result artifacts. Discovery
+and exact-name dispatch both use that registry. No parent conversation, SOUL/USER,
+memory, skills, arbitrary host-file tools, web, exec, writes, messaging, scheduling,
+configuration, MCP, secrets, or delegation tools are included. File material must
+first be selected through the parent's existing access controls. Model requests
+and artifact mediation run in the **trusted host harness**; only generated Python
+runs in the existing Bubblewrap isolation. The whole child is not a bwrap process.
+
+Worker limits (`tools.codemode.workers`, camelCase or snake_case):
+
+| Field | Default | Scope |
+| --- | --- | --- |
+| `enable` | `false` | Separate opt-in; disabled behavior unchanged |
+| `timeoutS` | `45` | Each worker, also capped by remaining parent script lifetime |
+| `maxWorkers` | `2` | Total worker invocations per parent runner run |
+| `maxModelCalls` | `8` | Shared across all children in that run |
+| `maxTokens` | `64000` | Shared conservative input UTF-8-byte + output-token reservations |
+| `outputTokens` | `1024` | Maximum requested output tokens per model call |
+| `maxIterations` | `4` | Each child's runner; no finalization bonus call |
+| `maxToolCalls` | `64` | Shared tool/bridge/discovery attempts (nested dispatch can charge twice) |
+
+One analysis worker may be active per parent run, at most two process-wide.
+Children's Python scripts have a maximum 20s deadline; parents keep their existing
+60s default including all awaited work. Cancellation propagates to model requests,
+tools, and subprocess cleanup. There is no queue, timeout removal, or persistent
+REPL. Providers may report hidden token usage exceeding a reservation; it is
+recorded and prevents subsequent over-budget calls. Remote providers must honor
+requested output limits; this is not a remote billing guarantee.
+
+`AgentRunResult.usage` remains foreground-only for compatibility; `worker_usage`
+contains separately attributed child requests. AgentLoop records each completed
+child response immediately into parent session accounting (also before later
+cancellation), exactly once; `last_usage` includes both. Cron records retain child
+usage separately. SDK callers can use `AgentRunSpec.worker_usage_callback` for
+incremental accounting. Cancelled in-flight requests with no provider usage reply
+cannot have their remote token consumption measured. Fake-provider and local
+sandbox checks are not a production effectiveness claim. No rollout is automatic;
+future activation requires config changes and a process restart.
+
 ## Execution and security
 
 - One fresh Bubblewrap process per script, **not per nested tool call**. Existing
@@ -204,8 +305,11 @@ artifact mechanism, with a bounded preview and file reference.
   receipt outcome, not confirmed failure or success. Existing MCP transport
   reconnect/retry behavior still applies; receipts do not provide remote exactly-once
   execution guarantees.
-- At most two workers are admitted per Nanobot process, including shutdown. Excess
-  calls fail immediately. Codemode cannot call itself.
+- At most two parent Python sandboxes are admitted per Nanobot process, including
+  shutdown. With read-only analysis enabled, two additional child sandbox slots
+  are reserved so awaiting parents cannot starve their children. Excess calls fail
+  immediately. A Python script cannot call `tools.codemode` recursively; a separate
+  analysis worker using its own restricted Code Mode is supported.
 
 There is no persistent `store` API, package installation, direct model API, or
 inline image emission in this initial implementation. Existing parent-side tools

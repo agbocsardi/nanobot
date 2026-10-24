@@ -9,14 +9,20 @@ import shutil
 import stat
 import time
 import uuid
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from contextlib import suppress
+from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import tiktoken
 from loguru import logger
+
+# Opt-in Code Mode capture, before legacy persistence replaces oversized content.
+TOOL_RESULT_CAPTURE: ContextVar[Callable[[str], None] | None] = ContextVar(
+    "tool_result_capture", default=None,
+)
 
 
 def sanitize_surrogates(text: str) -> str:
@@ -522,6 +528,10 @@ def maybe_persist_tool_result(
 
     if len(text_payload) <= max_chars:
         return content
+
+    capture = TOOL_RESULT_CAPTURE.get()
+    if capture is not None:
+        capture(text_payload if suffix == "txt" else json.dumps(content, ensure_ascii=True))
 
     root = ensure_dir(workspace / _TOOL_RESULTS_DIR)
     bucket = ensure_dir(root / safe_filename(session_key or "default"))
