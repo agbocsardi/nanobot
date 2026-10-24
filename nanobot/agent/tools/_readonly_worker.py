@@ -36,13 +36,27 @@ class ReadonlyWorkerConfig(Base):
                             description="Shared conservative input-byte plus output-token reservations")
     output_tokens: int = Field(default=1024, ge=128, le=4096)
     max_iterations: int = Field(default=8, ge=1, le=16)
-    max_tool_calls: int = Field(default=64, ge=1, le=256)
+    max_tool_calls: int = Field(default=64, ge=1, le=256,
+                                description="Artifact tool calls per worker; the run total is bounded by max_workers * this")
 
     @model_validator(mode="after")
     def coherent_concurrency(self):
         if self.max_concurrency > self.global_max_concurrency:
             raise ValueError("max_concurrency must not exceed global_max_concurrency")
         return self
+
+
+@dataclass
+class ToolBudget:
+    """Artifact tool allowance for one worker, so a chatty worker cannot starve siblings."""
+
+    limit: int
+    used: int = 0
+
+    def charge(self) -> None:
+        if self.used >= self.limit:
+            raise ValueError(f"Per-worker tool budget exhausted ({self.used}/{self.limit} calls)")
+        self.used += 1
 
 
 @dataclass
@@ -62,13 +76,26 @@ class WorkerRun:
     def __post_init__(self) -> None:
         self.slots = asyncio.Semaphore(self.config.max_concurrency)
 
-    def charge_tool(self) -> None:
+    def charge_tool(self, budget: ToolBudget | None = None) -> None:
+        """Charge this worker's allowance and the run-wide aggregate, without over-counting.
+
+        ``budget`` defaults to the current worker's allowance so the codemode bridge
+        charges the same per-worker counter the worker's registry does.
+        """
+        budget = budget if budget is not None else WORKER_TOOL_BUDGET.get()
+        total_max = self.config.max_workers * self.config.max_tool_calls
+        if budget is not None and budget.used >= budget.limit:
+            raise ValueError(f"Per-worker tool budget exhausted ({budget.used}/{budget.limit} calls)")
+        if self.tool_calls >= total_max:
+            raise ValueError(f"Run-wide worker tool budget exhausted ({self.tool_calls}/{total_max} calls)")
+        if budget is not None:
+            budget.used += 1
         self.tool_calls += 1
-        if self.tool_calls > self.config.max_tool_calls:
-            raise ValueError("Shared worker tool/discovery budget exhausted")
 
 
 WORKER_RUN: ContextVar[WorkerRun | None] = ContextVar("readonly_worker_run", default=None)
+# The current worker's own tool allowance; None outside a worker.
+WORKER_TOOL_BUDGET: ContextVar[ToolBudget | None] = ContextVar("readonly_worker_tool_budget", default=None)
 # None = parent. Even an empty set means a child, with no artifact access.
 WORKER_SCOPE: ContextVar[set[str] | None] = ContextVar("readonly_worker_scope", default=None)
 _active_children = 0
@@ -150,12 +177,13 @@ class ArtifactTool(Tool):
 class WorkerRegistry(ToolRegistry):
     """No parent references, bootstrap loader, mutation tools or recursive delegation."""
 
-    def __init__(self, run: WorkerRun):
+    def __init__(self, run: WorkerRun, budget: ToolBudget | None = None):
         super().__init__()
         self.run = run
+        self.budget = budget if budget is not None else ToolBudget(run.config.max_tool_calls)
 
     def prepare_call(self, name, params):
-        self.run.charge_tool()
+        self.run.charge_tool(self.budget)
         return super().prepare_call(name, params)
 
 
@@ -218,6 +246,26 @@ class BudgetProvider(LLMProvider):
         return response
 
 
+def _budget_snapshot(run: WorkerRun) -> dict[str, Any]:
+    """Remaining-capacity view attached to every worker result.
+
+    Tool calls report the run aggregate plus the per-worker allowance; the per-worker
+    used count is deliberately not attributed here because a result can be returned
+    from a scope where no worker is current.
+    """
+    return {
+        "workers_used": run.workers,
+        "workers_max": run.config.max_workers,
+        "model_calls_used": run.calls,
+        "model_calls_max": run.config.max_model_calls,
+        "tokens_reserved": run.reserved_tokens,
+        "tokens_max": run.config.max_tokens,
+        "tool_calls_used": run.tool_calls,
+        "tool_calls_max": run.config.max_workers * run.config.max_tool_calls,
+        "tool_calls_per_worker_max": run.config.max_tool_calls,
+    }
+
+
 async def run_worker(task: str, artifacts: list[str] | None = None, material: str = "") -> dict[str, Any]:
     """Navigate selected artifacts with the restricted child agent."""
     return await _run_request(task, artifacts, material, one_shot=False)
@@ -244,7 +292,8 @@ async def _run_request(task, artifacts, material, *, one_shot):
     # Exact serialized input + output reservation is checked by BudgetProvider.
     # Refuse grossly oversized inline input early; never silently truncate it.
     if len(material.encode()) > run.config.max_tokens:
-        return {"status": "budget_exhausted", "error": "Inline material exceeds shared token reservation budget"}
+        return {"status": "budget_exhausted", "error": "Inline material exceeds shared token reservation budget",
+                "budget": _budget_snapshot(run)}
     if artifacts is None:
         artifacts = []
     if not isinstance(artifacts, list) or len(artifacts) > 16:
@@ -252,17 +301,22 @@ async def _run_request(task, artifacts, material, *, one_shot):
     for artifact in artifacts:
         run.artifacts.validate(artifact)
     if run.workers >= run.config.max_workers:
-        return {"status": "budget_exhausted", "error": "Total worker/ask budget exhausted"}
+        return {"status": "budget_exhausted", "error": "Total worker/ask budget exhausted",
+                "budget": _budget_snapshot(run)}
     execution = CODEMODE_EXECUTION.get()
     if execution is None or not execution.active:
         raise ValueError("Workers require an active parent Code Mode invocation")
     parent = execution.registry.get("codemode")
     if run.snapshot_loader is None:
-        return {"status": "unavailable", "error": "An explicit worker/subagent run preset is required; no foreground fallback"}
+        return {"status": "unavailable",
+                "error": "An explicit worker/subagent run preset is required; no foreground fallback",
+                "budget": _budget_snapshot(run)}
     # Count accepted requests before queueing; fan-out cannot evade the total cap.
     run.workers += 1
     allowed = set(artifacts)
+    worker_budget = ToolBudget(run.config.max_tool_calls)
     scope_token = WORKER_SCOPE.set(allowed)
+    budget_token = WORKER_TOOL_BUDGET.set(worker_budget)
     provider = None
     evidence = WorkerEvidence()
     try:
@@ -291,8 +345,8 @@ async def _run_request(task, artifacts, material, *, one_shot):
                         "stop_reason": "error" if failed else "partial" if partial else "completed",
                         "content": response.content,
                         "error": response.content if failed else "Incomplete one-shot answer" if partial else None,
-                        "evidence": [], "usage": provider.usage}
-            registry = WorkerRegistry(run)
+                        "evidence": [], "usage": provider.usage, "budget": _budget_snapshot(run)}
+            registry = WorkerRegistry(run, worker_budget)
             registry.register(ArtifactTool(run, allowed))
             registry.register(ArtifactTool(run, allowed, search=True))
             # This instance and its execution dispatch reference ONLY the child registry.
@@ -321,15 +375,18 @@ async def _run_request(task, artifacts, material, *, one_shot):
             return {"status": "success" if result.stop_reason == "completed" else "partial",
                     "stop_reason": result.stop_reason, "content": result.final_content,
                     "error": result.error, "evidence": result.tool_events,
-                    "usage": provider.usage}
+                    "usage": provider.usage, "budget": _budget_snapshot(run)}
     except TimeoutError:
         return {"status": "timeout", "error": "Worker deadline exceeded",
-                "evidence": evidence.events, "usage": provider.usage if provider else []}
+                "evidence": evidence.events, "usage": provider.usage if provider else [],
+                "budget": _budget_snapshot(run)}
     except asyncio.CancelledError:
         raise
     except Exception as exc:
         return {"status": "budget_exhausted" if isinstance(exc, WorkerBudgetExceededError) else "error",
                 "error": f"{type(exc).__name__}: {exc}",
-                "evidence": evidence.events, "usage": provider.usage if provider else []}
+                "evidence": evidence.events, "usage": provider.usage if provider else [],
+                "budget": _budget_snapshot(run)}
     finally:
         WORKER_SCOPE.reset(scope_token)
+        WORKER_TOOL_BUDGET.reset(budget_token)
