@@ -286,6 +286,7 @@ async def run_bound_cron_job(
         response,
         agent_finished_at_ms=agent_finished_at_ms,
         delivery_finished_at_ms=delivery_finished_at_ms,
+        run_id=run_id,
     )
 
 
@@ -477,4 +478,5 @@ async def run_isolated_cron_job(
         response,
         agent_finished_at_ms=agent_finished_at_ms,
         delivery_finished_at_ms=delivery_finished_at_ms,
+        run_id=run_id,
     )

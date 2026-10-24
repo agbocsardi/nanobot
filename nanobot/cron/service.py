@@ -749,6 +749,7 @@ class CronService:
 
         job.state.run_history.append(CronRunRecord(
             run_at_ms=start_ms,
+            run_id=getattr(result, "run_id", None),
             scheduled_at_ms=scheduled_ms,
             detected_at_ms=detected_ms,
             started_at_ms=start_ms,

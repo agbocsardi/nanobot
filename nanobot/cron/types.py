@@ -74,6 +74,10 @@ class CronRunRecord:
     ``delivery_finished_at_ms - agent_finished_at_ms``.
     """
     run_at_ms: int = 0
+    # Stable identifier of the run-record file (``<job id>:<ms>:<rand>``).
+    # Carried so the WebUI can resolve a selected run's response exactly instead
+    # of matching neighbouring records by timestamp overlap.
+    run_id: str | None = None
     scheduled_at_ms: int | None = None
     detected_at_ms: int | None = None
     started_at_ms: int | None = None
@@ -140,11 +144,13 @@ class CronRunResult(str):
     Keeps the legacy callback contract — the response text is the string
     value, so ``str``-typed callers are unaffected — while carrying exact
     timing metadata the service persists into the run record and job state:
-    ``agent_finished_at_ms`` is the moment the agent turn returned and
-    ``delivery_finished_at_ms`` the moment delivery completed or failed.
+    ``agent_finished_at_ms`` is the moment the agent turn returned,
+    ``delivery_finished_at_ms`` the moment delivery completed or failed, and
+    ``run_id`` the identifier of the run-record file written for that run.
     """
     agent_finished_at_ms: int | None
     delivery_finished_at_ms: int | None
+    run_id: str | None
 
     def __new__(
         cls,
@@ -152,10 +158,12 @@ class CronRunResult(str):
         *,
         agent_finished_at_ms: int | None = None,
         delivery_finished_at_ms: int | None = None,
+        run_id: str | None = None,
     ) -> "CronRunResult":
         obj = str.__new__(cls, response or "")
         obj.agent_finished_at_ms = agent_finished_at_ms
         obj.delivery_finished_at_ms = delivery_finished_at_ms
+        obj.run_id = run_id
         return obj
 
 
