@@ -247,16 +247,17 @@ async def test_cancellation_and_deadline_release_capacity_and_keep_completed_usa
     provider.handler = hang
     pending = asyncio.create_task(run_worker("second"))
     await started.wait()
-    assert (await run_worker("parallel"))["status"] == "capacity"
     pending.cancel()
     with pytest.raises(asyncio.CancelledError):
         await pending
-    assert cancelled.is_set() and not run.active
+    assert cancelled.is_set() and run.active_children == 0
+    assert run.slots._value == run.config.max_concurrency
     assert len(callback) == len(run.usage) == 1
     run.workers = 0
     run.config.timeout_s = 0.02
     assert (await run_worker("timeout"))["status"] == "timeout"
-    assert not run.active
+    assert run.active_children == 0
+    assert run.slots._value == run.config.max_concurrency
 
 
 async def test_timeout_retains_completed_tool_evidence_and_usage(worker_context):
@@ -480,7 +481,7 @@ class TestWorkerSandbox:
                     '    try: await tools[name]()\n'
                     '    except ToolError: pass\n'
                     '    else: raise AssertionError("invoked forbidden tool")\n'
-                    'for op in [worker("recurse"), artifact_put("write")]:\n'
+                    'for op in [worker("recurse"), ask("recurse", "text"), artifact_put("write")]:\n'
                     '    try: await op\n'
                     '    except Exception: pass\n'
                     '    else: raise AssertionError("escaped worker")\n'

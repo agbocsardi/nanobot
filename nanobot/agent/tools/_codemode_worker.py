@@ -86,6 +86,10 @@ async def worker(task, *, artifacts=None, material=""):
     })
 
 
+async def ask(task, text):
+    return await _request("ask", arguments={"task": task, "text": text})
+
+
 async def artifact_put(text):
     return await _request("artifact_put", arguments={"text": text})
 
@@ -123,7 +127,7 @@ async def _main(payload):
         "__name__": "__codemode__", "asyncio": asyncio, "json": json,
         "tools": _Tools(), "text": text, "ToolError": ToolError,
         "search_tools": search_tools, "describe_tool": describe_tool,
-        "worker": worker, "artifact_put": artifact_put, "artifact_read": artifact_read,
+        "worker": worker, "ask": ask, "artifact_put": artifact_put, "artifact_read": artifact_read,
     }
     try:
         # Build the async wrapper without shifting the submitted source's line numbers.
