@@ -27,12 +27,12 @@ from nanobot.providers.base import LLMProvider
 class ReadonlyWorkerConfig(Base):
     enable: bool = False
     timeout_s: float = Field(default=45, ge=1, le=120)
-    max_workers: int = Field(default=8, ge=1, le=8, description="Total worker/ask invocations per parent run")
+    max_workers: int = Field(default=8, ge=1, le=32, description="Total worker/ask invocations per parent run")
     max_concurrency: int = Field(default=4, ge=1, le=8)
     global_max_concurrency: int = Field(default=8, ge=1, le=8,
                                         description="Process-wide child cap, bounded by 8 reserved child sandbox slots")
-    max_model_calls: int = Field(default=8, ge=1, le=32)
-    max_tokens: int = Field(default=64000, ge=4000, le=256000,
+    max_model_calls: int = Field(default=8, ge=1, le=128)
+    max_tokens: int = Field(default=64000, ge=4000, le=1_000_000,
                             description="Shared conservative input-byte plus output-token reservations")
     output_tokens: int = Field(default=1024, ge=128, le=4096)
     max_iterations: int = Field(default=8, ge=1, le=16)
