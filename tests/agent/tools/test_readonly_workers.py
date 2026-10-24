@@ -17,6 +17,7 @@ from nanobot.agent.tools._readonly_worker import (
     ArtifactTool,
     BudgetProvider,
     ReadonlyWorkerConfig,
+    ToolBudget,
     WorkerRegistry,
     WorkerRun,
     run_worker,
@@ -188,9 +189,58 @@ async def test_shared_model_token_worker_and_tool_budgets(worker_context):
     assert len(provider.requests) == 1
     assert "budget" in (await run_worker("three"))["error"]
     run.config.max_tool_calls = 1
-    run.charge_tool()
-    with pytest.raises(ValueError, match="budget"):
-        run.charge_tool()
+    budget = ToolBudget(run.config.max_tool_calls)
+    run.charge_tool(budget)
+    with pytest.raises(ValueError, match="Per-worker tool budget"):
+        run.charge_tool(budget)
+    # A refused charge must not keep climbing either counter.
+    assert budget.used == 1 and run.tool_calls == 1
+
+
+async def test_tool_budget_is_per_worker_so_siblings_cannot_be_starved(worker_context):
+    run, _, _ = worker_context
+    run.config.max_tool_calls = 2
+    reference = run.artifacts.put("needle")["artifact"]
+    chatty, quiet = WorkerRegistry(run), WorkerRegistry(run)
+    for registry in (chatty, quiet):
+        registry.register(ArtifactTool(run, {reference}))
+    for _ in range(2):
+        assert chatty.prepare_call("artifact_read", {"artifact": reference})[2] is None
+    with pytest.raises(ValueError, match="Per-worker tool budget exhausted"):
+        chatty.prepare_call("artifact_read", {"artifact": reference})
+    # The sibling keeps its own untouched allowance instead of inheriting exhaustion.
+    assert quiet.prepare_call("artifact_read", {"artifact": reference})[2] is None
+    assert quiet.budget.used == 1 and chatty.budget.used == 2
+
+
+async def test_run_wide_tool_budget_still_caps_total_calls(worker_context):
+    run, _, _ = worker_context
+    run.config.max_workers = 2
+    run.config.max_tool_calls = 2
+    budgets = [ToolBudget(run.config.max_tool_calls) for _ in range(3)]
+    for budget in budgets[:2]:
+        for _ in range(2):
+            run.charge_tool(budget)
+    with pytest.raises(ValueError, match="Run-wide worker tool budget exhausted"):
+        run.charge_tool(budgets[2])
+    assert run.tool_calls == 4 and budgets[2].used == 0
+
+
+async def test_successful_worker_result_carries_budget_snapshot(worker_context):
+    run, _, _ = worker_context
+    result = await run_worker("analyze")
+    assert result["status"] == "success" and result["stop_reason"] == "completed"
+    assert result["budget"] == {
+        "workers_used": 1,
+        "workers_max": run.config.max_workers,
+        "model_calls_used": 1,
+        "model_calls_max": run.config.max_model_calls,
+        "tokens_reserved": run.reserved_tokens,
+        "tokens_max": run.config.max_tokens,
+        "tool_calls_used": 0,
+        "tool_calls_max": run.config.max_workers * run.config.max_tool_calls,
+        "tool_calls_per_worker_max": run.config.max_tool_calls,
+    }
 
 
 async def test_token_budget_preflight_never_calls_provider(worker_context):
@@ -199,6 +249,7 @@ async def test_token_budget_preflight_never_calls_provider(worker_context):
     result = await run_worker("analyze", material="x" * 8000)
     assert result["status"] != "success"
     assert "budget" in json.dumps(result)
+    assert result["budget"]["model_calls_used"] == 0
     assert provider.requests == []
 
 
