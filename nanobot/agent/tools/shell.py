@@ -51,6 +51,102 @@ _WORKSPACE_BOUNDARY_NOTE = (
 )
 
 
+# Executables whose arguments are only data: a URL in one of these segments is
+# never dialled, so blocking it would be a false positive (a `sed` replacement
+# string, an `echo` line, `grep` output). Anything absent from this set is still
+# scanned, so the check fails closed for interpreters, package managers and
+# unknown tools.
+_INERT_TEXT_COMMANDS = frozenset({
+    "awk", "gawk", "basename", "base64", "cat", "chmod", "chown", "cmp", "column",
+    "comm", "cp", "cut", "date", "diff", "dirname", "echo", "egrep", "expand",
+    "expr", "false", "fgrep", "file", "fmt", "fold", "grep", "head", "hexdump",
+    "iconv", "join", "jq", "ln", "ls", "md5sum", "mkdir", "mv", "nl", "numfmt",
+    "od", "paste", "printf", "readlink", "realpath", "rev", "rg", "rm", "rmdir",
+    "sed", "seq", "sha256sum", "shuf", "sleep", "sort", "split", "stat", "strings",
+    "tac", "tail", "tee", "touch", "tr", "true", "unexpand", "uniq", "wc", "xxd",
+    "yq",
+})
+
+# Tokens that prefix another command without performing I/O themselves.
+_COMMAND_WRAPPERS = frozenset({"sudo", "doas", "env", "time", "nohup", "command", "exec", "nice"})
+_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_SHELL_REDIRECT_OPERATORS = frozenset({";", "&", "|", "<", ">", "(", ")"})
+
+
+def _strip_shell_comments(command: str) -> str:
+    """Drop unquoted ``#`` comment tails; a URL in a comment is never executed."""
+    out: list[str] = []
+    quote: str | None = None
+    escaped = False
+    index = 0
+    length = len(command)
+    while index < length:
+        ch = command[index]
+        if escaped:
+            out.append(ch)
+            escaped = False
+            index += 1
+            continue
+        if ch == "\\" and quote != "'":
+            out.append(ch)
+            escaped = True
+            index += 1
+            continue
+        if quote is not None:
+            out.append(ch)
+            if ch == quote:
+                quote = None
+            index += 1
+            continue
+        if ch in {"'", '"'}:
+            quote = ch
+            out.append(ch)
+            index += 1
+            continue
+        if ch == "#" and (not out or out[-1].isspace()):
+            while index < length and command[index] != "\n":
+                index += 1
+            continue
+        out.append(ch)
+        index += 1
+    return "".join(out)
+
+
+def _segment_executable(segment: str) -> str:
+    """Best-effort executable name of one shell segment, or ``""`` if unknown."""
+    import shlex
+
+    try:
+        tokens = shlex.split(segment)
+    except ValueError:
+        return ""
+    for token in tokens:
+        if _ASSIGNMENT_RE.match(token) or token in _COMMAND_WRAPPERS:
+            continue
+        if token in _SHELL_REDIRECT_OPERATORS:
+            continue
+        return Path(token).name
+    return ""
+
+
+def _command_is_text_only(command: str) -> bool:
+    """True when every segment of *command* is a non-networking text utility.
+
+    Only then can a URL in the text be treated as inert data. A command mixing
+    an inert segment with anything else (``echo <url> | curl -d @-``) still gets
+    scanned, because a pipe can hand the URL to a network client.
+    """
+    segments = [s for s in ExecTool._split_shell_segments(command.lower()) if s.strip()]
+    if not segments:
+        return False
+    for segment in segments:
+        if "/dev/tcp/" in segment or "/dev/udp/" in segment:
+            return False
+        if _segment_executable(segment) not in _INERT_TEXT_COMMANDS:
+            return False
+    return True
+
+
 class ExecToolConfig(Base):
     """Shell exec tool configuration."""
     enable: bool = True
@@ -633,13 +729,25 @@ class ExecTool(Tool):
             if self.allow_patterns:
                 return "Error: Command blocked by allowlist filter (not in allowlist)"
 
-        from nanobot.security.network import contains_internal_url
-        if contains_internal_url(
-            cmd,
-            allow_loopback=current_scope_allows_loopback(enabled=False),
-        ):
-            # The runner turns this marker into a non-retryable security hint.
-            return "Error: Command blocked by safety guard (internal/private URL detected)"
+        from nanobot.security.network import find_unsafe_exec_url
+        scan_text = "" if _command_is_text_only(_strip_shell_comments(cmd)) else cmd
+        unsafe_url = (
+            find_unsafe_exec_url(
+                scan_text,
+                allow_loopback=current_scope_allows_loopback(enabled=False),
+            )
+            if scan_text
+            else None
+        )
+        if unsafe_url is not None:
+            # The runner turns this marker into a recoverable, exec-specific hint.
+            # It deliberately avoids the web-SSRF marker wording: this is a lexical
+            # check on command text, not a transport-boundary guard.
+            target = unsafe_url.address or unsafe_url.hostname or "?"
+            return (
+                "Error: Command blocked by exec URL guard "
+                f"({unsafe_url.reason}: {unsafe_url.url} -> {target})"
+            )
 
         should_restrict = self.restrict_to_workspace if restrict_to_workspace is None else restrict_to_workspace
         if should_restrict:

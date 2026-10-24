@@ -9,7 +9,7 @@ import pytest
 
 from nanobot.security.network import (
     configure_ssrf_whitelist,
-    contains_internal_url,
+    find_unsafe_exec_url,
     ssrf_whitelist_context,
     validate_url_target,
 )
@@ -132,47 +132,47 @@ def test_allows_normal_https():
 
 
 # ---------------------------------------------------------------------------
-# contains_internal_url — shell command scanning
+# find_unsafe_exec_url — lexical shell-command scanning (exec pre-flight)
 # ---------------------------------------------------------------------------
 
 def test_detects_curl_metadata():
     with patch("nanobot.security.network.socket.getaddrinfo", _fake_resolve("169.254.169.254", ["169.254.169.254"])):
-        assert contains_internal_url('curl -s http://169.254.169.254/computeMetadata/v1/')
+        assert find_unsafe_exec_url('curl -s http://169.254.169.254/computeMetadata/v1/') is not None
 
 
 def test_detects_wget_localhost():
     with patch("nanobot.security.network.socket.getaddrinfo", _fake_resolve("localhost", ["127.0.0.1"])):
-        assert contains_internal_url("wget http://localhost:8080/secret")
+        assert find_unsafe_exec_url("wget http://localhost:8080/secret") is not None
 
 
 def test_loopback_exception_allows_literal_localhost_only():
     with patch("nanobot.security.network.socket.getaddrinfo", _fake_resolve("localhost", ["127.0.0.1"])):
-        assert not contains_internal_url("curl http://localhost:8765/", allow_loopback=True)
+        assert find_unsafe_exec_url("curl http://localhost:8765/", allow_loopback=True) is None
 
 
 def test_loopback_exception_rejects_public_name_resolving_to_loopback():
     with patch("nanobot.security.network.socket.getaddrinfo", _fake_resolve("example.com", ["127.0.0.1"])):
-        assert contains_internal_url("curl http://example.com:8765/", allow_loopback=True)
+        assert find_unsafe_exec_url("curl http://example.com:8765/", allow_loopback=True) is not None
 
 
 def test_loopback_exception_rejects_metadata():
     with patch("nanobot.security.network.socket.getaddrinfo", _fake_resolve("169.254.169.254", ["169.254.169.254"])):
-        assert contains_internal_url("curl http://169.254.169.254/latest/meta-data/", allow_loopback=True)
+        assert find_unsafe_exec_url("curl http://169.254.169.254/latest/meta-data/", allow_loopback=True) is not None
 
 
 def test_detects_ipv6_mapped_loopback():
-    """contains_internal_url must catch IPv6-mapped loopback in shell commands."""
+    """find_unsafe_exec_url must catch IPv6-mapped loopback in shell commands."""
     with patch("nanobot.security.network.socket.getaddrinfo", _fake_resolve_v6("evil.com", ["::ffff:127.0.0.1"])):
-        assert contains_internal_url("curl http://evil.com/secret")
+        assert find_unsafe_exec_url("curl http://evil.com/secret") is not None
 
 
 def test_allows_normal_curl():
     with patch("nanobot.security.network.socket.getaddrinfo", _fake_resolve("example.com", ["93.184.216.34"])):
-        assert not contains_internal_url("curl https://example.com/api/data")
+        assert find_unsafe_exec_url("curl https://example.com/api/data") is None
 
 
 def test_no_urls_returns_false():
-    assert not contains_internal_url("echo hello && ls -la")
+    assert find_unsafe_exec_url("echo hello && ls -la") is None
 
 
 # ---------------------------------------------------------------------------

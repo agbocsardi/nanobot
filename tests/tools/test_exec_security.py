@@ -36,7 +36,7 @@ async def test_exec_blocks_curl_metadata():
             command='curl -s -H "Metadata-Flavor: Google" http://169.254.169.254/computeMetadata/v1/'
         )
     assert "Error" in result
-    assert "internal" in result.lower() or "private" in result.lower()
+    assert "exec URL guard" in result
 
 
 @pytest.mark.asyncio
@@ -57,7 +57,7 @@ def test_exec_core_full_workspace_scope_blocks_loopback(tmp_path):
     finally:
         reset_workspace_scope(token)
     assert error is not None
-    assert "internal/private" in error
+    assert "exec URL guard" in error and "internal_target" in error
 
 
 def test_exec_full_workspace_scope_blocks_loopback_when_local_service_disabled(tmp_path):
@@ -70,7 +70,7 @@ def test_exec_full_workspace_scope_blocks_loopback_when_local_service_disabled(t
     finally:
         reset_workspace_scope(token)
     assert error is not None
-    assert "internal/private" in error
+    assert "exec URL guard" in error and "internal_target" in error
 
 
 def test_exec_restricted_workspace_scope_blocks_loopback(tmp_path):
@@ -83,7 +83,7 @@ def test_exec_restricted_workspace_scope_blocks_loopback(tmp_path):
     finally:
         reset_workspace_scope(token)
     assert error is not None
-    assert "internal/private" in error
+    assert "exec URL guard" in error and "internal_target" in error
 
 
 def test_exec_full_workspace_scope_still_blocks_metadata(tmp_path):
@@ -96,7 +96,7 @@ def test_exec_full_workspace_scope_still_blocks_metadata(tmp_path):
     finally:
         reset_workspace_scope(token)
     assert error is not None
-    assert "internal/private" in error
+    assert "exec URL guard" in error and "internal_target" in error
 
 
 @pytest.mark.asyncio
