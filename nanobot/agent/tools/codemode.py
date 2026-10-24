@@ -26,7 +26,6 @@ from nanobot.agent.tools._readonly_worker import (
     WORKER_RUN,
     WORKER_SCOPE,
     ReadonlyWorkerConfig,
-    run_worker,
 )
 from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
 from nanobot.agent.tools.context import ToolContext, current_request_session_key
@@ -43,6 +42,7 @@ class CodemodeExecution:
     registry: Any
     dispatch: CodemodeDispatch
     active: bool = True
+    worker_dispatch: Callable[[dict[str, Any], int], Awaitable[dict[str, Any]]] | None = None
 
 
 CODEMODE_EXECUTION: ContextVar[CodemodeExecution | None] = ContextVar("codemode_execution", default=None)
@@ -130,7 +130,7 @@ class CodemodeTool(Tool):
             f"{self.config.max_concurrency} concurrent safe calls."
             + (" Read-only workers enabled: await worker(task, artifacts=[id], material='') returns "
                "status/content/evidence as data, never a chat announcement. Use await artifact_put(text), "
-               "await artifact_read(id, offset=0, limit=8000). Oversized bridge results become "
+               "await artifact_read(id, offset=0, limit=8000). Oversized tool results become "
                "marked-partial references; their entire JSON is retained for this run. "
                "Pass result['artifact'] or source_artifacts IDs without copying bulk text. "
                "Workers see only selected artifacts, not parent history/tools/files. "
@@ -285,7 +285,12 @@ class CodemodeTool(Tool):
                 if scope is not None:
                     run.charge_tool()
                 if operation == "worker":
-                    result = await run_worker(**request.get("arguments", {}))
+                    if scope is not None:
+                        raise ValueError("Workers cannot delegate")
+                    execution = CODEMODE_EXECUTION.get()
+                    if execution.worker_dispatch is None:
+                        raise ValueError("Workers require an active AgentRunner worker dispatch")
+                    result = await execution.worker_dispatch(request.get("arguments", {}), request_id)
                 elif operation in ("artifact_put", "artifact_read"):
                     if run is None:
                         raise ValueError("Artifact operations require read-only workers enabled")

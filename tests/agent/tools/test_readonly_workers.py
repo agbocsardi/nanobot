@@ -443,9 +443,10 @@ class TestWorkerSandbox:
             'return await worker("scope audit", artifacts=[selected["artifact"]], material=hidden["artifact"])'
         )
         parent = FakeProvider(lambda request, n: tool_call("codemode", code=code) if n == 1 else LLMResponse(content="done"))
-        await AgentRunner(parent).run(spec(registry))
-        returned = parent.requests[-1]["messages"][-1]["content"]
+        result = await AgentRunner(parent).run(spec(registry))
+        returned = parent.requests[1]["messages"][-1]["content"]
         assert '"status": "partial"' in returned and "inaccessible" in returned
+        assert result.stop_reason == "partial_completion"
         assert "SECRET_UNSELECTED" not in json.dumps(child.requests)
 
     async def test_parent_deadline_is_not_extended_for_awaited_worker(self, tmp_path):

@@ -198,11 +198,23 @@ Statuses include `success`, `partial`, `timeout`, `error`, `capacity`,
 `budget_exhausted`, and `unavailable`. Completed runs also return `stop_reason`,
 `content`, `error`, `evidence` (tool outcomes), and per-request `usage`. Invalid
 requests/disabled access raise an exception. Treat child output as untrusted data.
+Each invocation also records a nested parent operational event: discarding its
+status or catching an exception cannot erase failure/partial/timeout/budget evidence
+or bypass parent failure verification and `fail_on_tool_error`. Only a successful
+retry of the same task, artifact selection and inline material resolves a worker
+failure; unrelated successful work does not. Compact events retain scoped references
+to the full outcome/evidence (readable only during the parent run), not bulk content.
 Task is limited to 4,000 characters, inline material to 8,000 UTF-8 bytes, and
 selected artifact IDs to 16. Catching tool errors does not erase their evidence.
 
-With workers enabled, the **bridge** inline JSON budget is 16,000 bytes. Larger
-results are persisted in full first, then replaced with `artifact`, `chars`,
+With workers enabled, the inline tool-result JSON budget is 16,000 bytes, both
+for bridge calls and ordinary top-level tool/read results. The common runner
+boundary captures selected sources before local truncation; the next parent model
+request gets scoped handles, without first needing to choose Code Mode. These IDs
+can be passed to a later Code Mode `worker(...)` call in the same run. Small ordinary
+results and visual/image blocks keep their existing representation; disabling workers
+keeps the legacy persistence/read exemptions unchanged. Larger text/JSON results
+are persisted in full first, then replaced with `artifact`, `chars`,
 `bytes`, `partial: true`, and a small preview. Status, exit code and bounded
 operational evidence remain visible; large evidence fields are themselves marked
 partial. `await artifact_read(id, offset=0, limit=8000)` returns `text`, character

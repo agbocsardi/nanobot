@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import os
@@ -48,6 +49,7 @@ from nanobot.utils.helpers import (
     estimate_request_bytes,
     extract_reasoning,
     maybe_persist_tool_result,
+    stringify_text_blocks,
     strip_private_fields,
     strip_reasoning_tags,
     strip_think,
@@ -366,7 +368,7 @@ class AgentRunner:
         from nanobot.agent.tools._readonly_worker import WORKER_RUN, WORKER_SCOPE, WorkerRun
 
         codemode = spec.tools.get("codemode")
-        if (codemode is None or not codemode.config.workers.enable
+        if (codemode is None or codemode.config.workers.enable is not True
                 or WORKER_SCOPE.get() is not None):
             return await self._run(spec)
         state = WorkerRun(codemode.config.workers.model_copy(deep=True), codemode.worker_snapshot_loader,
@@ -653,7 +655,7 @@ class AgentRunner:
                 # operational events live in the run-level record, not that pairing.
                 context.tool_events = [e for e in new_events if "parent_call_id" not in e]
                 completed_tool_results: list[dict[str, Any]] = []
-                for tool_call, result in zip(response.tool_calls, results):
+                for tool_call, result, event in zip(response.tool_calls, results, context.tool_events):
                     tool_message = {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
@@ -663,6 +665,7 @@ class AgentRunner:
                             tool_call.id,
                             tool_call.name,
                             result,
+                            event=event,
                         ),
                     }
                     messages.append(tool_message)
@@ -1014,6 +1017,11 @@ class AgentRunner:
         for later_index in range(index + 1, len(tool_events)):
             later = tool_events[later_index]
             if str(later.get("status") or "") != "success":
+                continue
+            if event.get("recovery_key") is not None:
+                # Analysis of another task/material must not launder a failed worker.
+                if later.get("recovery_key") == event["recovery_key"]:
+                    return True
                 continue
             if str(later.get("name") or "") == name:
                 return True
@@ -1633,30 +1641,9 @@ class AgentRunner:
                     id=f"{tool_call.id}/codemode/{request_id}", name=name, arguments=arguments,
                 )
                 async def execute():
-                    from nanobot.agent.tools._readonly_worker import WORKER_RUN, WORKER_SCOPE
-                    from nanobot.utils.helpers import TOOL_RESULT_CAPTURE
-
-                    state = WORKER_RUN.get()
-                    sources = []
-
-                    def retain(text):
-                        reference = state.artifacts.put(text)
-                        sources.append(reference)
-                        scope = WORKER_SCOPE.get()
-                        if scope is not None:
-                            scope.add(reference["artifact"])
-
-                    capture = TOOL_RESULT_CAPTURE.set(retain) if state is not None else None
-                    try:
-                        payload, event, error = await self._run_tool(
-                            spec, child, external_lookup_counts, workspace_violation_counts,
-                        )
-                        if sources:
-                            event["source_artifacts"] = sources
-                        return payload, event, error
-                    finally:
-                        if capture is not None:
-                            TOOL_RESULT_CAPTURE.reset(capture)
+                    return await self._run_tool(
+                        spec, child, external_lookup_counts, workspace_violation_counts,
+                    )
                 try:
                     if spec.concurrent_tools:
                         payload, event, error = await execute()
@@ -1694,7 +1681,59 @@ class AgentRunner:
                     child_errors.append(error)
                 return envelope
 
-            execution = CodemodeExecution(spec.tools, dispatch)
+            async def dispatch_worker(arguments: dict[str, Any], request_id: int):
+                from nanobot.agent.tools._readonly_worker import WORKER_RUN, run_worker
+
+                if not execution.active:
+                    raise RuntimeError("The parent codemode call has ended")
+                caught = None
+                try:
+                    outcome = await run_worker(**arguments)
+                except (Exception, asyncio.CancelledError) as exc:
+                    caught = exc
+                    outcome = {"status": "cancelled" if isinstance(exc, asyncio.CancelledError) else "error",
+                               "error": f"{type(exc).__name__}: {exc}"}
+                worker_status = outcome["status"]
+                evidence = {"kind": "readonly_worker", "worker_status": worker_status,
+                            "stop_reason": outcome.get("stop_reason")}
+                state = WORKER_RUN.get()
+                bounded = outcome
+                if state is not None:
+                    try:
+                        # Full evidence stays scoped/on disk, not in the event ledger or chat.
+                        bounded = state.artifacts.bound(outcome)
+                        evidence.update(
+                            {key: bounded[key] for key in ("artifact", "chars", "bytes")}
+                            if bounded is not outcome else state.artifacts.put(json.dumps(outcome, ensure_ascii=True))
+                        )
+                    except Exception as exc:
+                        outcome = {"status": "error", "error": f"Worker result retention failed: {exc}"}
+                        bounded = outcome
+                        evidence["retention_error"] = str(exc)[:200]
+                status = "success" if outcome["status"] == "success" else (
+                    "partial" if outcome["status"] in {"partial", "cancelled"} else "retryable_error"
+                )
+                failures = [{key: child.get(key) for key in ("name", "status", "detail")}
+                            for child in outcome.get("evidence", []) if child.get("status") != "success"][:3]
+                if failures:
+                    evidence["failures"] = failures
+                cause = outcome.get("error") or "; ".join(str(child["detail"]) for child in failures)
+                detail = f"Worker {outcome['status']} ({outcome.get('stop_reason') or 'no completion'}): {cause}"
+                event = self._tool_event("worker", ToolResult(detail, status=status, evidence=[evidence]))
+                # Recovery requires the same task AND selected material, not just another worker.
+                selected = {"task": arguments.get("task"), "artifacts": arguments.get("artifacts") or [],
+                            "material": arguments.get("material", "")} if isinstance(arguments, dict) else arguments
+                event.update({"parent_call_id": tool_call.id,
+                              "call_id": f"{tool_call.id}/worker/{request_id}",
+                              "recovery_key": hashlib.sha256(json.dumps(selected, sort_keys=True).encode()).hexdigest()})
+                children.append((request_id, event, []))
+                if status != "success" and spec.fail_on_tool_error:
+                    child_errors.append(RuntimeError(detail))
+                if caught is not None:
+                    raise caught
+                return bounded
+
+            execution = CodemodeExecution(spec.tools, dispatch, worker_dispatch=dispatch_worker)
             token = CODEMODE_EXECUTION.set(execution)
             try:
                 result, event, error = await self._run_tool(
@@ -1746,6 +1785,38 @@ class AgentRunner:
         return results, events, event_targets, fatal_error
 
     async def _run_tool(
+        self,
+        spec: AgentRunSpec,
+        tool_call: ToolCallRequest,
+        external_lookup_counts: dict[str, int],
+        workspace_violation_counts: dict[str, int],
+    ) -> tuple[Any, dict[str, Any], BaseException | None]:
+        from nanobot.agent.tools._readonly_worker import WORKER_RUN, WORKER_SCOPE
+        from nanobot.utils.helpers import TOOL_RESULT_CAPTURE
+
+        state = WORKER_RUN.get()
+        sources = []
+
+        def retain(text):
+            reference = state.artifacts.put(text)
+            sources.append(reference)
+            scope = WORKER_SCOPE.get()
+            if scope is not None:
+                scope.add(reference["artifact"])
+
+        capture = TOOL_RESULT_CAPTURE.set(retain) if state is not None else None
+        try:
+            payload, event, error = await self._run_tool_impl(
+                spec, tool_call, external_lookup_counts, workspace_violation_counts,
+            )
+            if sources:
+                event["source_artifacts"] = sources
+            return payload, event, error
+        finally:
+            if capture is not None:
+                TOOL_RESULT_CAPTURE.reset(capture)
+
+    async def _run_tool_impl(
         self,
         spec: AgentRunSpec,
         tool_call: ToolCallRequest,
@@ -2185,8 +2256,27 @@ class AgentRunner:
         tool_call_id: str,
         tool_name: str,
         result: Any,
+        *,
+        event: dict[str, Any] | None = None,
     ) -> Any:
+        from nanobot.agent.tools._readonly_worker import WORKER_RUN, WORKER_SCOPE
+
         result = ensure_nonempty_tool_result(tool_name, result)
+        state = WORKER_RUN.get()
+        # Preserve visual blocks: artifact-only children cannot replace image ingestion.
+        if (state is not None and WORKER_SCOPE.get() is None
+                and (not isinstance(result, list) or stringify_text_blocks(result) is not None)):
+            event = event or {}
+            envelope = {"content": result, "status": event.get("status", "success"),
+                        **{key: event[key] for key in (
+                            "data", "evidence", "side_effects", "postcondition", "retryable",
+                            "exit_code", "stdout", "stderr", "source_artifacts",
+                        ) if key in event}}
+            if event.get("source_artifacts"):
+                envelope["partial"] = True
+            bounded = state.artifacts.bound(envelope)
+            if bounded is not envelope or event.get("source_artifacts"):
+                return json.dumps(bounded, ensure_ascii=True)
         if tool_name in _TOOL_RESULT_OFFLOAD_EXEMPT_TOOLS:
             # Exempt tools bound their own output; skip generic offload and truncation.
             return result
