@@ -1681,14 +1681,14 @@ class AgentRunner:
                     child_errors.append(error)
                 return envelope
 
-            async def dispatch_worker(arguments: dict[str, Any], request_id: int):
-                from nanobot.agent.tools._readonly_worker import WORKER_RUN, run_worker
+            async def dispatch_worker(arguments: dict[str, Any], request_id: int, operation: str):
+                from nanobot.agent.tools._readonly_worker import WORKER_RUN, run_ask, run_worker
 
                 if not execution.active:
                     raise RuntimeError("The parent codemode call has ended")
                 caught = None
                 try:
-                    outcome = await run_worker(**arguments)
+                    outcome = await (run_ask if operation == "ask" else run_worker)(**arguments)
                 except (Exception, asyncio.CancelledError) as exc:
                     caught = exc
                     outcome = {"status": "cancelled" if isinstance(exc, asyncio.CancelledError) else "error",
@@ -1719,12 +1719,13 @@ class AgentRunner:
                     evidence["failures"] = failures
                 cause = outcome.get("error") or "; ".join(str(child["detail"]) for child in failures)
                 detail = f"Worker {outcome['status']} ({outcome.get('stop_reason') or 'no completion'}): {cause}"
-                event = self._tool_event("worker", ToolResult(detail, status=status, evidence=[evidence]))
+                event = self._tool_event(operation, ToolResult(detail, status=status, evidence=[evidence]))
                 # Recovery requires the same task AND selected material, not just another worker.
                 selected = {"task": arguments.get("task"), "artifacts": arguments.get("artifacts") or [],
-                            "material": arguments.get("material", "")} if isinstance(arguments, dict) else arguments
+                            "material": arguments.get("text" if operation == "ask" else "material", ""),
+                            "operation": operation} if isinstance(arguments, dict) else arguments
                 event.update({"parent_call_id": tool_call.id,
-                              "call_id": f"{tool_call.id}/worker/{request_id}",
+                              "call_id": f"{tool_call.id}/{operation}/{request_id}",
                               "recovery_key": hashlib.sha256(json.dumps(selected, sort_keys=True).encode()).hexdigest()})
                 children.append((request_id, event, []))
                 if status != "success" and spec.fail_on_tool_error:

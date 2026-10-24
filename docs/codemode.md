@@ -170,7 +170,24 @@ Enable `tools.codemode.workers.enable` alongside Code Mode, and explicitly set
 implicit foreground model. Missing routing returns `status: unavailable`. SDK
 users can supply `CodemodeTool(..., worker_snapshot_loader=...)` returning a
 provider/model/context-window snapshot. No credentials are exposed to scripts.
-There are no worker provider retries or fallback-model substitutions.
+There are no worker or `ask` provider retries or fallback-model substitutions.
+
+**Choose the smallest path:** small text or a chunk the parent already sliced →
+`ask(task, text)`; a large artifact the child must search/navigate →
+`worker(task, artifacts=[id])`. `ask` makes exactly one provider call with no tools,
+child registry, sandbox, recursion, or required artifacts. Its answer is the
+`content` string in the same status/evidence/usage envelope as `worker`:
+
+```python
+chunks = ["code=42", "code=73"]
+answers = await asyncio.gather(*(ask("Extract the code", chunk) for chunk in chunks))
+text([{"status": r["status"], "answer": r.get("content")} for r in answers])
+```
+
+Both paths share total invocations, concurrency, deadlines, model-call and token
+budgets, usage callbacks, and parent failure evidence (even if results are discarded).
+A provider error, incomplete output, or unsolicited tool call is not a successful
+`ask`; no follow-up model call or tool execution is attempted.
 
 ```python
 # The parent need not read/copy the bulk source into generated Python.
@@ -204,8 +221,17 @@ or bypass parent failure verification and `fail_on_tool_error`. Only a successfu
 retry of the same task, artifact selection and inline material resolves a worker
 failure; unrelated successful work does not. Compact events retain scoped references
 to the full outcome/evidence (readable only during the parent run), not bulk content.
-Task is limited to 4,000 characters, inline material to 8,000 UTF-8 bytes, and
-selected artifact IDs to 16. Catching tool errors does not erase their evidence.
+Task is limited to 4,000 characters and selected artifact IDs to 16. Inline
+`material`/`text` may be at most `maxTokens` UTF-8 bytes; the complete serialized
+request (including task, framing, and tool schemas for workers) plus output allowance
+must fit the **remaining shared** token reservation budget. Over-budget `ask` calls
+return `budget_exhausted` before contacting the provider, never silently truncated
+input. Navigating workers retain explicit budget-error/partial evidence when a
+model-call reservation is refused; inline material exceeding `maxTokens` outright
+returns `budget_exhausted` on either path. In practice the admissible chunk is
+smaller than `maxTokens`; prefer artifacts for bulk
+navigation. Catching tool errors does not erase their evidence. Recovery for `ask`
+requires the same task and text; `ask` and `worker` do not clear each other's failures.
 
 With workers enabled, the inline tool-result JSON budget is 16,000 bytes, both
 for bridge calls and ordinary top-level tool/read results. The common runner
@@ -248,20 +274,35 @@ Worker limits (`tools.codemode.workers`, camelCase or snake_case):
 | Field | Default | Scope |
 | --- | --- | --- |
 | `enable` | `false` | Separate opt-in; disabled behavior unchanged |
-| `timeoutS` | `45` | Each worker, also capped by remaining parent script lifetime |
-| `maxWorkers` | `2` | Total worker invocations per parent runner run |
+| `timeoutS` | `45` | Each worker/ask including slot waits, also capped by remaining parent script lifetime |
+| `maxWorkers` | `8` | Total worker + ask invocations per parent runner run (1–8) |
+| `maxConcurrency` | `4` | Simultaneous worker + ask calls per run (1–8); excess calls wait |
+| `globalMaxConcurrency` | `8` | Process-wide child cap (1–8), at least `maxConcurrency` |
 | `maxModelCalls` | `8` | Shared across all children in that run |
 | `maxTokens` | `64000` | Shared conservative input UTF-8-byte + output-token reservations |
 | `outputTokens` | `1024` | Maximum requested output tokens per model call |
-| `maxIterations` | `4` | Each child's runner; no finalization bonus call |
+| `maxIterations` | `8` | Each navigating child's runner (1–16); no finalization bonus call; ask always one call |
 | `maxToolCalls` | `64` | Shared tool/bridge/discovery attempts (nested dispatch can charge twice) |
 
-One analysis worker may be active per parent run, at most two process-wide.
+The default per-run concurrency is 4 and process-wide child cap is 8, with 8
+separate reserved child Python sandbox slots (parent sandbox cap stays 2).
+The invariant is **per-run concurrency ≤ global child cap ≤ child sandbox slots**;
+schema validation enforces it. All admitted navigating children can hold a sandbox
+simultaneously; awaiting parents do not occupy child slots, and children cannot
+recursively delegate. `ask` shares the child cap but needs no sandbox. If simultaneous
+SDK runs specify different global caps, admission respects the stricter cap of the
+requesting and currently active runs. Parent Code Mode's own `maxConcurrency` also
+bounds bridge requests: raise it alongside workers' concurrency to use more than 4.
+Total invocations are charged before queueing; two four-call waves fit the default
+8-invocation budget, but multiple-call navigation may need a larger shared model
+budget. `capacity` is not a normal fan-out result: calls wait for slots until their
+request/parent deadline or cancellation instead.
+
 Children's Python scripts have a maximum 20s deadline; parents keep their existing
 60s default including all awaited work. Cancellation propagates to model requests,
-tools, and subprocess cleanup. There is no queue, timeout removal, or persistent
-REPL. Providers may report hidden token usage exceeding a reservation; it is
-recorded and prevents subsequent over-budget calls. Remote providers must honor
+tools, queued calls, and subprocess cleanup, releasing slots/counters on every path.
+There is no timeout removal or persistent REPL. Providers may report hidden token
+usage exceeding a reservation; it is recorded and prevents subsequent over-budget calls. Remote providers must honor
 requested output limits; this is not a remote billing guarantee.
 
 `AgentRunResult.usage` remains foreground-only for compatibility; `worker_usage`
@@ -318,10 +359,11 @@ future activation requires config changes and a process restart.
   reconnect/retry behavior still applies; receipts do not provide remote exactly-once
   execution guarantees.
 - At most two parent Python sandboxes are admitted per Nanobot process, including
-  shutdown. With read-only analysis enabled, two additional child sandbox slots
-  are reserved so awaiting parents cannot starve their children. Excess calls fail
-  immediately. A Python script cannot call `tools.codemode` recursively; a separate
-  analysis worker using its own restricted Code Mode is supported.
+  shutdown. With read-only analysis enabled, eight additional child sandbox slots
+  are reserved, at least the configurable global child cap, so awaiting parents
+  cannot starve their children. Parent sandbox overflow still fails immediately;
+  worker/ask fan-out queues within its deadlines. A Python script cannot call
+  `tools.codemode` recursively; a separate analysis worker using its own restricted Code Mode is supported.
 
 There is no persistent `store` API, package installation, direct model API, or
 inline image emission in this initial implementation. Existing parent-side tools

@@ -42,13 +42,14 @@ class CodemodeExecution:
     registry: Any
     dispatch: CodemodeDispatch
     active: bool = True
-    worker_dispatch: Callable[[dict[str, Any], int], Awaitable[dict[str, Any]]] | None = None
+    worker_dispatch: Callable[[dict[str, Any], int, str], Awaitable[dict[str, Any]]] | None = None
 
 
 CODEMODE_EXECUTION: ContextVar[CodemodeExecution | None] = ContextVar("codemode_execution", default=None)
 _MAX_FRAME_BYTES = 4 * 1024 * 1024
 _MAX_OUTPUT_BYTES = 1024 * 1024
-_MAX_WORKERS = 2
+_MAX_PARENT_SANDBOXES = 2
+_MAX_CHILD_SANDBOXES = 8  # >= workers.global_max_concurrency (schema maximum)
 _active_workers = 0
 _active_child_sandboxes = 0
 
@@ -129,7 +130,10 @@ class CodemodeTool(Tool):
             f"Limits: {self.config.timeout_s:g}s, {self.config.max_tool_calls} discovery/tool requests, "
             f"{self.config.max_concurrency} concurrent safe calls."
             + (" Read-only workers enabled: await worker(task, artifacts=[id], material='') returns "
-               "status/content/evidence as data, never a chat announcement. Use await artifact_put(text), "
+               "status/content/evidence/usage as data, never a chat announcement. "
+               "For small or sliced text prefer await ask(task, text): exactly one model call, no tools. "
+               "Use worker with artifact IDs only when the child needs to search/navigate bulk input. "
+               "Use await artifact_put(text), "
                "await artifact_read(id, offset=0, limit=8000). Oversized tool results become "
                "marked-partial references; their entire JSON is retained for this run. "
                "Pass result['artifact'] or source_artifacts IDs without copying bulk text. "
@@ -194,10 +198,11 @@ class CodemodeTool(Tool):
         execution = CODEMODE_EXECUTION.get()
         if execution is None or not execution.active or execution.registry is not self.registry:
             return ToolResult.policy_block("Codemode requires an active AgentRunner execution context for this registry")
-        if (_active_child_sandboxes if child else _active_workers) >= _MAX_WORKERS:
+        if ((_active_child_sandboxes >= _MAX_CHILD_SANDBOXES) if child
+                else (_active_workers >= _MAX_PARENT_SANDBOXES)):
             return ToolResult.retryable_error("Codemode worker capacity reached; retry after an active script ends")
-        # Reserved child slots prevent two awaiting parents from occupying every slot.
-        # Globally at most two parent and two child sandboxes, with no recursive workers.
+        # Parent slots are separate. Every admitted child can own a sandbox:
+        # per-run concurrency <= global child cap <= reserved child sandbox slots.
         if child:
             _active_child_sandboxes += 1
         else:
@@ -284,13 +289,13 @@ class CodemodeTool(Tool):
                 scope = WORKER_SCOPE.get()
                 if scope is not None:
                     run.charge_tool()
-                if operation == "worker":
+                if operation in ("worker", "ask"):
                     if scope is not None:
                         raise ValueError("Workers cannot delegate")
                     execution = CODEMODE_EXECUTION.get()
                     if execution.worker_dispatch is None:
                         raise ValueError("Workers require an active AgentRunner worker dispatch")
-                    result = await execution.worker_dispatch(request.get("arguments", {}), request_id)
+                    result = await execution.worker_dispatch(request.get("arguments", {}), request_id, operation)
                 elif operation in ("artifact_put", "artifact_read"):
                     if run is None:
                         raise ValueError("Artifact operations require read-only workers enabled")
