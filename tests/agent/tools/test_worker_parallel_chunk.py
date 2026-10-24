@@ -215,7 +215,7 @@ async def test_ask_budget_refusal_never_calls_provider(worker_context, budget):
     run.config.max_tokens = 4000
     text = "x" * 4001 if budget == "input" else "x" * 3500
     if budget == "calls":
-        run.calls = run.config.max_model_calls
+        run.calls = run.config.max_workers * run.config.max_model_calls
     if budget == "shared_tokens":
         run.reserved_tokens = 3999
     if budget == "workers":
@@ -226,12 +226,17 @@ async def test_ask_budget_refusal_never_calls_provider(worker_context, budget):
     assert_released(run)
 
 
-async def test_ask_and_worker_share_call_and_total_budgets(worker_context):
+async def test_ask_and_worker_keep_separate_call_allowances_under_a_shared_total(worker_context):
     run, provider, _ = worker_context
     run.config.max_model_calls = 1
+    # Each request carries its own model-call allowance; only the total is shared.
     assert (await run_ask("chunk", "text"))["status"] == "success"
-    assert (await run_worker("navigate"))["status"] != "success"
-    assert len(provider.requests) == 1 and len(run.usage) == 1
+    assert (await run_worker("navigate"))["status"] == "success"
+    assert len(provider.requests) == 2 and len(run.usage) == 2
+    run.calls = run.config.max_workers * run.config.max_model_calls
+    refused = await run_ask("chunk", "text")
+    assert refused["status"] == "budget_exhausted"
+    assert "Run-wide model-call budget exhausted" in refused["error"]
     run.workers = run.config.max_workers
     assert (await run_ask("chunk", "text"))["status"] == "budget_exhausted"
 

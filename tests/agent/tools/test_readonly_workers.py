@@ -17,7 +17,8 @@ from nanobot.agent.tools._readonly_worker import (
     ArtifactTool,
     BudgetProvider,
     ReadonlyWorkerConfig,
-    ToolBudget,
+    WorkerAllowance,
+    WorkerBudgetExceededError,
     WorkerRegistry,
     WorkerRun,
     run_worker,
@@ -184,17 +185,60 @@ async def test_direct_dispatch_cannot_use_unknown_tools_or_unselected_artifacts(
 async def test_shared_model_token_worker_and_tool_budgets(worker_context):
     run, provider, _ = worker_context
     run.config.max_model_calls = 1
+    # Model calls are per-worker: the second worker gets its own single-call allowance.
     assert (await run_worker("one"))["status"] == "success"
-    assert (await run_worker("two"))["status"] != "success"
-    assert len(provider.requests) == 1
-    assert "budget" in (await run_worker("three"))["error"]
+    assert (await run_worker("two"))["status"] == "success"
+    assert len(provider.requests) == 2
+    # The run-wide total is the shared ceiling, at max_workers * max_model_calls.
+    run.calls = run.config.max_workers * run.config.max_model_calls
+    refused = await run_worker("three")
+    assert refused["stop_reason"] == "provider_error"  # the loop surfaces refusals, not a crash
+    assert "Run-wide model-call budget exhausted" in refused["error"]
+    assert len(provider.requests) == 2
+    # Token reservations stay one shared pool, not multiplied by worker count.
+    run.calls = 0
+    run.reserved_tokens = run.config.max_tokens - 1
+    refused = await run_worker("four")
+    assert refused["stop_reason"] == "provider_error"
+    assert "Shared worker token reservation budget exhausted" in refused["error"]
+    assert len(provider.requests) == 2
     run.config.max_tool_calls = 1
-    budget = ToolBudget(run.config.max_tool_calls)
+    budget = WorkerAllowance(run.config.max_tool_calls, "tool")
     run.charge_tool(budget)
     with pytest.raises(ValueError, match="Per-worker tool budget"):
         run.charge_tool(budget)
     # A refused charge must not keep climbing either counter.
     assert budget.used == 1 and run.tool_calls == 1
+
+
+async def test_model_call_budget_is_per_worker_so_siblings_cannot_be_starved(worker_context):
+    run, provider, _ = worker_context
+    run.config.max_model_calls = 2
+    run.config.max_iterations = 2
+    reference = run.artifacts.put("selected")["artifact"]
+    provider.handler = lambda *_: tool_call("artifact_read", artifact=reference)
+    greedy = await run_worker("greedy", [reference])
+    assert greedy["stop_reason"] == "max_iterations"
+    assert greedy["budget"]["model_calls_this_worker_used"] == 2
+    # The sibling keeps its own untouched allowance instead of inheriting exhaustion.
+    sibling = await run_worker("sibling", [reference])
+    assert sibling["stop_reason"] == "max_iterations"
+    assert "budget" not in (sibling["error"] or "").lower()
+    assert sibling["budget"]["model_calls_this_worker_used"] == 2
+    assert len(provider.requests) == 4 and run.calls == 4
+
+
+async def test_run_wide_model_call_budget_still_caps_total_calls(worker_context):
+    run, _, _ = worker_context
+    run.config.max_workers = 2
+    run.config.max_model_calls = 2
+    allowances = [WorkerAllowance(run.config.max_model_calls, "model-call") for _ in range(3)]
+    for allowance in allowances[:2]:
+        for _ in range(2):
+            run.charge_model_call(allowance)
+    with pytest.raises(WorkerBudgetExceededError, match="Run-wide model-call budget exhausted"):
+        run.charge_model_call(allowances[2])
+    assert run.calls == 4 and allowances[2].used == 0
 
 
 async def test_tool_budget_is_per_worker_so_siblings_cannot_be_starved(worker_context):
@@ -217,7 +261,7 @@ async def test_run_wide_tool_budget_still_caps_total_calls(worker_context):
     run, _, _ = worker_context
     run.config.max_workers = 2
     run.config.max_tool_calls = 2
-    budgets = [ToolBudget(run.config.max_tool_calls) for _ in range(3)]
+    budgets = [WorkerAllowance(run.config.max_tool_calls, "tool") for _ in range(3)]
     for budget in budgets[:2]:
         for _ in range(2):
             run.charge_tool(budget)
@@ -234,7 +278,9 @@ async def test_successful_worker_result_carries_budget_snapshot(worker_context):
         "workers_used": 1,
         "workers_max": run.config.max_workers,
         "model_calls_used": 1,
-        "model_calls_max": run.config.max_model_calls,
+        "model_calls_max": run.config.max_workers * run.config.max_model_calls,
+        "model_calls_per_worker_max": run.config.max_model_calls,
+        "model_calls_this_worker_used": 1,
         "tokens_reserved": run.reserved_tokens,
         "tokens_max": run.config.max_tokens,
         "tool_calls_used": 0,
