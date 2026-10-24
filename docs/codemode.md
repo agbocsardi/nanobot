@@ -275,11 +275,11 @@ Worker limits (`tools.codemode.workers`, camelCase or snake_case):
 | --- | --- | --- |
 | `enable` | `false` | Separate opt-in; disabled behavior unchanged |
 | `timeoutS` | `45` | Each worker/ask including slot waits, also capped by remaining parent script lifetime |
-| `maxWorkers` | `8` | Total worker + ask invocations per parent runner run (1–8) |
+| `maxWorkers` | `8` | Total worker + ask invocations per parent runner run (1–32) |
 | `maxConcurrency` | `4` | Simultaneous worker + ask calls per run (1–8); excess calls wait |
 | `globalMaxConcurrency` | `8` | Process-wide child cap (1–8), at least `maxConcurrency` |
-| `maxModelCalls` | `8` | Shared across all children in that run |
-| `maxTokens` | `64000` | Shared conservative input UTF-8-byte + output-token reservations |
+| `maxModelCalls` | `8` | Shared across all children in that run (1–128) |
+| `maxTokens` | `64000` | Shared conservative input UTF-8-byte + output-token reservations (4000–1000000) |
 | `outputTokens` | `1024` | Maximum requested output tokens per model call |
 | `maxIterations` | `8` | Each navigating child's runner (1–16); no finalization bonus call; ask always one call |
 | `maxToolCalls` | `64` | Shared tool/bridge/discovery attempts (nested dispatch can charge twice) |

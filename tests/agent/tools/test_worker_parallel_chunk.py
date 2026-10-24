@@ -54,6 +54,16 @@ def test_concurrency_and_iteration_schema_bounds():
             ReadonlyWorkerConfig(**args)
 
 
+def test_budget_ceilings_allow_large_queued_fanout_without_widening_sandboxes():
+    # A queued fan-out may exceed the simultaneous cap; it must not exceed it.
+    config = ReadonlyWorkerConfig(max_workers=32, max_model_calls=128, max_tokens=1_000_000)
+    assert config.max_workers == 32 and config.max_model_calls == 128
+    assert config.max_concurrency <= config.global_max_concurrency <= codemode._MAX_CHILD_SANDBOXES
+    for args in ({"max_workers": 33}, {"max_model_calls": 129}, {"max_tokens": 1_000_001}):
+        with pytest.raises(ValidationError):
+            ReadonlyWorkerConfig(**args)
+
+
 async def test_parallel_workers_two_waves_and_request_local_usage(worker_context):
     run, provider, _ = worker_context
     n = run.config.max_concurrency
