@@ -80,6 +80,22 @@ async def describe_tool(name):
     return await _request("describe", name=name)
 
 
+async def worker(task, *, artifacts=None, material=""):
+    return await _request("worker", arguments={
+        "task": task, "artifacts": artifacts, "material": material,
+    })
+
+
+async def artifact_put(text):
+    return await _request("artifact_put", arguments={"text": text})
+
+
+async def artifact_read(artifact, *, offset=0, limit=8000):
+    return await _request("artifact_read", arguments={
+        "artifact": artifact, "offset": offset, "limit": limit,
+    })
+
+
 async def _read_replies(reader):
     try:
         while line := await reader.readline():
@@ -107,6 +123,7 @@ async def _main(payload):
         "__name__": "__codemode__", "asyncio": asyncio, "json": json,
         "tools": _Tools(), "text": text, "ToolError": ToolError,
         "search_tools": search_tools, "describe_tool": describe_tool,
+        "worker": worker, "artifact_put": artifact_put, "artifact_read": artifact_read,
     }
     try:
         # Build the async wrapper without shifting the submitted source's line numbers.

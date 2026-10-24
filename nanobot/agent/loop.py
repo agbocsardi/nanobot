@@ -1618,12 +1618,17 @@ class AgentLoop:
                     message_metadata=effective_metadata,
                 ),
                 vision_handoff=self.vision_handoff,
+                worker_usage_callback=lambda provider, model, usage: self._record_session_usage(
+                    session, usage, provider=provider, model=model,
+                ),
             ))
         finally:
             reset_workspace_scope(workspace_token)
             reset_request_context(request_token)
             reset_file_states(file_state_token)
-        self._last_usage = result.usage
+        self._last_usage = dict(result.usage)
+        for row in result.worker_usage:
+            AgentRunner._accumulate_usage(self._last_usage, row["usage"])
         # A per-turn sink survives MessageTool suppressing the outbound response;
         # shared foreground state is not valid cron audit data.
         run_usage = effective_metadata.get("_cron_run_usage")
@@ -1637,6 +1642,8 @@ class AgentLoop:
                 provider=str(getattr(spec, "name", None) or type(provider).__name__),
                 model=effective_model,
             ))
+            if result.worker_usage:
+                run_usage["worker_usage"] = result.worker_usage
         self._record_session_usage(
             session,
             result.usage,

@@ -18,7 +18,7 @@ from nanobot.agent.tools.schema import (
 )
 from nanobot.config_base import Base
 from nanobot.security.workspace_access import current_tool_workspace
-from nanobot.utils.helpers import build_image_content_blocks, detect_image_mime
+from nanobot.utils.helpers import TOOL_RESULT_CAPTURE, build_image_content_blocks, detect_image_mime
 from nanobot.utils.image_budget import prepare_image
 from nanobot.utils.image_cache import cache_prepared_image, path_within_workspace
 
@@ -344,6 +344,9 @@ class ReadFileTool(_FsTool):
             result = "\n".join(numbered)
 
             if len(result) > self._MAX_CHARS:
+                capture = TOOL_RESULT_CAPTURE.get()
+                if capture is not None:
+                    capture(result + f"\n\n(Selected lines {offset}-{end} of {total}; not necessarily the whole file.)")
                 trimmed, chars = [], 0
                 for line in numbered:
                     chars += len(line) + 1
@@ -407,6 +410,9 @@ class ReadFileTool(_FsTool):
         if end < total_pages - 1:
             result += f"\n\n(Showing pages {start + 1}-{end + 1} of {total_pages}. Use pages='{end + 2}-{min(end + 1 + self._MAX_PDF_PAGES, total_pages)}' to continue.)"
         if len(result) > self._MAX_CHARS:
+            capture = TOOL_RESULT_CAPTURE.get()
+            if capture is not None:
+                capture(result + f"\n\n(Selected pages {start + 1}-{end + 1} of {total_pages}.)")
             result = result[:self._MAX_CHARS] + "\n\n(PDF text truncated at ~128K chars)"
         return result
 
@@ -425,6 +431,9 @@ class ReadFileTool(_FsTool):
             return f"({fp.suffix.upper().lstrip('.')} has no extractable text: {fp})"
 
         if len(result) > self._MAX_CHARS:
+            capture = TOOL_RESULT_CAPTURE.get()
+            if capture is not None:
+                capture(result)
             result = result[:self._MAX_CHARS] + "\n\n(Document text truncated at ~128K chars)"
 
         return result
