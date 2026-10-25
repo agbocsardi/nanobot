@@ -228,7 +228,8 @@ async def test_verification_turn_lets_the_model_retry_before_replying() -> None:
     assert len(provider.requests) == 4
     nudge = provider.requests[2]["messages"][-1]
     assert nudge["role"] == "user"
-    assert "did not complete" in nudge["content"]
+    assert "draft has not been delivered" in nudge["content"]
+    assert "complete answer, not just an error-clarification message" in nudge["content"]
     assert "- write_file: Error: permission denied" in nudge["content"]
     assert result.stop_reason == "completed"
     assert result.final_content == "Saved the list, after a retry."
@@ -444,6 +445,71 @@ async def test_unrelated_success_does_not_recover_retryable_error() -> None:
 
     assert result.stop_reason == "partial_completion"
     assert result.final_content.startswith("Incomplete:")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_status", ["success", "nonzero_exit"])
+async def test_terminal_poll_resolves_only_its_running_exec(exit_status) -> None:
+    tools = ToolRegistry()
+    tools.register(StaticTool("exec", ToolResult.partial(
+        "Process running", data={"state": "running", "session_id": "owned"},
+    )))
+    tools.register(StaticTool("write_stdin", ToolResult(
+        "Process exited", status=exit_status,
+        data={"state": "exited", "session_id": "owned"},
+    )))
+    result, provider = await run_script([
+        LLMResponse(content="working", tool_calls=[ToolCallRequest(id="start", name="exec", arguments={})]),
+        LLMResponse(content="polling", tool_calls=[ToolCallRequest(id="poll", name="write_stdin", arguments={})]),
+        LLMResponse(content="Here is the answer."),
+    ], tools=tools, max_iterations=6)
+    assert result.stop_reason == "completed"
+    assert result.final_content == "Here is the answer."
+    assert len(provider.requests) == 3
+    # The initial partial is still recorded honestly, not relabeled success.
+    assert result.tool_events[0]["status"] == "partial"
+
+
+@pytest.mark.asyncio
+async def test_unrelated_exec_success_does_not_clear_running_process() -> None:
+    tools = ToolRegistry()
+    tools.register(_PathTool("exec",
+        ToolResult.partial("Process running", data={"state": "running", "session_id": "owned"}),
+        ToolResult("Other command done", data={"state": "exited", "session_id": "other"}),
+    ))
+    result, _ = await run_script([
+        _edit_turn("start", "exec", ""),
+        _edit_turn("other", "exec", ""),
+        LLMResponse(content="Still running."),
+    ], tools=tools)
+    assert result.stop_reason == "partial_completion"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unchecked", [False, True])
+async def test_chat_keeps_verification_internal_but_preserves_failure_verdict(unchecked) -> None:
+    tools = ToolRegistry()
+    tools.register(_PathTool("write_file", ToolResult(
+        "Accepted but unverified", side_effects=[{"kind": "write"}], postcondition="unchecked",
+    )) if unchecked else _failing_write())
+    answer = "The lookup failed; no settings changed. Here are the available options."
+    result, provider = await run_script([
+        _edit_turn("write", "write_file", "/notes/list.md"),
+        LLMResponse(content=answer if unchecked else "Unsupported draft success."),
+        LLMResponse(content=answer),
+    ], tools=tools, max_iterations=6, include_tool_failure_details=False)
+    assert result.stop_reason == "partial_completion"
+    assert result.final_content == answer
+    assert result.messages[-1]["content"] == answer
+    assert result.tool_events[0]["status"] == ("partial" if unchecked else "retryable_error")
+    assert len(provider.requests) == (2 if unchecked else 3)
+    if unchecked:
+        # Accepted side effects must not earn a retry: it may duplicate delivery.
+        return
+    nudge = provider.requests[-1]["messages"][-1]["content"]
+    assert "Keep answering the user's latest request" in nudge
+    assert "raw tool diagnostics internal" in nudge
+    assert "Do not restate the whole task" not in nudge
 
 
 # --- a malformed call is not a failed operation (#55) -------------------------
