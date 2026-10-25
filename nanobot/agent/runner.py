@@ -176,6 +176,9 @@ class AgentRunSpec:
     # plainly what did not happen. Set False to keep the old prefix-only
     # behaviour (one fewer LLM call on failing turns).
     verify_tool_failures: bool = True
+    # Internal consumers retain explicit diagnostic text; conversational turns
+    # keep the structured verdict but deliver only the model's corrected answer.
+    include_tool_failure_details: bool = True
     vision_handoff: Any = None  # nanobot.agent.vision_handoff.VisionHandoff | None
     # Persisted-run observability: enrich every tool event with a compact
     # args map and a rendered-result preview (see _tool_event).
@@ -886,6 +889,7 @@ class AgentRunner:
                 stop_reason = terminal_tool_reason
                 clean = self._suppress_false_success(
                     clean, stop_reason, tool_events, tool_event_targets,
+                    include_details=spec.include_tool_failure_details,
                 )
                 assistant_message = build_assistant_message(
                     clean,
@@ -1014,8 +1018,28 @@ class AgentRunner:
         """
         name = str(event.get("name") or "")
         targets = cls._targets_at(event_targets, index)
+        data = event.get("data")
+        session_id = (
+            data.get("session_id")
+            if name in {"exec", "write_stdin"} and isinstance(data, dict)
+            else None
+        )
         for later_index in range(index + 1, len(tool_events)):
             later = tool_events[later_index]
+            # Running is an intermediate process state, not a failed command.
+            # Match its result-side ID to the terminal poll, including a
+            # non-zero exit (which is payload data, not an unresolved call).
+            if session_id and data.get("state") == "running":
+                later_data = later.get("data")
+                if (
+                    later.get("name") in {"exec", "write_stdin"}
+                    and isinstance(later_data, dict)
+                    and later_data.get("session_id") == session_id
+                    and later_data.get("state") == "exited"
+                    and later.get("status") in {"success", "nonzero_exit"}
+                ):
+                    return True
+                continue
             if str(later.get("status") or "") != "success":
                 continue
             if event.get("recovery_key") is not None:
@@ -1054,7 +1078,15 @@ class AgentRunner:
         stop_reason: str,
         tool_events: list[dict[str, Any]] | None = None,
         event_targets: list[list[str]] | None = None,
+        *,
+        include_details: bool = True,
     ) -> str:
+        if not include_details:
+            prefix = (_POLICY_BLOCK_PREFIX if stop_reason == "policy_block"
+                      else _PARTIAL_COMPLETION_PREFIX)
+            logger.warning("{}\n{}", prefix,
+                           "\n".join(cls._failure_details(tool_events or [], event_targets)))
+            return content
         # Only false-success outcomes get a prefix; ask_user (a deliberate
         # wait-for-user pause) and other terminal reasons pass content through.
         # The first line stays byte-identical so log fingerprinting and the

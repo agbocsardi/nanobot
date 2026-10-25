@@ -57,6 +57,7 @@ async def run_script(
     max_iterations: int = 3,
     finalize_on_max_iterations: bool = True,
     verify_tool_failures: bool = True,
+    include_tool_failure_details: bool = True,
 ):
     provider = ScriptedProvider(responses)
     # AgentRunner only requires the provider protocol at runtime. MagicMock supplies
@@ -71,6 +72,7 @@ async def run_script(
         max_tool_result_chars=AgentDefaults().max_tool_result_chars,
         finalize_on_max_iterations=finalize_on_max_iterations,
         verify_tool_failures=verify_tool_failures,
+        include_tool_failure_details=include_tool_failure_details,
     ))
     return result, provider
 

@@ -98,6 +98,38 @@ async def test_cron_usage_sink_records_run_override(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("background", [False, True])
+async def test_loop_keeps_tool_diagnostics_internal_for_chat(tmp_path, background):
+    from nanobot.agent.tools.base import ToolResult
+
+    loop = _make_loop(tmp_path)
+    loop.max_iterations = 6
+    answer = "The save failed; here is the explanation you asked for."
+    loop.provider.chat_with_retry = AsyncMock(side_effect=[
+        LLMResponse(content="saving", tool_calls=[
+            ToolCallRequest(id="call", name="list_dir", arguments={}),
+        ]),
+        LLMResponse(content="Unsupported draft."),
+        LLMResponse(content=answer),
+    ])
+    from nanobot.agent.tools.registry import ToolRegistry
+    from tests.harness.helpers import StaticTool
+
+    tools = ToolRegistry()
+    tools.register(StaticTool("list_dir", ToolResult.retryable_error("lookup failed")))
+    content, _, messages, reason, _ = await loop._run_agent_loop(
+        [], tools=tools, metadata={"_cron_run_usage": {}} if background else {},
+    )
+    assert reason == "partial_completion"
+    assert loop.provider.chat_with_retry.await_count == 3
+    if background:
+        assert content.startswith("Incomplete:")
+    else:
+        assert content == answer
+        assert messages[-1]["content"] == answer
+
+
+@pytest.mark.asyncio
 async def test_loop_goal_turn_uses_standard_iteration_budget(tmp_path):
     loop = _make_loop(tmp_path)
     loop.provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
