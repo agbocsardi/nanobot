@@ -3,6 +3,7 @@
 import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -387,11 +388,20 @@ def test_add_at_job_uses_default_timezone_for_naive_datetime(tmp_path) -> None:
         RequestContext(channel="telegram", chat_id="chat-1", session_key="telegram:chat-1")
     )
 
-    result = tool._add_job(None, "Morning reminder", None, None, None, "2026-10-25T08:00:00")
+    # Derive the timestamp rather than hardcoding a date: a fixed date silently
+    # becomes a past date once the calendar passes it, and the test then fails
+    # on the "must be in the future" guard instead of on timezone handling.
+    # Asia/Shanghai has a fixed +08:00 offset, so a naive value two days out is
+    # unambiguous and always future-dated.
+    at = (datetime.now(timezone.utc) + timedelta(days=2)).replace(
+        hour=8, minute=0, second=0, microsecond=0,
+    ).replace(tzinfo=None)
+
+    result = tool._add_job(None, "Morning reminder", None, None, None, at.isoformat())
 
     assert result.startswith("Created job")
     job = tool._cron.list_jobs()[0]
-    expected = int(datetime(2026, 10, 25, 0, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    expected = int(at.replace(tzinfo=ZoneInfo("Asia/Shanghai")).timestamp() * 1000)
     assert job.schedule.at_ms == expected
 
 
