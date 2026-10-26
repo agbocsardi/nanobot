@@ -11,8 +11,10 @@ from typing import Any
 
 from nanobot.utils.helpers import _write_text_atomic
 
-INLINE_BYTES = 16000
+INLINE_BYTES = 16000  # Model-visible output, not the script's working data.
+SCRIPT_BYTES = 1024 * 1024
 READ_CHARS = 8000
+MAX_READ_CHARS = 128000
 
 
 class ArtifactStore:
@@ -45,13 +47,13 @@ class ArtifactStore:
             raise ValueError("Unknown or inaccessible artifact in this run/profile")
 
     def read(
-        self, artifact: str, offset: int = 0, limit: int = READ_CHARS,
+        self, artifact: str, offset: int = 0, limit: int | None = READ_CHARS,
         *, allowed: Set[str] | None = None,
     ) -> dict[str, Any]:
         self.validate(artifact, allowed)
-        if (type(offset) is not int or offset < 0 or type(limit) is not int
-                or not 1 <= limit <= READ_CHARS):
-            raise ValueError(f"offset must be nonnegative; limit must be 1..{READ_CHARS}")
+        if (type(offset) is not int or offset < 0 or (limit is not None and (
+                type(limit) is not int or not 1 <= limit <= MAX_READ_CHARS))):
+            raise ValueError(f"offset must be nonnegative; limit must be None or 1..{MAX_READ_CHARS}")
         path, chars = self._paths[artifact]
         # UTF-8 offsets are characters, not bytes. Storage is bounded for the whole run.
         with path.open(encoding="utf-8") as handle:
@@ -61,10 +63,15 @@ class ArtifactStore:
                 if not chunk:
                     break
                 remaining -= len(chunk)
-            text = handle.read(limit)
+            # Full reads are convenient for computation, but must still fit the bridge.
+            text = handle.read(limit if limit is not None else SCRIPT_BYTES)
+        end = offset + len(text)
+        more = end < chars
+        if limit is None and (more or len(json.dumps(text, ensure_ascii=True).encode()) > SCRIPT_BYTES - 1024):
+            raise ValueError("Artifact exceeds the 1 MiB script read limit; request offset/limit chunks or use a worker")
         return {"artifact": artifact, "text": text, "offset": offset,
-                "next_offset": offset + len(text), "chars": chars,
-                "partial": offset > 0 or offset + len(text) < chars}
+                "next_offset": end if more else None, "chars": chars,
+                "partial": more}
 
     def search(self, artifact: str, query: str, *, allowed: Set[str]) -> dict[str, Any]:
         self.validate(artifact, allowed)
@@ -83,10 +90,10 @@ class ArtifactStore:
         return {"artifact": artifact, "offsets": offsets, "chars": chars,
                 "partial": text.find(query, start) >= 0 if len(offsets) == 100 else False}
 
-    def bound(self, value: Any) -> Any:
-        """Persist the entire JSON value BEFORE replacing any inline fields."""
+    def bound(self, value: Any, *, max_bytes: int = INLINE_BYTES) -> Any:
+        """Offload before truncating; script transport and model output have distinct limits."""
         serialized = json.dumps(value, ensure_ascii=True, allow_nan=False)
-        if len(serialized.encode()) <= INLINE_BYTES:
+        if len(serialized.encode()) <= max_bytes:
             return value
         reference = self.put(serialized)
         result = {"partial": True, **reference, "preview": serialized[:1000]}

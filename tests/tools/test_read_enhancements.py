@@ -1,4 +1,4 @@
-"""Tests for ReadFileTool enhancements: description fix, read dedup, PDF support, device blacklist, office docs."""
+"""ReadFileTool content, session isolation, PDF, device and office contracts."""
 
 import os
 import sys
@@ -34,11 +34,11 @@ class TestReadDescriptionFix:
 
 
 # ---------------------------------------------------------------------------
-# Read deduplication
+# Repeated reads
 # ---------------------------------------------------------------------------
 
-class TestReadDedup:
-    """Same file + same offset/limit + unchanged mtime -> short stub."""
+class TestRepeatedReads:
+    """Explicit reads always return content, even when the file is unchanged."""
 
     @pytest.fixture()
     def tool(self, tmp_path):
@@ -49,15 +49,13 @@ class TestReadDedup:
         return WriteFileTool(workspace=tmp_path)
 
     @pytest.mark.asyncio
-    async def test_second_read_returns_unchanged_stub(self, tool, tmp_path):
+    async def test_second_read_returns_content(self, tool, tmp_path):
         f = tmp_path / "data.txt"
         f.write_text("\n".join(f"line {i}" for i in range(100)), encoding="utf-8")
         first = await tool.execute(path=str(f))
         assert "line 0" in first
         second = await tool.execute(path=str(f))
-        assert "unchanged" in second.lower()
-        # Stub should not contain file content
-        assert "line 0" not in second
+        assert second == first
 
     @pytest.mark.asyncio
     async def test_read_after_external_modification_returns_full(self, tool, tmp_path):
@@ -147,7 +145,7 @@ class TestReadDedupSessionIsolation:
             file_state.reset_file_states(token)
 
         assert "line 0" in first
-        assert "unchanged" in repeat.lower()
+        assert repeat == first
 
         token = file_state.bind_file_states(session_b)
         try:

@@ -94,7 +94,7 @@ async def artifact_put(text):
     return await _request("artifact_put", arguments={"text": text})
 
 
-async def artifact_read(artifact, *, offset=0, limit=8000):
+async def artifact_read(artifact, *, offset=0, limit=None):
     return await _request("artifact_read", arguments={
         "artifact": artifact, "offset": offset, "limit": limit,
     })

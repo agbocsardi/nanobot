@@ -115,10 +115,10 @@ def test_full_payload_is_on_disk_before_inline_truncation_and_errors_remain_visi
             chunk = store.read(bounded["artifact"], offset=offset)
             chunks.append(chunk["text"])
             offset = chunk["next_offset"]
-            if offset == chunk["chars"]:
+            if offset is None:
                 break
         assert json.loads("".join(chunks)) == original
-        assert chunk["partial"]  # not the entire artifact, even the final chunk
+        assert not chunk["partial"]  # EOF terminates pagination even after a nonzero offset
         escaped = {key: '\\"' * 10000 for key in (
             "status", "stop_reason", "retryable", "exit_code", "postcondition", "content",
             "error", "evidence", "side_effects", "usage", "source_artifacts",
@@ -138,7 +138,7 @@ def test_artifacts_reject_paths_cross_runs_scopes_and_invalid_reads():
                 b.read(bad)
         with pytest.raises(ValueError):
             a.read(hidden, allowed={selected})
-        for kwargs in [{"offset": -1}, {"limit": 8001}, {"limit": True}]:
+        for kwargs in [{"offset": -1}, {"limit": 128001}, {"limit": True}]:
             with pytest.raises(ValueError):
                 a.read(selected, **kwargs)
         assert a.search(selected, "needle", allowed={selected})["offsets"] == [2, 11]
@@ -214,7 +214,6 @@ async def test_shared_model_token_worker_and_tool_budgets(worker_context):
 async def test_model_call_budget_is_per_worker_so_siblings_cannot_be_starved(worker_context):
     run, provider, _ = worker_context
     run.config.max_model_calls = 2
-    run.config.max_iterations = 2
     reference = run.artifacts.put("selected")["artifact"]
     provider.handler = lambda *_: tool_call("artifact_read", artifact=reference)
     greedy = await run_worker("greedy", [reference])
@@ -303,7 +302,7 @@ async def test_worker_iteration_limit_has_no_bonus_finalization_call(worker_cont
     run, provider, _ = worker_context
     reference = run.artifacts.put("selected")["artifact"]
     provider.handler = lambda *_: tool_call("artifact_read", artifact=reference)
-    run.config.max_iterations = 2
+    run.config.max_model_calls = 2
     result = await run_worker("analyze", [reference])
     assert result["stop_reason"] == "max_iterations"
     assert result["status"] != "success"

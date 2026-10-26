@@ -7,7 +7,6 @@ import hashlib
 import inspect
 import json
 import os
-from contextlib import suppress
 from copy import copy, deepcopy
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -68,7 +67,6 @@ from nanobot.utils.runtime import (
     build_length_recovery_message,
     ensure_nonempty_tool_result,
     is_blank_text,
-    repeated_external_lookup_error,
     repeated_workspace_violation_error,
 )
 
@@ -179,6 +177,9 @@ class AgentRunSpec:
     # Internal consumers retain explicit diagnostic text; conversational turns
     # keep the structured verdict but deliver only the model's corrected answer.
     include_tool_failure_details: bool = True
+    # Chat can recover through another source without a failed read becoming a task verdict.
+    # Internal/background consumers remain strict; operational events are always retained.
+    adjudicate_read_only_failures: bool = True
     vision_handoff: Any = None  # nanobot.agent.vision_handoff.VisionHandoff | None
     # Persisted-run observability: enrich every tool event with a compact
     # args map and a rendered-result preview (see _tool_event).
@@ -457,7 +458,6 @@ class AgentRunner:
         tool_event_targets: list[list[str]] = []
         # At most one verification turn per run: it must not become a loop.
         verification_attempted = False
-        external_lookup_counts: dict[str, int] = {}
         # Per-turn throttle for repeated attempts against the same outside target.
         workspace_violation_counts: dict[str, int] = {}
         empty_content_retries = 0
@@ -645,7 +645,6 @@ class AgentRunner:
                 results, new_events, new_event_targets, fatal_error = await self._execute_tools(
                     spec,
                     response.tool_calls,
-                    external_lookup_counts,
                     workspace_violation_counts,
                 )
                 tool_events.extend(new_events)
@@ -848,8 +847,14 @@ class AgentRunner:
                     continue
                 break
 
+            verdict_events, verdict_targets = tool_events, tool_event_targets
+            if not spec.adjudicate_read_only_failures:
+                selected = [(event, targets) for event, targets in zip(tool_events, tool_event_targets)
+                            if not event.get("read_only")]
+                verdict_events = [event for event, _ in selected]
+                verdict_targets = [targets for _, targets in selected]
             terminal_tool_reason = self._terminal_tool_stop_reason(
-                tool_events, tool_event_targets,
+                verdict_events, verdict_targets,
             )
             if (
                 terminal_tool_reason == "partial_completion"
@@ -858,14 +863,14 @@ class AgentRunner:
                 # Only when a retry or a plainer statement could change the
                 # outcome; an unverifiable side effect is not fixable here.
                 and self._actionable_failures(
-                    self._unresolved_events(tool_events, tool_event_targets)
+                    self._unresolved_events(verdict_events, verdict_targets)
                 )
                 # Leave a slot for the verification call, otherwise the loop
                 # would fall through to max_iterations handling instead.
                 and iteration + 1 < spec.max_iterations
             ):
                 verification_attempted = True
-                unresolved = self._unresolved_events(tool_events, tool_event_targets)
+                unresolved = self._unresolved_events(verdict_events, verdict_targets)
                 actionable = self._actionable_failures(unresolved)
                 # Record what the model actually said, unprefixed: the reply is
                 # on hold, not rewritten, and the transcript stays honest.
@@ -888,7 +893,7 @@ class AgentRunner:
             if terminal_tool_reason is not None:
                 stop_reason = terminal_tool_reason
                 clean = self._suppress_false_success(
-                    clean, stop_reason, tool_events, tool_event_targets,
+                    clean, stop_reason, verdict_events, verdict_targets,
                     include_details=spec.include_tool_failure_details,
                 )
                 assistant_message = build_assistant_message(
@@ -1654,13 +1659,12 @@ class AgentRunner:
         self,
         spec: AgentRunSpec,
         tool_calls: list[ToolCallRequest],
-        external_lookup_counts: dict[str, int],
         workspace_violation_counts: dict[str, int],
     ) -> tuple[list[Any], list[dict[str, Any]], list[list[str]], BaseException | None]:
         async def run_call(tool_call: ToolCallRequest):
             if tool_call.name != "codemode":
                 return await self._run_tool(
-                    spec, tool_call, external_lookup_counts, workspace_violation_counts,
+                    spec, tool_call, workspace_violation_counts,
                 )
             children: list[tuple[int, dict[str, Any], list[str]]] = []
             child_errors: list[BaseException] = []
@@ -1674,7 +1678,7 @@ class AgentRunner:
                 )
                 async def execute():
                     return await self._run_tool(
-                        spec, child, external_lookup_counts, workspace_violation_counts,
+                        spec, child, workspace_violation_counts,
                     )
                 try:
                     if spec.concurrent_tools:
@@ -1733,7 +1737,9 @@ class AgentRunner:
                 if state is not None:
                     try:
                         # Full evidence stays scoped/on disk, not in the event ledger or chat.
-                        bounded = state.artifacts.bound(outcome)
+                        from nanobot.agent.tools._worker_artifacts import SCRIPT_BYTES
+
+                        bounded = state.artifacts.bound(outcome, max_bytes=SCRIPT_BYTES)
                         evidence.update(
                             {key: bounded[key] for key in ("artifact", "chars", "bytes")}
                             if bounded is not outcome else state.artifacts.put(json.dumps(outcome, ensure_ascii=True))
@@ -1752,6 +1758,7 @@ class AgentRunner:
                 cause = outcome.get("error") or "; ".join(str(child["detail"]) for child in failures)
                 detail = f"Worker {outcome['status']} ({outcome.get('stop_reason') or 'no completion'}): {cause}"
                 event = self._tool_event(operation, ToolResult(detail, status=status, evidence=[evidence]))
+                event["read_only"] = True
                 # Recovery requires the same task AND selected material, not just another worker.
                 selected = {"task": arguments.get("task"), "artifacts": arguments.get("artifacts") or [],
                             "material": arguments.get("text" if operation == "ask" else "material", ""),
@@ -1770,7 +1777,7 @@ class AgentRunner:
             token = CODEMODE_EXECUTION.set(execution)
             try:
                 result, event, error = await self._run_tool(
-                    spec, tool_call, external_lookup_counts, workspace_violation_counts,
+                    spec, tool_call, workspace_violation_counts,
                 )
             finally:
                 execution.active = False
@@ -1782,6 +1789,13 @@ class AgentRunner:
                 children.sort(key=lambda item: item[0])
                 event["_nested_events"] = [child for _, child, _ in children]
                 event["_nested_targets"] = [targets for _, _, targets in children]
+            # The sandbox itself cannot mutate host state. Nested operations determine
+            # whether an outer script failure is only failed read-only computation.
+            event["read_only"] = (
+                event["status"] not in {"policy_block", "ask_user"}
+                and not event.get("side_effects")
+                and all(child.get("read_only") for _, child, _ in children)
+            )
             return result, event, error or (child_errors[0] if child_errors else None)
 
         batches = self._partition_tool_batches(spec, tool_calls)
@@ -1821,7 +1835,6 @@ class AgentRunner:
         self,
         spec: AgentRunSpec,
         tool_call: ToolCallRequest,
-        external_lookup_counts: dict[str, int],
         workspace_violation_counts: dict[str, int],
     ) -> tuple[Any, dict[str, Any], BaseException | None]:
         from nanobot.agent.tools._readonly_worker import WORKER_RUN, WORKER_SCOPE
@@ -1840,10 +1853,17 @@ class AgentRunner:
         capture = TOOL_RESULT_CAPTURE.set(retain) if state is not None else None
         try:
             payload, event, error = await self._run_tool_impl(
-                spec, tool_call, external_lookup_counts, workspace_violation_counts,
+                spec, tool_call, workspace_violation_counts,
             )
             if sources:
                 event["source_artifacts"] = sources
+            tool = spec.tools.get(tool_call.name)
+            if (tool is not None and tool_call.name != "codemode" and getattr(tool, "read_only", False) is True
+                    and isinstance(tool_call.arguments, dict)
+                    and tool.effect_for(tool_call.arguments) == "read"
+                    and not event.get("side_effects")
+                    and event.get("status") not in {"policy_block", "ask_user"}):
+                event["read_only"] = True
             return payload, event, error
         finally:
             if capture is not None:
@@ -1853,102 +1873,14 @@ class AgentRunner:
         self,
         spec: AgentRunSpec,
         tool_call: ToolCallRequest,
-        external_lookup_counts: dict[str, int],
         workspace_violation_counts: dict[str, int],
     ) -> tuple[Any, dict[str, Any], BaseException | None]:
         hint = "\n\n[Analyze the error above and try a different approach.]"
         # Enriched persistence for run records: capture compact args whenever
         # the run opts in (subagents), leaving default runs byte-identical.
         recorded_args = tool_call.arguments if spec.record_tool_details else None
-        lookup_error = repeated_external_lookup_error(
-            tool_call.name,
-            tool_call.arguments,
-            external_lookup_counts,
-        )
-        if lookup_error:
-            outcome = ToolResult.policy_block(
-                lookup_error,
-                evidence=[{"kind": "policy", "rule": "repeated_external_lookup"}],
-            )
-            event = self._tool_event(
-                tool_call.name,
-                outcome,
-                detail="repeated external lookup blocked",
-                arguments=recorded_args,
-            )
-            if spec.fail_on_tool_error:
-                return lookup_error + hint, event, RuntimeError(lookup_error)
-            return lookup_error + hint, event, None
-        prepare_call = getattr(spec.tools, "prepare_call", None)
-        tool, params, prep_error = None, tool_call.arguments, None
-        if callable(prepare_call):
-            with suppress(Exception):
-                prepared = prepare_call(tool_call.name, tool_call.arguments)
-                if isinstance(prepared, tuple) and len(prepared) == 3:
-                    tool, params, prep_error = prepared
-        if prep_error:
-            # Schema/parameter rejection: the call never reached the tool, so it
-            # is a malformed call rather than a failed operation.
-            outcome = ToolResult.invalid_arguments(prep_error)
-            event = self._tool_event(
-                tool_call.name,
-                outcome,
-                detail=prep_error.split(": ", 1)[-1][:120],
-                execution_succeeded=False,
-                arguments=recorded_args,
-            )
-            handled = self._classify_violation(
-                raw_text=prep_error,
-                soft_payload=prep_error + hint,
-                event=event,
-                tool_call=tool_call,
-                workspace_violation_counts=workspace_violation_counts,
-            )
-            if handled is not None:
-                return handled
-            return prep_error + hint, event, (
-                RuntimeError(prep_error) if spec.fail_on_tool_error else None
-            )
-        evaluate_policy = getattr(spec.tools, "evaluate_policy", None)
-        if tool is not None and callable(evaluate_policy):
-            decision = evaluate_policy(tool, params)
-            if decision.outcome != "allow":
-                action = "requires explicit approval" if decision.outcome == "ask" else "was denied"
-                reason = f": {decision.reason}" if decision.reason else ""
-                approval_hint = ""
-                if decision.outcome == "ask" and decision.approval_token:
-                    approval_hint = (
-                        f" Approve with `/policy approve {decision.approval_token}` "
-                        f"or deny with `/policy deny {decision.approval_token}`."
-                    )
-                message = (
-                    f"Policy {action} for tool '{tool_call.name}'"
-                    f" (rule: {decision.rule_id or 'unnamed'}){reason}.{approval_hint}"
-                )
-                data: dict[str, Any] = {
-                    "decision": decision.outcome,
-                    "rule_id": decision.rule_id,
-                    "resource": decision.resource,
-                }
-                evidence: dict[str, Any] = {
-                    "kind": "tool_policy",
-                    "decision": decision.outcome,
-                    "rule_id": decision.rule_id,
-                }
-                if decision.approval_token:
-                    data["approval_token"] = decision.approval_token
-                    evidence["approval_token"] = decision.approval_token
-                outcome = ToolResult.policy_block(
-                    message,
-                    data=data,
-                    evidence=[evidence],
-                )
-                return str(outcome), self._tool_event(
-                    tool_call.name,
-                    outcome,
-                    execution_succeeded=False,
-                    arguments=recorded_args,
-                ), None
+        tool = spec.tools.get(tool_call.name)
+        params = tool_call.arguments
         emit_file_edit_events = (
             spec.progress_callback is not None
             and on_progress_accepts_file_edit_events(spec.progress_callback)
@@ -1974,15 +1906,8 @@ class AgentRunner:
                 ) for file_edit_tracker in file_edit_trackers],
             )
         try:
-            exec_call_kwargs: dict[str, Any] = {}
-            if getattr(spec.tools, "receipt_store", None) is not None:
-                exec_call_kwargs["exec_id"] = tool_call.id
-            if tool is not None and exec_call_kwargs:
-                result = await spec.tools.execute(tool_call.name, params, **exec_call_kwargs)
-            elif tool is not None:
-                result = await tool.execute(**params)
-            else:
-                result = await spec.tools.execute(tool_call.name, params, **exec_call_kwargs)
+            exec_kwargs = {"exec_id": tool_call.id} if getattr(spec.tools, "receipt_store", None) is not None else {}
+            result = await spec.tools.execute(tool_call.name, params, **exec_kwargs)
         except asyncio.CancelledError:
             raise
         except BaseException as exc:
@@ -2032,6 +1957,7 @@ class AgentRunner:
                 )
             event = self._tool_event(
                 tool_call.name, outcome, arguments=recorded_args,
+                execution_succeeded=outcome.status not in {"invalid_arguments", "policy_block"},
             )
             handled = self._classify_violation(
                 raw_text=str(outcome),
@@ -2043,7 +1969,7 @@ class AgentRunner:
             if handled is not None:
                 return handled
             payload = str(outcome)
-            if outcome.retryable:
+            if outcome.retryable and hint not in payload:
                 payload += hint
             fatal = outcome.status == "fatal_error" or spec.fail_on_tool_error
             return payload, event, RuntimeError(str(outcome)) if fatal else None

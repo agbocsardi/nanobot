@@ -1617,8 +1617,12 @@ class AgentLoop:
                     session_metadata=session_metadata,
                     message_metadata=effective_metadata,
                 ),
-                # Verification diagnostics stay in events/logs, not in chat.
-                # Cron/background runs retain their explicit machine notices.
+                # Failed read-only helpers are evidence, not a verdict on a chat answer.
+                # Unattended runs and mutations retain strict completion checks.
+                adjudicate_read_only_failures=(
+                    effective_metadata["interaction_mode"] not in {"foreground", "audit", "exploration"}
+                    or "_cron_run_usage" in effective_metadata
+                ),
                 include_tool_failure_details="_cron_run_usage" in effective_metadata,
                 vision_handoff=self.vision_handoff,
                 worker_usage_callback=lambda provider, model, usage: self._record_session_usage(

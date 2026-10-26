@@ -10,8 +10,6 @@ from loguru import logger
 
 from nanobot.utils.helpers import stringify_text_blocks
 
-_MAX_REPEAT_EXTERNAL_LOOKUPS = 2
-
 # Third same-target workspace violation in a turn escalates to "stop retrying".
 _MAX_REPEAT_WORKSPACE_VIOLATIONS = 2
 
@@ -86,45 +84,6 @@ def build_length_recovery_message() -> dict[str, str]:
 def build_goal_continue_message(custom: str | None = None) -> dict[str, str]:
     """Prompt the model to continue when a sustained goal is still active."""
     return {"role": "user", "content": custom or SUSTAINED_GOAL_CONTINUE_PROMPT}
-
-
-def external_lookup_signature(tool_name: str, arguments: Any) -> str | None:
-    """Stable signature for repeated external lookups we want to throttle."""
-    if not isinstance(arguments, dict):
-        return None
-    if tool_name == "web_fetch":
-        url = str(arguments.get("url") or "").strip()
-        if url:
-            return f"web_fetch:{url.lower()}"
-    if tool_name == "web_search":
-        query = str(arguments.get("query") or arguments.get("search_term") or "").strip()
-        if query:
-            return f"web_search:{query.lower()}"
-    return None
-
-
-def repeated_external_lookup_error(
-    tool_name: str,
-    arguments: Any,
-    seen_counts: dict[str, int],
-) -> str | None:
-    """Block repeated external lookups after a small retry budget."""
-    signature = external_lookup_signature(tool_name, arguments)
-    if signature is None:
-        return None
-    count = seen_counts.get(signature, 0) + 1
-    seen_counts[signature] = count
-    if count <= _MAX_REPEAT_EXTERNAL_LOOKUPS:
-        return None
-    logger.warning(
-        "Blocking repeated external lookup {} on attempt {}",
-        signature[:160],
-        count,
-    )
-    return (
-        "Error: repeated external lookup blocked. "
-        "Use the results you already have to answer, or try a meaningfully different source."
-    )
 
 
 # Workspace-boundary violations are soft errors, with per-target throttling.

@@ -27,6 +27,7 @@ from nanobot.agent.tools._readonly_worker import (
     WORKER_SCOPE,
     ReadonlyWorkerConfig,
 )
+from nanobot.agent.tools._worker_artifacts import SCRIPT_BYTES
 from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
 from nanobot.agent.tools.context import ToolContext, current_request_session_key
 from nanobot.config_base import Base
@@ -134,8 +135,9 @@ class CodemodeTool(Tool):
                "For small or sliced text prefer await ask(task, text): exactly one model call, no tools. "
                "Use worker with artifact IDs only when the child needs to search/navigate bulk input. "
                "Use await artifact_put(text), "
-               "await artifact_read(id, offset=0, limit=8000). Oversized tool results become "
-               "marked-partial references; their entire JSON is retained for this run. "
+               "await artifact_read(id) reads the full text up to 1 MiB; use offset/limit "
+               "for larger artifacts (next_offset=None at EOF). Script tool results stay structured "
+               "up to 1 MiB, then become references to their complete JSON for this run. "
                "Pass result['artifact'] or source_artifacts IDs without copying bulk text. "
                "Workers see only selected artifacts, not parent history/tools/files. "
                "The existing script deadline includes awaited workers."
@@ -287,7 +289,8 @@ class CodemodeTool(Tool):
                 operation = request.get("operation")
                 run = WORKER_RUN.get()
                 scope = WORKER_SCOPE.get()
-                if scope is not None:
+                if scope is not None and operation != "call":
+                    # Tool calls are charged once by WorkerRegistry.prepare_call.
                     run.charge_tool()
                 if operation in ("worker", "ask"):
                     if scope is not None:
@@ -322,7 +325,7 @@ class CodemodeTool(Tool):
                 else:
                     raise ValueError("Unknown bridge operation")
                 if run is not None:
-                    result = run.artifacts.bound(result)
+                    result = run.artifacts.bound(result, max_bytes=SCRIPT_BYTES)
                     if scope is not None and isinstance(result, dict) and "artifact" in result:
                         # New harness-owned result artifacts are local intermediates, not
                         # permission to read an unselected parent/sibling artifact.
