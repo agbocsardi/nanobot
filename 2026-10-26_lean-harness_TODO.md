@@ -11,10 +11,10 @@
 
 ## Merge and deployment
 
-- [ ] Commit feature branch and merge into main; push origin/main.
-- [ ] Fast-forward the clean local editable install at `/home/gergo/nanobot`.
-- [ ] Restart the personal gateway and verify startup plus safe installed-runtime probes.
-- [ ] Record deployment result without changing live config or other gateway services.
+- [x] Commit feature branch and merge into main; push origin/main.
+- [x] Fast-forward the clean local editable install at `/home/gergo/nanobot`.
+- [x] Restart the personal gateway and verify startup plus safe installed-runtime probes.
+- [x] Record deployment result without changing live config or other gateway services.
 
 ## Log
 
@@ -79,3 +79,25 @@ install `/home/gergo/nanobot` start at `a5cbd5595`; origin/main is identical aft
 Deploy to the personal local `nanobot-gateway.service`, not the separate Szárszó bot.
 Restart is part of activation. No live config, secrets, dependency or service-unit
 changes are planned. The calling Pi process is outside the gateway cgroup.
+
+Feature committed as `a93742a21`, merged into main as `3ad30b2b6`, and pushed to
+origin. The merged tree is identical to the tested feature tree. Re-ran the full
+suite on main: 3,864 passed, same 1 known date-sensitive cron failure, clean delta.
+Fast-forwarded the clean editable deployment checkout to the merge (no reset).
+
+The last inbound message before activation was `/new`, not an in-flight model
+turn. Restarted only `nanobot-gateway.service` at 11:31:34 CET; new PID 417456.
+Both MCP servers connected and Agent loop started at 11:31:36; service remains
+active/running. The existing COROS enabledTools catalog-mismatch warning persists.
+Config file SHA-256 was identical before and after restart; no settings changed.
+The separate Szárszó bot was not restarted.
+
+Installed-runtime verification ran from `/home/gergo` through the uv-managed
+editable install, confirming imports from `/home/gergo/nanobot`. Real Bubblewrap
+plus an offline fake provider processed 3,000 structured rows, read back full
+artifact JSON with terminating EOF, and aggregated to the expected sum in two
+provider calls. Repeated installed file reads both returned full content. The
+existing config validates with max_model_calls=128 and no separate iteration field.
+No real LLM request or private external-data task was run; user-facing effectiveness
+still needs normal live usage. This final record is documentation-only and needs
+no additional service restart.
