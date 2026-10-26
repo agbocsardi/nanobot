@@ -322,7 +322,13 @@ class ToolRegistry:
         params: dict[str, Any],
     ) -> PolicyDecision:
         """Evaluate configured policy after validation and before execution."""
-        return self.policy.evaluate(tool.name, params, read_only=tool.read_only)
+        # Classify per call, not per tool: a tool that is read-only for some
+        # actions (`my check`) must not launder a mutating one (`my set`) past a
+        # read-only policy. The runner's read-only event flag uses the same pair.
+        read_only = tool.read_only and tool.effect_for(
+            params if isinstance(params, dict) else {}
+        ) == "read"
+        return self.policy.evaluate(tool.name, params, read_only=read_only)
 
     @property
     def tool_names(self) -> list[str]:
