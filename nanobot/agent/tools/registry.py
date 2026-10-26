@@ -180,7 +180,7 @@ class ToolRegistry:
         hint = "\n\n[Analyze the error above and try a different approach.]"
         tool, params, error = self.prepare_call(name, params)
         if error:
-            return ToolResult.retryable_error(error + hint)
+            return ToolResult.invalid_arguments(error + hint)
 
         assert tool is not None  # guarded by prepare_call()
         decision = self.evaluate_policy(tool, params)
@@ -264,7 +264,8 @@ class ToolRegistry:
                 )
 
         try:
-            outcome = adapt_legacy_tool_result(await tool.execute(**params))
+            result = await tool.execute(**params)
+            outcome = adapt_legacy_tool_result(result)
             if receipt is not None:
                 if outcome.status == "partial":
                     # Unresolved outcome (e.g. a still-running session): the
@@ -286,7 +287,7 @@ class ToolRegistry:
                     )
             if outcome.retryable and str(outcome).startswith("Error"):
                 return self._replace_content(outcome, str(outcome) + hint)
-            return outcome
+            return result if not isinstance(result, str) and outcome.status == "success" else outcome
         except asyncio.CancelledError:
             if receipt is not None:
                 self.receipt_store.complete(
@@ -298,7 +299,7 @@ class ToolRegistry:
             if receipt is not None:
                 self.receipt_store.complete(exec_id, status="failed", ok=False,
                                             outcome=redact_preview(f"exception: {e}"))
-            return ToolResult.retryable_error(f"Error executing {name}: {str(e)}" + hint)
+            return ToolResult.retryable_error(f"Error executing {name}: {e}" + hint)
 
     @staticmethod
     def _replace_content(outcome: ToolResult, content: str) -> ToolResult:

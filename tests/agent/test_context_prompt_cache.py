@@ -311,14 +311,13 @@ def test_channel_format_hint_telegram(tmp_path) -> None:
     assert "messaging app" in prompt
 
 
-def test_channel_format_hint_whatsapp(tmp_path) -> None:
-    """WhatsApp should get plain-text format hint."""
+def test_removed_channel_has_no_format_hint(tmp_path) -> None:
+    """Removed channels do not need bundled prompt instructions."""
     workspace = _make_workspace(tmp_path)
     builder = ContextBuilder(workspace)
 
     prompt = builder.build_system_prompt(channel="whatsapp")
-    assert "Format Hint" in prompt
-    assert "plain text only" in prompt
+    assert "Format Hint" not in prompt
 
 
 def test_channel_format_hint_absent_for_unknown(tmp_path) -> None:

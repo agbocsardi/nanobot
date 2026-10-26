@@ -198,14 +198,13 @@ class TestBundledToolContract:
         tpl = pkg_files("nanobot") / "templates" / "agent" / "tool_contract.md"
         content = tpl.read_text(encoding="utf-8")
 
-        assert "## General Tool Contract" in content
-        assert "Use the narrowest structured tool" in content
-        assert "Do not use `exec` as a universal workaround" in content
-        assert "## File and Coding Workflows" in content
+        assert "Tool schemas describe parameters and limits" in content
+        assert "Code Mode can compose calls" in content
+        assert "## Files and processes" in content
         assert "apply_patch" in content
-        assert "## Web and External Information" in content
-        assert "## Messaging and Media" in content
-        assert "## Scheduling and Background Work" in content
+        assert "## External information and delivery" in content
+        assert "message" in content
+        assert "cron" in content
         assert "pure coding" not in content.lower()
 
     def test_tool_contract_is_injected_without_workspace_file(self, tmp_path):
@@ -213,8 +212,8 @@ class TestBundledToolContract:
         prompt = builder.build_system_prompt()
 
         assert "# Tool Usage Notes" in prompt
-        assert "## General Tool Contract" in prompt
-        assert "Do not use `exec` as a universal workaround" in prompt
+        assert "Tool schemas describe parameters and limits" in prompt
+        assert "Do not repeat a mutation whose outcome is unknown" in prompt
 
 
 # ---------------------------------------------------------------------------

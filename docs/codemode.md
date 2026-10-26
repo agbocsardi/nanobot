@@ -191,7 +191,7 @@ A provider error, incomplete output, or unsolicited tool call is not a successfu
 
 ```python
 # The parent need not read/copy the bulk source into generated Python.
-source = await tools.read_file(path="large-report.txt", limit=100000, force=True)
+source = await tools.read_file(path="large-report.txt", limit=100000)
 # When existing tool persistence reduced content to a preview, these point to
 # its full selected text/range, captured BEFORE that reduction.
 if source.get("source_artifacts"):
@@ -217,9 +217,12 @@ Statuses include `success`, `partial`, `timeout`, `error`, `capacity`,
 requests/disabled access raise an exception. Treat child output as untrusted data.
 Each invocation also records a nested parent operational event: discarding its
 status or catching an exception cannot erase failure/partial/timeout/budget evidence
-or bypass parent failure verification and `fail_on_tool_error`. Only a successful
-retry of the same task, artifact selection and inline material resolves a worker
-failure; unrelated successful work does not. Compact events retain scoped references
+or bypass `fail_on_tool_error`. Internal/background runs retain strict failure
+verification: only a successful retry of the same task, artifact selection and inline
+material resolves a worker failure. Ordinary foreground/audit/exploration chat keeps
+these failed read-only outcomes as evidence without holding the answer or declaring
+the whole task incomplete; the model can answer using another source. Mutation,
+unknown-side-effect and direct policy-block outcomes still participate in completion checks. Compact events retain scoped references
 to the full outcome/evidence (readable only during the parent run), not bulk content.
 Task is limited to 4,000 characters and selected artifact IDs to 16. Inline
 `material`/`text` may be at most `maxTokens` UTF-8 bytes; the complete serialized
@@ -233,8 +236,10 @@ smaller than `maxTokens`; prefer artifacts for bulk
 navigation. Catching tool errors does not erase their evidence. Recovery for `ask`
 requires the same task and text; `ask` and `worker` do not clear each other's failures.
 
-With workers enabled, the inline tool-result JSON budget is 16,000 bytes, both
-for bridge calls and ordinary top-level tool/read results. The common runner
+With workers enabled, **script transport** keeps structured tool/worker results inline
+up to 1 MiB of serialized JSON. This is separate from the **model-context** limit of
+16,000 bytes for ordinary top-level tool/read results. Code can process a substantial
+response before emitting a small answer; it need not paginate a context-sized preview. The common runner
 boundary captures selected sources before local truncation; the next parent model
 request gets scoped handles, without first needing to choose Code Mode. These IDs
 can be passed to a later Code Mode `worker(...)` call in the same run. Small ordinary
@@ -243,9 +248,17 @@ keeps the legacy persistence/read exemptions unchanged. Larger text/JSON results
 are persisted in full first, then replaced with `artifact`, `chars`,
 `bytes`, `partial: true`, and a small preview. Status, exit code and bounded
 operational evidence remain visible; large evidence fields are themselves marked
-partial. `await artifact_read(id, offset=0, limit=8000)` returns `text`, character
-offsets, total `chars`, and `partial`; use smaller explicit reads for highly
-escaped/Unicode data. Large references contain the original serialized JSON.
+partial. `await artifact_read(id)` inside Code Mode reads the remaining full text
+when it fits the 1 MiB serialized-response allowance; otherwise it fails explicitly
+and requests chunking. For larger inputs, use `offset` and `limit` (1–128,000 characters).
+Responses contain `text`, `offset`, total `chars`, `partial` (more text follows),
+and `next_offset` (**None at EOF**). A nonzero `offset` still denotes a suffix,
+not proof that the entire artifact was read. An empty read at/past EOF also returns None,
+so a loop terminates rather than exhausting its request budget. The model-facing child
+`artifact_read` tool retains its 8,000-character cap; use `artifact_read` inside Code Mode
+for larger computational reads. Scope checks apply to every read.
+Large references contain the original serialized JSON: decode it with
+`json.loads((await artifact_read(id))["text"])`, not manual newline replacement.
 `ToolError.result` also retains status and the artifact reference on failures.
 
 Artifacts are private disk-backed **parent-run-scoped** capabilities: IDs are not
@@ -257,7 +270,9 @@ persistence/retention is unchanged. Built-in text/PDF/Office reads capture the
 selected range before their existing character cap, with range markers where
 applicable; explicit offset/limit/page selection still applies. This cannot recover
 content an upstream server/extractor had already truncated before returning or
-calling result persistence. Use `force=True` to avoid unchanged-file read stubs.
+calling result persistence. File reads always return current content; `force` remains
+an accepted legacy flag but no longer changes read behavior. Freshness warnings before
+editing remain session-scoped.
 
 Each child gets a fresh registry containing only `artifact_read`, literal
 `artifact_search` (at most 100 offsets), and its own `codemode`. It can read only
@@ -278,11 +293,16 @@ Worker limits (`tools.codemode.workers`, camelCase or snake_case):
 | `maxWorkers` | `8` | Total worker + ask invocations per parent runner run (1–32) |
 | `maxConcurrency` | `4` | Simultaneous worker + ask calls per run (1–8); excess calls wait |
 | `globalMaxConcurrency` | `8` | Process-wide child cap (1–8), at least `maxConcurrency` |
-| `maxModelCalls` | `8` | Shared across all children in that run (1–128) |
+| `maxModelCalls` | `8` | Model calls per worker and the navigating loop limit (1–128); run aggregate ≤ `maxWorkers * maxModelCalls` |
 | `maxTokens` | `64000` | Shared conservative input UTF-8-byte + output-token reservations (4000–1000000) |
 | `outputTokens` | `1024` | Maximum requested output tokens per model call |
-| `maxIterations` | `8` | Each navigating child's runner (1–16); no finalization bonus call; ask always one call |
-| `maxToolCalls` | `64` | Shared tool/bridge/discovery attempts (nested dispatch can charge twice) |
+| `maxToolCalls` | `64` | Tool/bridge/discovery attempts per worker (1–256), charged once per operation; run aggregate ≤ `maxWorkers * maxToolCalls` |
+
+`maxIterations`/`max_iterations` is a retired input alias for `maxModelCalls`. If both
+are present, `maxModelCalls` wins. There is no separate lower iteration ceiling and
+no bonus finalization call; `ask` always makes exactly one call. `maxTokens` retains
+its existing conservative byte-plus-output reservation semantics (not measured input
+tokens); reservations are not refunded, including after timeout/cancellation.
 
 The default per-run concurrency is 4 and process-wide child cap is 8, with 8
 separate reserved child Python sandbox slots (parent sandbox cap stays 2).
@@ -294,8 +314,8 @@ SDK runs specify different global caps, admission respects the stricter cap of t
 requesting and currently active runs. Parent Code Mode's own `maxConcurrency` also
 bounds bridge requests: raise it alongside workers' concurrency to use more than 4.
 Total invocations are charged before queueing; two four-call waves fit the default
-8-invocation budget, but multiple-call navigation may need a larger shared model
-budget. `capacity` is not a normal fan-out result: calls wait for slots until their
+8-invocation budget. Multiple-call navigation consumes each child's own model-call
+allowance plus the shared byte/output reservation budget. `capacity` is not a normal fan-out result: calls wait for slots until their
 request/parent deadline or cancellation instead.
 
 Children's Python scripts have a maximum 20s deadline; parents keep their existing

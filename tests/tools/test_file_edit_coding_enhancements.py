@@ -5,7 +5,7 @@ import asyncio
 from nanobot.agent.tools.filesystem import EditFileTool, ReadFileTool
 
 
-def test_read_file_force_bypasses_dedup(tmp_path):
+def test_read_file_force_remains_compatible(tmp_path):
     target = tmp_path / "data.txt"
     target.write_text("alpha\n")
     tool = ReadFileTool(workspace=tmp_path)
@@ -15,7 +15,7 @@ def test_read_file_force_bypasses_dedup(tmp_path):
     forced = asyncio.run(tool.execute(path=str(target), force=True))
 
     assert "alpha" in first
-    assert "unchanged" in second.lower()
+    assert second == first == forced
     assert "alpha" in forced
     assert "unchanged" not in forced.lower()
 

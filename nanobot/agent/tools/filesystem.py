@@ -2,13 +2,12 @@
 
 import difflib
 import mimetypes
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from nanobot.agent.tools.base import Tool, tool_parameters
-from nanobot.agent.tools.file_state import FileStates, _hash_file, current_file_states
+from nanobot.agent.tools.file_state import FileStates, current_file_states
 from nanobot.agent.tools.path_utils import resolve_workspace_path
 from nanobot.agent.tools.schema import (
     BooleanSchema,
@@ -183,7 +182,7 @@ def _parse_page_range(pages: str, total: int) -> tuple[int, int]:
         ),
         pages=StringSchema("Page range for PDF files, e.g. '1-5' (default: all, max 20 pages)"),
         force=BooleanSchema(
-            description="Bypass same-file read deduplication and return content again.",
+            description="Legacy compatibility flag; reads always return current content.",
             default=False,
         ),
         required=["path"],
@@ -212,7 +211,6 @@ class ReadFileTool(_FsTool):
             "Read the relevant range before editing so replacements or patches "
             "are based on current content. "
             "Use offset and limit for large text files. "
-            "Use force=true to re-read content even if unchanged. "
             "Reads exceeding ~128K chars are truncated."
         )
 
@@ -269,44 +267,6 @@ class ReadFileTool(_FsTool):
                     blocks[0].pop("_meta", None)
                 return blocks
 
-            # Read dedup: same path + offset + limit + unchanged mtime → stub
-            # Always check for external modifications before dedup
-            entry = self._file_states.get(fp)
-            try:
-                current_mtime = os.path.getmtime(fp)
-            except OSError:
-                current_mtime = 0.0
-            if (
-                not force
-                and entry
-                and entry.can_dedup
-                and entry.offset == offset
-                and entry.limit == limit
-            ):
-                if current_mtime != entry.mtime:
-                    # File was modified externally - force full read and mark as not dedupable
-                    entry.can_dedup = False
-                    self._file_states.record_read(fp, offset=offset, limit=limit)  # Update state with new mtime
-                    # Continue to read full content (don't return dedup message)
-                else:
-                    # File unchanged - return dedup message
-                    # But only if content is actually unchanged (not just mtime)
-                    current_hash = _hash_file(str(fp))
-                    if current_hash == entry.content_hash:
-                        return f"[File unchanged since last read: {path}]"
-                    else:
-                        # Content changed despite same mtime - force full read
-                        entry.can_dedup = False
-                        self._file_states.record_read(fp, offset=offset, limit=limit)
-            else:
-                # No previous state or marked as not dedupable - read full content
-                self._file_states.record_read(fp, offset=offset, limit=limit)
-                # Force full read by setting can_dedup to False for this read
-                if entry:
-                    entry.can_dedup = False
-
-            # Read the file content after dedup check
-            raw = fp.read_bytes()
             try:
                 text_content = raw.decode("utf-8")
             except UnicodeDecodeError:

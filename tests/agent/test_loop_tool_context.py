@@ -42,8 +42,9 @@ class _Tools:
     def get_definitions(self) -> list:
         return []
 
-    def prepare_call(self, name: str, arguments: dict):
-        return (self.tool, arguments, None) if name == "cron" else (None, arguments, None)
+    async def execute(self, name: str, arguments: dict):
+        assert name == "cron"
+        return await self.tool.execute(**arguments)
 
 
 @pytest.mark.asyncio

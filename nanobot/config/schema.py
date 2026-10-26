@@ -68,7 +68,7 @@ class DreamConfig(Base):
     timeout_s: int = Field(default=300, ge=30, le=3600)  # Whole Dream run timeout (seconds)
     max_changed_files: int = Field(default=8, ge=1)  # Max memory files one Dream run may touch
     max_diff_chars: int = Field(default=32_000, ge=1)  # Max combined Dream diff size in chars
-    annotate_line_ages: bool = True  # Reserved for future Dream prompt aging hints
+    annotate_line_ages: bool = True  # Legacy/no-op; accepted only for old configs
 
     def build_schedule(self, timezone: str) -> CronSchedule:
         """Build the runtime schedule, preferring the legacy cron override if present."""

@@ -108,7 +108,7 @@ async def _execute(registry, code, *, call_id="outer", concurrent=True, **spec_k
             initial_messages=[], tools=registry, model="test", max_iterations=1,
             max_tool_result_chars=16000, concurrent_tools=concurrent, **spec_kwargs,
         ),
-        [ToolCallRequest(id=call_id, name="codemode", arguments={"code": code})], {}, {},
+        [ToolCallRequest(id=call_id, name="codemode", arguments={"code": code})], {},
     )
     return results, events, error
 
@@ -364,7 +364,7 @@ class TestSandbox:
             AgentRunSpec(initial_messages=[], tools=registry, model="test", max_iterations=1,
                          max_tool_result_chars=16000),
             [ToolCallRequest(id="outer", name="codemode", arguments={"code": code}),
-             ToolCallRequest(id="after", name="after", arguments={"path": "/other"})], {}, {},
+             ToolCallRequest(id="after", name="after", arguments={"path": "/other"})], {},
         )
         assert error is None
         assert [event["name"] for event in events] == ["codemode", "first", "second", "after"]

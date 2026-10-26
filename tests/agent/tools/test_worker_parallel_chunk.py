@@ -44,10 +44,10 @@ def assert_released(run):
 def test_concurrency_and_iteration_schema_bounds():
     config = ReadonlyWorkerConfig()
     assert (config.max_workers, config.max_concurrency, config.global_max_concurrency) == (8, 4, 8)
-    assert config.max_iterations == 8
-    assert ReadonlyWorkerConfig(max_iterations=16).max_iterations == 16
+    assert config.max_model_calls == 8
+    assert ReadonlyWorkerConfig(max_iterations=16).max_model_calls == 16
     assert config.max_concurrency <= config.global_max_concurrency <= codemode._MAX_CHILD_SANDBOXES
-    for args in ({"max_iterations": 17}, {"max_concurrency": 9},
+    for args in ({"max_iterations": 129}, {"max_concurrency": 9},
                  {"global_max_concurrency": 9},
                  {"max_concurrency": 4, "global_max_concurrency": 3}):
         with pytest.raises(ValidationError):

@@ -109,19 +109,21 @@ async def test_loop_keeps_tool_diagnostics_internal_for_chat(tmp_path, backgroun
         LLMResponse(content="saving", tool_calls=[
             ToolCallRequest(id="call", name="list_dir", arguments={}),
         ]),
-        LLMResponse(content="Unsupported draft."),
+        LLMResponse(content=answer),
         LLMResponse(content=answer),
     ])
     from nanobot.agent.tools.registry import ToolRegistry
-    from tests.harness.helpers import StaticTool
+    from tests.agent.tools.test_codemode import _Tool
 
     tools = ToolRegistry()
-    tools.register(StaticTool("list_dir", ToolResult.retryable_error("lookup failed")))
+    tools.register(_Tool("list_dir", handler=AsyncMock(
+        return_value=ToolResult.retryable_error("lookup failed"),
+    )))
     content, _, messages, reason, _ = await loop._run_agent_loop(
         [], tools=tools, metadata={"_cron_run_usage": {}} if background else {},
     )
-    assert reason == "partial_completion"
-    assert loop.provider.chat_with_retry.await_count == 3
+    assert reason == ("partial_completion" if background else "completed")
+    assert loop.provider.chat_with_retry.await_count == (3 if background else 2)
     if background:
         assert content.startswith("Incomplete:")
     else:

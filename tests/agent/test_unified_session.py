@@ -266,7 +266,7 @@ class TestCmdNewUnifiedSession:
         assert reloaded.messages == []
         reset_file_state = file_state_store.for_session("unified:default")
         assert reset_file_state is not previous_file_state
-        assert reset_file_state.is_unchanged(tracked_file) is False
+        assert reset_file_state.get(tracked_file) is None
 
     @pytest.mark.asyncio
     async def test_cmd_new_in_unified_mode_does_not_affect_other_sessions(self, tmp_path: Path):

@@ -1,4 +1,4 @@
-"""Track file-read state for read-before-edit warnings and read deduplication."""
+"""Track file freshness for read-before-edit warnings."""
 
 from __future__ import annotations
 
@@ -13,10 +13,7 @@ from pathlib import Path
 @dataclass(slots=True)
 class ReadState:
     mtime: float
-    offset: int
-    limit: int | None
     content_hash: str | None
-    can_dedup: bool
 
 
 def _hash_file(p: str) -> str | None:
@@ -27,12 +24,7 @@ def _hash_file(p: str) -> str | None:
 
 
 class FileStates:
-    """Per-session read/write tracker.
-
-    Owns its own state dict so read-dedup ("File unchanged since last read")
-    and read-before-edit warnings stay scoped to one agent session and do
-    not leak across sessions sharing this process.
-    """
+    """Per-session read/write freshness tracker; reads always return content."""
 
     __slots__ = ("_state",)
 
@@ -48,10 +40,7 @@ class FileStates:
             return
         self._state[p] = ReadState(
             mtime=mtime,
-            offset=offset,
-            limit=limit,
             content_hash=_hash_file(p),
-            can_dedup=True,
         )
 
     def record_write(self, path: str | Path) -> None:
@@ -64,10 +53,7 @@ class FileStates:
             return
         self._state[p] = ReadState(
             mtime=mtime,
-            offset=1,
-            limit=None,
             content_hash=_hash_file(p),
-            can_dedup=False,
         )
 
     def check_read(self, path: str | Path) -> str | None:
@@ -94,33 +80,6 @@ class FileStates:
         if entry.content_hash and _hash_file(p) != entry.content_hash:
             return "Warning: file has been modified since last read. Re-read to verify content before editing."
         return None
-
-    def is_unchanged(self, path: str | Path, offset: int = 1, limit: int | None = None) -> bool:
-        """Return True if file was previously read with same params and content is unchanged."""
-        p = str(Path(path).resolve())
-        entry = self._state.get(p)
-        if entry is None:
-            return False
-        if not entry.can_dedup:
-            return False
-        if entry.offset != offset or entry.limit != limit:
-            return False
-        try:
-            current_mtime = os.path.getmtime(p)
-        except OSError:
-            return False
-        if current_mtime != entry.mtime:
-            # mtime changed - check if content also changed
-            current_hash = _hash_file(p)
-            if current_hash != entry.content_hash:
-                # Content actually changed - don't dedup
-                entry.can_dedup = False
-                return False
-            # Content identical despite mtime change (e.g. touch) - mark as not dedupable to force full read next time
-            entry.can_dedup = False
-            return True
-        # mtime unchanged - content must be identical
-        return True
 
     def get(self, path: str | Path) -> ReadState | None:
         """Return the raw ReadState entry for a path, or None."""
@@ -212,10 +171,6 @@ def record_write(path: str | Path) -> None:
 
 def check_read(path: str | Path) -> str | None:
     return _default.check_read(path)
-
-
-def is_unchanged(path: str | Path, offset: int = 1, limit: int | None = None) -> bool:
-    return _default.is_unchanged(path, offset=offset, limit=limit)
 
 
 def clear() -> None:

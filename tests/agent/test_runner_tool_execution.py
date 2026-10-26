@@ -133,7 +133,6 @@ async def test_runner_batches_read_only_tools_before_exclusive_work():
             ToolCallRequest(id="rw1", name="write_a", arguments={}),
         ],
         {},
-        {},
     )
 
     assert shared_events[0:2] == ["start:read_a", "start:read_b"]
@@ -175,7 +174,6 @@ async def test_runner_does_not_batch_exclusive_read_only_tools():
             ToolCallRequest(id="ddg1", name="ddg_like", arguments={}),
             ToolCallRequest(id="ro2", name="read_b", arguments={}),
         ],
-        {},
         {},
     )
 
@@ -345,7 +343,7 @@ async def test_runner_rejects_openai_responses_array_arguments_without_executing
 
 
 @pytest.mark.asyncio
-async def test_runner_blocks_repeated_external_fetches():
+async def test_runner_allows_repeated_external_fetches():
     provider = MagicMock()
     captured_final_call: list[dict] = []
     call_count = {"n": 0}
@@ -375,14 +373,14 @@ async def test_runner_blocks_repeated_external_fetches():
         max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
     ))
 
-    assert result.stop_reason == "policy_block"
-    assert result.final_content.endswith("done")
-    assert tools.execute.await_count == 2
-    blocked_tool_message = [
+    assert result.stop_reason == "completed"
+    assert result.final_content == "done"
+    assert tools.execute.await_count == 3
+    repeated_tool_message = [
         msg for msg in captured_final_call
         if msg.get("role") == "tool" and msg.get("tool_call_id") == "call_3"
     ][0]
-    assert "repeated external lookup blocked" in blocked_tool_message["content"]
+    assert repeated_tool_message["content"] == "page content"
 
 
 @pytest.mark.asyncio
@@ -408,7 +406,6 @@ async def test_runner_routes_local_side_effect_tool_through_receipt_store(tmp_pa
             max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
         ),
         [ToolCallRequest(id="write-1", name="write_a", arguments={})],
-        {},
         {},
     )
 
@@ -462,7 +459,6 @@ async def test_runner_carries_approval_token_into_policy_tool_result():
         results, events, _targets, error = await runner._execute_tools(
             spec,
             [ToolCallRequest(id="ask-1", name="write_state", arguments={})],
-            {},
             {},
         )
     finally:
