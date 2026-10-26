@@ -47,6 +47,13 @@ class MyTool(Tool, ContextAware):
 
     _plugin_discoverable = False  # Requires AgentLoop reference; registered manually
     config_key = "my"
+    # A failed introspection is evidence, not a verdict on a reply; `set`
+    # changes runtime config and must stay a write. effect_for decides per call.
+    effect = "local_write"
+
+    def effect_for(self, params: dict[str, Any]) -> str:
+        action = str(params.get("action") or "")
+        return "read" if action in {"status", "inspect", "check"} else self.effect
 
     @classmethod
     def config_cls(cls):
@@ -167,6 +174,17 @@ class MyTool(Tool, ContextAware):
                 "(e.g. changing model), warn the user first."
             )
         return base
+
+    @property
+    def read_only(self) -> bool:
+        # Per-call: the runner only marks an event read-only when effect_for
+        # also reports a read, so `set` keeps its write classification.
+        return True
+
+    @property
+    def exclusive(self) -> bool:
+        # `set` mutates running config; keep it out of parallel batches.
+        return True
 
     @property
     def parameters(self) -> dict[str, Any]:
